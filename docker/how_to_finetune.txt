@@ -1,0 +1,35 @@
+sudo docker run -it --rm --gpus all \
+    --shm-size=16g \
+    -v $(pwd)/..:/workspace/gr00t \
+    gr00t-dev /bin/bash
+
+
+sudo docker run -it --rm --gpus all \
+    --shm-size=16g \
+    -v $(pwd)/..:/workspace/gr00t \
+    chickenology/gr00t:20250816 /bin/bash
+
+
+cd /workspace/gr00t
+uv venv --python 3.10
+uv pip install -e .
+
+
+uv pip install tyro
+uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+
+
+CUDA_VISIBLE_DEVICES=0 python \
+    gr00t/experiment/launch_finetune.py \
+    --base-model-path nvidia/GR00T-N1.6-3B \
+    --dataset-path ./alfiebot.CanDoChallenge\
+    --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path ./alfiebot.CanDoChallenge/alfiebot_config.py \
+    --num-gpus 1 \
+    --output-dir ./cando \
+    --save-total-limit 5 \
+    --save-steps 2000 \
+    --max-steps 2000 \
+    --global-batch-size 32 \
+    --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08 \
+    --dataloader-num-workers 4

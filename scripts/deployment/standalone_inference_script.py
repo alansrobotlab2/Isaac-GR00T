@@ -101,7 +101,20 @@ class TensorRTDiTWrapper:
             raise RuntimeError(f"Failed to load TensorRT engine from {engine_path}")
 
         self.context = self.engine.create_execution_context()
+
+        # Determine output dtype from the engine (varies by precision: BF16, FP16, etc.)
+        import tensorrt as trt
+
+        _trt_to_torch = {
+            trt.DataType.FLOAT: torch.float32,
+            trt.DataType.HALF: torch.float16,
+            trt.DataType.BF16: torch.bfloat16,
+            trt.DataType.INT8: torch.int8,
+        }
+        output_trt_dtype = self.engine.get_tensor_dtype("output")
+        self.output_dtype = _trt_to_torch.get(output_trt_dtype, torch.float32)
         logging.info(f"TensorRT engine loaded: {engine_path}")
+        logging.info(f"  Output dtype: {self.output_dtype} (TRT: {output_trt_dtype})")
 
     def __call__(self, sa_embs, vl_embs, timestep, image_mask=None, backbone_attention_mask=None):
         """Forward pass through TensorRT DiT."""
@@ -133,10 +146,9 @@ class TensorRTDiTWrapper:
                 "backbone_attention_mask", backbone_attention_mask.data_ptr()
             )
 
-        # Output in BF16 (matches ONNX export and engine precision)
         output_shape = self.context.get_tensor_shape("output")
         output = torch.empty(
-            tuple(output_shape), dtype=torch.bfloat16, device=f"cuda:{self.device}"
+            tuple(output_shape), dtype=self.output_dtype, device=f"cuda:{self.device}"
         )
         self.context.set_tensor_address("output", output.data_ptr())
 

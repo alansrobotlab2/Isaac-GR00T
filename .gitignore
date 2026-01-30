@@ -8,6 +8,15 @@
 # UV lock file
 uv.lock
 
+# alfiebot gr00t directories
+/alfiebot.CanDoChallenge/
+/cando/
+/calibration_data/
+/groot_n1d6_onnx/
+/inference_output*
+/tensorrt_compile*
+/eagle_qwen2_awq_4bit/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
