@@ -96,8 +96,13 @@ class TensorRTDiTWrapper:
         self.trt_logger = trt.Logger(trt.Logger.WARNING)
         self.runtime = trt.Runtime(self.trt_logger)
 
+        # Read and deserialize separately so we can free the file buffer immediately
+        # On Jetson unified memory, the file buffer competes with GPU allocation
         with open(engine_path, "rb") as f:
-            self.engine = self.runtime.deserialize_cuda_engine(f.read())
+            engine_data = f.read()
+        self.engine = self.runtime.deserialize_cuda_engine(engine_data)
+        del engine_data
+        gc.collect()
 
         if self.engine is None:
             raise RuntimeError(f"Failed to load TensorRT engine from {engine_path}")
@@ -299,8 +304,13 @@ class TensorRTBackboneWrapper:
         self.trt_logger = trt.Logger(trt.Logger.WARNING)
         self.runtime = trt.Runtime(self.trt_logger)
 
+        # Read and deserialize separately so we can free the file buffer immediately
+        # On Jetson unified memory, the file buffer competes with GPU allocation
         with open(engine_path, "rb") as f:
-            self.engine = self.runtime.deserialize_cuda_engine(f.read())
+            engine_data = f.read()
+        self.engine = self.runtime.deserialize_cuda_engine(engine_data)
+        del engine_data
+        gc.collect()
 
         if self.engine is None:
             raise RuntimeError(f"Failed to load backbone TensorRT engine from {engine_path}")
@@ -350,6 +360,29 @@ class TensorRTBackboneWrapper:
 
             pixel_values = pixel_values.to(f"cuda:{self.device}").contiguous()
 
+            # Debug: log input shapes and dtypes to diagnose Cask/Myelin errors
+            logging.info(
+                f"[Backbone TRT] input_ids: {input_ids.shape} {input_ids.dtype}, "
+                f"attention_mask: {attention_mask.shape} {attention_mask.dtype}, "
+                f"pixel_values: {pixel_values.shape} {pixel_values.dtype}"
+            )
+
+            # Validate shapes against engine profile before execution
+            for inp_name, inp_tensor in [
+                ("input_ids", input_ids),
+                ("attention_mask", attention_mask),
+                ("pixel_values", pixel_values),
+            ]:
+                profile_min = self.engine.get_tensor_profile_shape(inp_name, 0)[0]
+                profile_max = self.engine.get_tensor_profile_shape(inp_name, 0)[2]
+                actual = tuple(inp_tensor.shape)
+                for dim_idx, (a, lo, hi) in enumerate(zip(actual, profile_min, profile_max)):
+                    if a < lo or a > hi:
+                        logging.error(
+                            f"[Backbone TRT] Shape mismatch! {inp_name} dim {dim_idx}: "
+                            f"actual={a}, profile min={lo}, max={hi}"
+                        )
+
             self.context.set_input_shape("input_ids", input_ids.shape)
             self.context.set_input_shape("attention_mask", attention_mask.shape)
             self.context.set_input_shape("pixel_values", pixel_values.shape)
@@ -362,6 +395,7 @@ class TensorRTBackboneWrapper:
             outputs = {}
             for name, dtype in self.output_dtypes.items():
                 shape = self.context.get_tensor_shape(name)
+                logging.info(f"[Backbone TRT] output '{name}': shape={tuple(shape)}, dtype={dtype}")
                 tensor = torch.empty(tuple(shape), dtype=dtype, device=f"cuda:{self.device}")
                 self.context.set_tensor_address(name, tensor.data_ptr())
                 outputs[name] = tensor
@@ -901,11 +935,25 @@ def main(args: ArgsConfig):
         # 3. Load TRT engine to GPU
         # 4. Move remaining PyTorch components to GPU
         if args.inference_mode == "tensorrt" and torch.cuda.is_available():
-            # TRT needs contiguous memory - load it FIRST while GPU is empty
-            logging.info("TensorRT mode: Loading TRT engine first while GPU is empty...")
-            logging.info(f"Loading TensorRT engine: {args.trt_engine_path}")
-            # TRT can run in FP16 for Orin optimization, output will be converted to BF16
-            # for the action decoder (Eagle backbone requires BF16)
+            # TRT needs contiguous GPU memory - load ALL TRT engines FIRST while GPU is empty
+            # This is critical on Jetson unified memory where CPU/GPU share 16GB:
+            # Loading TRT engines before PyTorch avoids memory fragmentation and
+            # ensures the large contiguous allocations succeed.
+            logging.info("TensorRT mode: Loading ALL TRT engines first while GPU is empty...")
+
+            # Load backbone TRT engine first (largest: ~3GB)
+            backbone_trt = None
+            if args.backbone_trt_engine_path:
+                logging.info(f"Loading backbone TRT engine: {args.backbone_trt_engine_path}")
+                backbone_trt = TensorRTBackboneWrapper(args.backbone_trt_engine_path, device=0)
+                gc.collect()
+                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    mem_used = torch.cuda.memory_allocated() / 1024**3
+                    logging.info(f"GPU memory after backbone TRT load: {mem_used:.2f} GB")
+
+            # Load DiT TRT engine
+            logging.info(f"Loading DiT TensorRT engine: {args.trt_engine_path}")
             trt_dit = TensorRTDiTWrapper(
                 args.trt_engine_path,
                 device=0,
@@ -915,7 +963,7 @@ def main(args: ArgsConfig):
             torch.cuda.empty_cache()
             if torch.cuda.is_available():
                 mem_used = torch.cuda.memory_allocated() / 1024**3
-                logging.info(f"GPU memory after TRT load: {mem_used:.2f} GB")
+                logging.info(f"GPU memory after all TRT engines loaded: {mem_used:.2f} GB")
 
             # Load PyTorch model WITHOUT DiT (skip_dit=True saves ~2GB)
             # This is critical for Jetson unified memory where CPU and GPU share 16GB
@@ -937,13 +985,10 @@ def main(args: ArgsConfig):
                 mem_used = torch.cuda.memory_allocated() / 1024**3
                 logging.info(f"GPU memory after PyTorch model load: {mem_used:.2f} GB")
 
-            # Wire up TRT engine to replace the (empty) DiT
+            # Wire up TRT engines to replace the (empty) PyTorch components
             replace_dit_with_tensorrt(policy, args.trt_engine_path, preloaded_trt=trt_dit)
 
-            # Wire up backbone TRT engine if provided
-            if args.backbone_trt_engine_path:
-                logging.info(f"Loading backbone TRT engine: {args.backbone_trt_engine_path}")
-                backbone_trt = TensorRTBackboneWrapper(args.backbone_trt_engine_path, device=0)
+            if backbone_trt is not None:
                 replace_backbone_with_tensorrt(policy, args.backbone_trt_engine_path, preloaded_trt=backbone_trt)
 
             gc.collect()

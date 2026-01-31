@@ -211,4 +211,6 @@ Additional options:
 
 **Action quality degraded**: Compare INT8 vs BF16 outputs using the pipeline's validation step. If MSE is too high, you may need more calibration samples or should evaluate whether specific layers need FP16 precision (advanced: use TensorRT's layer-level precision API).
 
+**Backbone TRT OOM on Orin NX 16GB**: The backbone INT8 engine needs ~3GB of contiguous GPU memory. On Jetson unified memory, the loading order matters — all TRT engines are loaded first (backbone, then DiT) while GPU is empty, before loading the PyTorch model. If you still hit OOM, check system memory usage with `tegrastats` and ensure no other processes are consuming GPU memory.
+
 **Calibration cache**: Delete `calibration_data/int8_calib.cache` to force recalibration. The cache is tied to the specific ONNX model — if you retrain and re-export, delete the cache.

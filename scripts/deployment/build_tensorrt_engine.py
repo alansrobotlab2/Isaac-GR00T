@@ -94,7 +94,7 @@ class MemoryMonitor:
             nvmap_path = '/sys/kernel/debug/nvmap/iovmm/clients'
             if os.path.exists(nvmap_path):
                 result = subprocess.run(
-                    ['sudo', 'cat', nvmap_path],
+                    ['cat', nvmap_path],
                     capture_output=True, text=True, timeout=1.0
                 )
                 # Parse total GPU memory from nvmap
@@ -143,19 +143,19 @@ def prepare_system_for_build():
 
     # Drop filesystem caches to free physical RAM
     try:
-        subprocess.run(['sudo', 'sync'], check=False, timeout=30)
+        subprocess.run(['sync'], check=False, timeout=30)
         subprocess.run(
-            ['sudo', 'sh', '-c', 'echo 3 > /proc/sys/vm/drop_caches'],
+            ['sh', '-c', 'echo 3 > /proc/sys/vm/drop_caches'],
             check=False, timeout=10
         )
         logger.info("Dropped filesystem caches")
     except Exception as e:
-        logger.warning(f"Could not drop caches (may need sudo): {e}")
+        logger.warning(f"Could not drop caches: {e}")
 
     # Increase swappiness to push CPU-only allocations to swap
     try:
         subprocess.run(
-            ['sudo', 'sysctl', '-w', 'vm.swappiness=100'],
+            ['sysctl', '-w', 'vm.swappiness=100'],
             check=False, timeout=10
         )
         logger.info("Set vm.swappiness=100")
@@ -165,7 +165,7 @@ def prepare_system_for_build():
     # Allow memory overcommit
     try:
         subprocess.run(
-            ['sudo', 'sysctl', '-w', 'vm.overcommit_memory=1'],
+            ['sysctl', '-w', 'vm.overcommit_memory=1'],
             check=False, timeout=10
         )
         logger.info("Set vm.overcommit_memory=1")
@@ -769,7 +769,7 @@ def main():
     )
     parser.add_argument(
         "--prepare-system", action="store_true", default=False,
-        help="Prepare system for build: drop caches, increase swappiness (requires sudo)"
+        help="Prepare system for build: drop caches, increase swappiness"
     )
     parser.add_argument(
         "--memory-monitor", action="store_true", default=False,
