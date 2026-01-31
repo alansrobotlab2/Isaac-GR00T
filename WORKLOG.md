@@ -1,5 +1,16 @@
 # Worklog
 
+## 2026-01-31: Unified memory optimizations for Orin NX 16GB
+
+**Problem:** Investigated whether the inference pipeline was making efficient use of Jetson's unified memory architecture (CPU and GPU share same 16GB DRAM). Found several areas where unnecessary memory copies and allocations wasted unified memory.
+
+**Changes (standalone_inference_script.py):**
+1. **Removed redundant `.to('cuda')` in TRT wrappers** — On unified memory, tensors are already GPU-accessible. The DiT wrapper was doing 5 device copies × 50 diffusion steps = ~250 unnecessary allocations per inference. Now only dtype casting is performed (no device movement), with `.contiguous()` guarded by `is_contiguous()` check.
+2. **Pre-allocated reusable TRT output buffers** — DiT and backbone wrappers now cache output tensors and only reallocate on shape change, eliminating alloc/free churn during the diffusion loop.
+3. **Configured `PYTORCH_CUDA_ALLOC_CONF`** — Set `expandable_segments:True` (reduces fragmentation) and `garbage_collection_threshold:0.6` (reclaims unused cache sooner than default 0.8).
+4. **Capped PyTorch CUDA memory at 60%** — `set_per_process_memory_fraction(0.6)` prevents PyTorch's caching allocator from starving TensorRT/numpy/OS on the shared 16GB.
+5. **Gated backbone debug logging to DEBUG level** — Per-call `logging.info` with f-string formatting was creating unnecessary overhead and temporary string allocations in the hot path.
+
 ## 2026-01-30: Fix backbone TRT OOM on Orin NX 16GB
 
 **Problem:** Running full TRT inference (DiT + backbone) on Orin NX 16GB hit CUDA OOM when loading the backbone TRT engine (~3.08 GB). The loading order was: DiT TRT -> PyTorch model -> backbone TRT. By the time the backbone loaded, GPU memory was too fragmented/consumed.

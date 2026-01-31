@@ -25,6 +25,14 @@ import tyro
 
 warnings.simplefilter("ignore", category=FutureWarning)
 
+# Jetson unified memory optimization: configure PyTorch CUDA allocator before any CUDA ops.
+# - expandable_segments: reduces fragmentation by growing existing segments instead of new blocks
+# - garbage_collection_threshold: 0.6 triggers GC earlier (default 0.8) to reclaim unused cache
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True,garbage_collection_threshold:0.6",
+)
+
 """
 Combined inference script supporting both PyTorch and TensorRT modes.
 
@@ -135,6 +143,11 @@ class TensorRTDiTWrapper:
         else:
             logging.info(f"TensorRT output dtype: {output_dtype} -> torch {self.engine_output_dtype}")
 
+        # Pre-allocated output buffer — reused across diffusion steps to avoid
+        # repeated alloc/free on Jetson unified memory. Reallocated only on shape change.
+        self._output_buf = None
+        self._output_shape = None
+
     def _trt_dtype_to_torch(self, trt_dtype):
         """Convert TensorRT dtype to PyTorch dtype."""
         import tensorrt as trt
@@ -156,16 +169,25 @@ class TensorRTDiTWrapper:
 
         # Use dedicated stream for TRT execution to avoid synchronization overhead
         with torch.cuda.stream(self.stream):
-            # Setup context bindings - cast to engine's expected dtypes
-            cuda_device = f"cuda:{self.device}"
-            sa_embs = sa_embs.to(device=cuda_device, dtype=self.input_dtypes.get("sa_embs", sa_embs.dtype)).contiguous()
-            vl_embs = vl_embs.to(device=cuda_device, dtype=self.input_dtypes.get("vl_embs", vl_embs.dtype)).contiguous()
-            timestep = timestep.to(device=cuda_device, dtype=self.input_dtypes.get("timestep", timestep.dtype)).contiguous()
+            # Cast to engine's expected dtypes (no device move — Jetson unified memory)
+            sa_embs = sa_embs.to(dtype=self.input_dtypes.get("sa_embs", sa_embs.dtype))
+            if not sa_embs.is_contiguous():
+                sa_embs = sa_embs.contiguous()
+            vl_embs = vl_embs.to(dtype=self.input_dtypes.get("vl_embs", vl_embs.dtype))
+            if not vl_embs.is_contiguous():
+                vl_embs = vl_embs.contiguous()
+            timestep = timestep.to(dtype=self.input_dtypes.get("timestep", timestep.dtype))
+            if not timestep.is_contiguous():
+                timestep = timestep.contiguous()
 
             if image_mask is not None:
-                image_mask = image_mask.to(device=cuda_device, dtype=self.input_dtypes.get("image_mask", image_mask.dtype)).contiguous()
+                image_mask = image_mask.to(dtype=self.input_dtypes.get("image_mask", image_mask.dtype))
+                if not image_mask.is_contiguous():
+                    image_mask = image_mask.contiguous()
             if backbone_attention_mask is not None:
-                backbone_attention_mask = backbone_attention_mask.to(device=cuda_device, dtype=self.input_dtypes.get("backbone_attention_mask", backbone_attention_mask.dtype)).contiguous()
+                backbone_attention_mask = backbone_attention_mask.to(dtype=self.input_dtypes.get("backbone_attention_mask", backbone_attention_mask.dtype))
+                if not backbone_attention_mask.is_contiguous():
+                    backbone_attention_mask = backbone_attention_mask.contiguous()
 
             self.context.set_input_shape("sa_embs", sa_embs.shape)
             self.context.set_input_shape("vl_embs", vl_embs.shape)
@@ -185,21 +207,26 @@ class TensorRTDiTWrapper:
                     "backbone_attention_mask", backbone_attention_mask.data_ptr()
                 )
 
-            # Output dtype matches the engine's native output type
-            output_shape = self.context.get_tensor_shape("output")
-            output = torch.empty(
-                tuple(output_shape), dtype=self.engine_output_dtype, device=f"cuda:{self.device}"
-            )
-            self.context.set_tensor_address("output", output.data_ptr())
+            # Reuse output buffer across diffusion steps (avoids alloc/free churn)
+            output_shape = tuple(self.context.get_tensor_shape("output"))
+            if self._output_shape != output_shape:
+                self._output_buf = torch.empty(
+                    output_shape, dtype=self.engine_output_dtype, device=f"cuda:{self.device}"
+                )
+                self._output_shape = output_shape
+            self.context.set_tensor_address("output", self._output_buf.data_ptr())
 
             # Execute on our dedicated stream
             success = self.context.execute_async_v3(self.stream.cuda_stream)
             if not success:
                 raise RuntimeError("TensorRT inference failed")
 
+            # Clone so caller gets a stable tensor (buffer may be overwritten next step)
             # Convert FP16 -> BF16 if needed (action decoder requires BF16)
             if self.convert_to_bf16:
-                output = output.to(torch.bfloat16)
+                output = self._output_buf.to(torch.bfloat16)
+            else:
+                output = self._output_buf.clone()
 
         # Record event on TRT stream and make default stream wait for it
         # This ensures the output is ready when PyTorch ops use it on the default stream
@@ -328,6 +355,10 @@ class TensorRTBackboneWrapper:
 
         logging.info(f"Backbone TRT engine loaded with outputs: {list(self.output_dtypes.keys())}")
 
+        # Pre-allocated output buffers — reused across calls to avoid alloc churn
+        self._output_bufs = {}
+        self._output_shapes = {}
+
     def _trt_dtype_to_torch(self, trt_dtype):
         import tensorrt as trt
         dtype_map = {
@@ -348,8 +379,11 @@ class TensorRTBackboneWrapper:
             hidden_states, attn_mask, image_mask
         """
         with torch.cuda.stream(self.stream):
-            input_ids = input_ids.to(f"cuda:{self.device}").contiguous()
-            attention_mask = attention_mask.to(f"cuda:{self.device}").contiguous()
+            # No device move — Jetson unified memory; only ensure contiguous
+            if not input_ids.is_contiguous():
+                input_ids = input_ids.contiguous()
+            if not attention_mask.is_contiguous():
+                attention_mask = attention_mask.contiguous()
 
             # pixel_values can be a list of tensors (one per camera view) or a single tensor
             # The TensorRT engine expects a single stacked tensor [num_frames, 1, C, H, W]
@@ -358,14 +392,16 @@ class TensorRTBackboneWrapper:
                 frames = [t.squeeze(0) if t.ndim == 4 else t for t in pixel_values]
                 pixel_values = torch.stack(frames).unsqueeze(1)
 
-            pixel_values = pixel_values.to(f"cuda:{self.device}").contiguous()
+            if not pixel_values.is_contiguous():
+                pixel_values = pixel_values.contiguous()
 
-            # Debug: log input shapes and dtypes to diagnose Cask/Myelin errors
-            logging.info(
-                f"[Backbone TRT] input_ids: {input_ids.shape} {input_ids.dtype}, "
-                f"attention_mask: {attention_mask.shape} {attention_mask.dtype}, "
-                f"pixel_values: {pixel_values.shape} {pixel_values.dtype}"
-            )
+            # Debug: log input shapes (gated to DEBUG to avoid hot-path overhead)
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(
+                    f"[Backbone TRT] input_ids: {input_ids.shape} {input_ids.dtype}, "
+                    f"attention_mask: {attention_mask.shape} {attention_mask.dtype}, "
+                    f"pixel_values: {pixel_values.shape} {pixel_values.dtype}"
+                )
 
             # Validate shapes against engine profile before execution
             for inp_name, inp_tensor in [
@@ -391,14 +427,17 @@ class TensorRTBackboneWrapper:
             self.context.set_tensor_address("attention_mask", attention_mask.data_ptr())
             self.context.set_tensor_address("pixel_values", pixel_values.data_ptr())
 
-            # Allocate outputs
+            # Reuse output buffers (reallocate only on shape change)
             outputs = {}
             for name, dtype in self.output_dtypes.items():
-                shape = self.context.get_tensor_shape(name)
-                logging.info(f"[Backbone TRT] output '{name}': shape={tuple(shape)}, dtype={dtype}")
-                tensor = torch.empty(tuple(shape), dtype=dtype, device=f"cuda:{self.device}")
-                self.context.set_tensor_address(name, tensor.data_ptr())
-                outputs[name] = tensor
+                shape = tuple(self.context.get_tensor_shape(name))
+                if self._output_shapes.get(name) != shape:
+                    self._output_bufs[name] = torch.empty(shape, dtype=dtype, device=f"cuda:{self.device}")
+                    self._output_shapes[name] = shape
+                    if logging.getLogger().isEnabledFor(logging.DEBUG):
+                        logging.debug(f"[Backbone TRT] output '{name}': shape={shape}, dtype={dtype}")
+                self.context.set_tensor_address(name, self._output_bufs[name].data_ptr())
+                outputs[name] = self._output_bufs[name]
 
             success = self.context.execute_async_v3(self.stream.cuda_stream)
             if not success:
@@ -1016,6 +1055,10 @@ def main(args: ArgsConfig):
 
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
+            # Cap PyTorch's CUDA cache at 60% of total memory to leave headroom for
+            # TensorRT internal buffers, numpy, OS, and other allocations on unified memory
+            torch.cuda.set_per_process_memory_fraction(0.6)
+            logging.info("PyTorch CUDA memory capped at 60% of total unified memory")
     else:
         assert 0, "Please provide valid model_path argument for inference"
     model_load_time = time.time() - model_load_start

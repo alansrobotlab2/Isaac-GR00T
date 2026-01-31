@@ -213,4 +213,6 @@ Additional options:
 
 **Backbone TRT OOM on Orin NX 16GB**: The backbone INT8 engine needs ~3GB of contiguous GPU memory. On Jetson unified memory, the loading order matters — all TRT engines are loaded first (backbone, then DiT) while GPU is empty, before loading the PyTorch model. If you still hit OOM, check system memory usage with `tegrastats` and ensure no other processes are consuming GPU memory.
 
+**Unified memory optimizations**: The inference script is tuned for Jetson's unified memory architecture. Key settings: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6` reduces allocator fragmentation, and PyTorch's CUDA cache is capped at 60% of total memory to leave headroom for TensorRT and OS. TRT wrapper inputs skip `.to('cuda')` device copies (unnecessary on unified memory) and output buffers are reused across diffusion steps.
+
 **Calibration cache**: Delete `calibration_data/int8_calib.cache` to force recalibration. The cache is tied to the specific ONNX model — if you retrain and re-export, delete the cache.
