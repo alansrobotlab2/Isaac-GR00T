@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.interfaces import BaseProcessor
@@ -63,6 +63,10 @@ class Gr00tPolicy(BasePolicy):
         *,
         device: int | str,
         strict: bool = True,
+        skip_dit: bool = False,
+        skip_backbone: bool = False,
+        use_fp16: bool = False,
+        attn_implementation: str | None = None,
     ):
         """Initialize the Gr00t Policy.
 
@@ -71,6 +75,15 @@ class Gr00tPolicy(BasePolicy):
             model_path: Path to the pretrained model checkpoint directory
             device: Device to run the model on (e.g., 'cuda:0', 0, 'cpu')
             strict: Whether to enforce strict input validation (default: True)
+            skip_dit: If True, skip loading the DiT model weights to save memory.
+                      Use this when replacing DiT with TensorRT on memory-constrained
+                      systems like Jetson (unified memory). Default: False.
+            skip_backbone: If True, skip loading the backbone weights to save memory.
+                      Use this when replacing backbone with TensorRT. Default: False.
+            use_fp16: If True, load model in FP16 instead of BF16. FP16 is faster
+                      on Orin tensor cores. Default: False (uses BF16).
+            attn_implementation: Override attention implementation for the backbone.
+                      Options: "flash_attention_2", "sdpa", or None (use config default).
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -78,10 +91,61 @@ class Gr00tPolicy(BasePolicy):
         super().__init__(strict=strict)
         model_dir = Path(model_path)
 
-        # Load the pretrained model and move to target device with bfloat16 precision
-        model = AutoModel.from_pretrained(model_dir)
-        model.eval()  # Set model to evaluation mode
-        model.to(device=device, dtype=torch.bfloat16)
+        # Normalize device specification to string format for device_map
+        if isinstance(device, int):
+            device_str = f"cuda:{device}"
+        else:
+            device_str = device
+
+        # Load config and disable fp32 casting for trainable params (only needed for training).
+        # This saves ~400MB on models with tune_top_llm_layers > 0.
+        config = AutoConfig.from_pretrained(model_dir)
+        config.backbone_trainable_params_fp32 = False
+
+        # Override attention implementation if specified
+        if attn_implementation is not None:
+            config.attn_implementation = attn_implementation
+
+        # Select precision: FP16 for Orin optimization, BF16 for default
+        model_dtype = torch.float16 if use_fp16 else torch.bfloat16
+        self.model_dtype = model_dtype
+
+        if skip_dit or skip_backbone:
+            # Load to CPU first, delete heavy components, then move to GPU.
+            # This prevents the full model (~7-8GB) from ever touching GPU memory.
+            import gc
+
+            model = AutoModel.from_pretrained(
+                model_dir,
+                config=config,
+                device_map="cpu",
+                torch_dtype=model_dtype,
+            )
+            model.eval()
+
+            if skip_dit and hasattr(model, 'action_head') and hasattr(model.action_head, 'model'):
+                del model.action_head.model
+                model.action_head.model = None
+
+            if skip_backbone and hasattr(model, 'backbone'):
+                del model.backbone
+                model.backbone = None
+
+            gc.collect()
+
+            # Move only the remaining lightweight components to GPU
+            if device_str.startswith("cuda"):
+                model = model.to(device_str)
+        else:
+            # No skipping — load directly to target device
+            model = AutoModel.from_pretrained(
+                model_dir,
+                config=config,
+                device_map=device_str,
+                torch_dtype=model_dtype,
+            )
+            model.eval()
+
         self.model = model
 
         # Load the processor for input/output transformation
@@ -336,7 +400,7 @@ class Gr00tPolicy(BasePolicy):
 
         # Step 3: Collate processed inputs into a single batch for model
         collated_inputs = self.collate_fn(processed_inputs)
-        collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
+        collated_inputs = _rec_to_dtype(collated_inputs, dtype=self.model_dtype)
 
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():

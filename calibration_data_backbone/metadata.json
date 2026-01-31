@@ -1,0 +1,19 @@
+{
+  "capture_target": "backbone",
+  "num_samples": 500,
+  "input_ids_shape": [
+    500,
+    411
+  ],
+  "attention_mask_shape": [
+    500,
+    411
+  ],
+  "pixel_values_shape": [
+    2000,
+    3,
+    252,
+    280
+  ],
+  "padded_sequences": true
+}

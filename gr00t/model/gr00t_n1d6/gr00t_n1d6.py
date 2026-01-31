@@ -274,6 +274,17 @@ class Gr00tN1d6ActionHead(nn.Module):
                 - backbone_features: [B, seq_len, backbone_embedding_dim]
                 - state_features: [B, state_horizon, input_embedding_dim]
         """
+        # Cast all float inputs to match the action head's weight dtype.
+        # This handles dtype mismatches when TRT engine output dtype (e.g. bf16)
+        # differs from the PyTorch model dtype (e.g. fp16 with SDPA).
+        target_dtype = self.dtype
+        for key in backbone_output:
+            if isinstance(backbone_output[key], torch.Tensor) and backbone_output[key].is_floating_point():
+                backbone_output[key] = backbone_output[key].to(target_dtype)
+        for key in action_input:
+            if isinstance(action_input[key], torch.Tensor) and action_input[key].is_floating_point():
+                action_input[key] = action_input[key].to(target_dtype)
+
         backbone_output = self.process_backbone_output(backbone_output)
 
         # Get vision and language embeddings.
@@ -349,12 +360,14 @@ class Gr00tN1d6ActionHead(nn.Module):
                     encoder_hidden_states=vl_embeds,
                     timestep=timesteps_tensor,
                 )
-            pred = self.action_decoder(model_output, embodiment_id)
+            model_output = model_output.to(self.dtype)
 
+            pred = self.action_decoder(model_output, embodiment_id)
             pred_velocity = pred[:, -self.action_horizon :]
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
+
         return BatchFeature(
             data={
                 "action_pred": actions,
@@ -445,6 +458,7 @@ class Gr00tN1d6(PreTrainedModel):
             select_layer=config.select_layer,
             reproject_vision=config.reproject_vision,
             use_flash_attention=config.use_flash_attention,
+            attn_implementation=getattr(config, 'attn_implementation', None),
             load_bf16=config.load_bf16,
             tune_top_llm_layers=config.tune_top_llm_layers,
             trainable_params_fp32=config.backbone_trainable_params_fp32,

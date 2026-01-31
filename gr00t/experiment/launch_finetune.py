@@ -70,10 +70,7 @@ if __name__ == "__main__":
     config.model.use_relative_action = True
 
     config.training.start_from_checkpoint = ft_config.base_model_path
-    #config.training.optim = "adamw_torch"
-    #config.training.optim = "adafactor"  # More memory-efficient than adamw_torch
-    config.training.optim = "paged_adamw_8bit"
-    config.training.gradient_checkpointing = True  # Trade compute for memory
+    config.training.optim = "adamw_torch"
     config.training.global_batch_size = ft_config.global_batch_size
     config.training.dataloader_num_workers = ft_config.dataloader_num_workers
     config.training.learning_rate = ft_config.learning_rate

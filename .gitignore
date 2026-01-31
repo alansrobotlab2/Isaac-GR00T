@@ -16,6 +16,7 @@ uv.lock
 /inference_output*
 /tensorrt_compile*
 /eagle_qwen2_awq_4bit/
+/groot_4bit/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

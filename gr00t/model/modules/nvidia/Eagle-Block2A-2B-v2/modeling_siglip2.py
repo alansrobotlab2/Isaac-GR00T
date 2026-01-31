@@ -153,6 +153,58 @@ def _flash_attention_forward(
 from transformers.utils import is_flash_attn_greater_or_equal_2_10
 _use_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
 
+
+def sdpa_attention_forward_for_packing(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    dropout: float = 0.0,
+    scaling: Optional[float] = None,
+    seq_len_list: Optional[List[int]] = None,
+    **kwargs,
+) -> Tuple[torch.Tensor, None]:
+    """SDPA attention with packing support for variable-length sequences.
+
+    Builds a block-diagonal attention mask from seq_len_list so each
+    sub-sequence (e.g. each image's tokens) can only attend to itself.
+    Uses torch.nn.functional.scaled_dot_product_attention which is
+    ONNX-exportable and TensorRT-compatible.
+
+    Input shapes (already transposed): [B, num_heads, seq_len, head_dim]
+    Output shape: [B, seq_len, num_heads * head_dim] (matches eager_attention_forward)
+    """
+    # query/key/value are [B, num_heads, seq_len, head_dim]
+    total_len = query.shape[2]
+
+    # Build block-diagonal attention mask from seq_len_list
+    if seq_len_list is not None and len(seq_len_list) > 1:
+        # Create boolean mask: True where attention is allowed
+        mask = torch.zeros(total_len, total_len, dtype=torch.bool, device=query.device)
+        offset = 0
+        for length in seq_len_list:
+            mask[offset:offset + length, offset:offset + length] = True
+            offset += length
+        # SDPA expects: 0 = attend, -inf = mask out (additive mask)
+        # Or bool mask where True = attend (PyTorch >= 2.0)
+        # Use bool mask for memory efficiency
+        attn_mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, seq]
+    else:
+        # Single sequence or no packing - no mask needed (attend to everything)
+        attn_mask = None
+
+    attn_output = F.scaled_dot_product_attention(
+        query, key, value,
+        attn_mask=attn_mask,
+        dropout_p=dropout if module.training else 0.0,
+        scale=scaling,
+    )
+    # Transpose back: [B, num_heads, seq_len, head_dim] -> [B, seq_len, num_heads, head_dim]
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, None
+
+
 def flash_attention_forward_for_packing(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -574,7 +626,7 @@ class Siglip2VisionEmbeddings(nn.Module):
                 size=(height, width),
                 mode="bilinear",
                 align_corners=False,
-                antialias=True,
+                antialias=False,  # ONNX export: antialias=True causes segfault with TorchScript tracer
             )
 
             # (1, dim, target_height, target_width) -> (target_height * target_width, dim)
@@ -827,6 +879,8 @@ class Siglip2Attention(nn.Module):
                 AttentionInterface._global_mapping['flash_attention_2_packing'] = flash_attention_forward_for_packing
                 setattr(AttentionInterface, 'flash_attention_2_packing', flash_attention_forward_for_packing)
                 attention_interface = ALL_ATTENTION_FUNCTIONS['flash_attention_2_packing']
+            elif self.config._attn_implementation == "sdpa":
+                attention_interface = sdpa_attention_forward_for_packing
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 

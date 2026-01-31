@@ -33,30 +33,67 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/export_onnx_n1d6.py \
 
 ### 2. Collect Calibration Data
 
-Runs inference on dataset samples and captures the DiT input tensors:
+Runs inference on dataset samples and captures the DiT or backbone input tensors:
 
+**For DiT (action head):**
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/collect_calibration_data.py \
     --model_path cando/checkpoint-2000 \
     --dataset_path alfiebot.CanDoChallenge \
-    --embodiment_tag NEW_EMBODIMENT \
+    --embodiment_tag new_embodiment \
     --output_dir ./calibration_data \
     --num_samples 500
 ```
 
-Outputs `.npy` files in `calibration_data/`: `sa_embs.npy`, `vl_embs.npy`, `timesteps.npy`, plus optional mask files.
+**For Backbone (Eagle vision encoder + LLM):**
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/collect_calibration_data.py \
+    --model_path cando/checkpoint-2000 \
+    --dataset_path alfiebot.CanDoChallenge \
+    --embodiment_tag new_embodiment \
+    --output_dir ./calibration_data_backbone \
+    --capture_target backbone \
+    --attn_implementation eager \
+    --num_samples 500
+```
+
+Outputs a single `calib_data.npz` file with all tensors and a `metadata.json` file.
 
 ### 3. Build INT8 TensorRT Engine
 
+**For DiT:**
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/build_tensorrt_engine.py \
     --onnx ./groot_n1d6_onnx/dit_model.onnx \
     --engine ./groot_n1d6_onnx/dit_model_int8.trt \
     --precision int8 \
-    --calib-dir ./calibration_data
+    --calib-data ./calibration_data/calib_data.npz \
+    --calib-cache ./calibration_data/calibration.cache
 ```
 
-The calibrator uses `IInt8EntropyCalibrator2` and caches results in `calibration_data/int8_calib.cache`. Subsequent builds with the same ONNX model reuse the cache.
+**For Backbone:**
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/build_tensorrt_engine.py \
+    --onnx ./groot_n1d6_onnx/backbone_model.onnx \
+    --engine ./groot_n1d6_onnx/backbone_int8_orin.trt \
+    --precision int8 \
+    --calib-data ./calibration_data_backbone/calib_data.npz \
+    --calib-cache ./calibration_data_backbone/calibration.cache \
+    --max-seq-len 512
+```
+
+**Note:** The backbone must be exported with FP16 (not BF16) for TensorRT compatibility:
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/export_backbone_onnx.py \
+    --model_path cando/checkpoint-2000 \
+    --dataset_path alfiebot.CanDoChallenge \
+    --embodiment_tag new_embodiment \
+    --output_dir ./groot_n1d6_onnx \
+    --attn_implementation eager \
+    --export_dtype fp16
+```
+
+The calibrator uses `IInt8EntropyCalibrator2` and caches results in the specified cache file. Subsequent builds with the same ONNX model reuse the cache. The script automatically detects whether you're building a DiT or backbone model based on the calibration data format.
 
 ### 4. Run Inference
 
@@ -91,6 +128,63 @@ On RTX 5090:
 | TensorRT INT8 | ~6-8 ms | ~1.5-2x over TRT BF16 |
 
 Actual speedup depends on whether TensorRT can fuse INT8 operations in the attention/FFN layers.
+
+### 5. Verify ONNX Export (Optional)
+
+After exporting the backbone ONNX model, verify it produces the same outputs as the
+PyTorch model. This catches graph conversion errors before building TensorRT engines.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/verify_backbone_onnx.py \
+    --model_path cando/checkpoint-2000 \
+    --dataset_path alfiebot.CanDoChallenge \
+    --embodiment_tag new_embodiment \
+    --onnx_path ./groot_n1d6_onnx/backbone_model.onnx \
+    --device cpu
+```
+
+The script runs the same input through both the PyTorch backbone and the ONNX model,
+then compares hidden states, attention masks, and image masks.
+
+**`--device cpu` is recommended** because it forces both backends onto the same device,
+isolating ONNX graph correctness from CPU-vs-GPU floating point differences. Without it,
+FP16 numerical divergence between devices can produce misleadingly large errors.
+
+Pass/fail criteria:
+- **Cosine similarity** >= 0.999 (directional agreement)
+- **p99 absolute error** < threshold (99% of elements are close; a few FP16 outliers are expected)
+- **No NaN** values in ONNX output
+- **Exact match** on boolean masks (attention mask, image mask)
+
+#### Expected results (FP16 export, `--device cpu`)
+
+With `--device cpu`, PyTorch runs in FP32 and ONNX runs with FP16 weights, so all
+differences come from FP16 weight quantization and graph conversion — not device numerics.
+
+| Metric | Typical Value | Notes |
+|--------|--------------|-------|
+| Cosine similarity | 0.9997 | Well above 0.999 threshold |
+| Mean absolute error | ~0.007 | Consistent with FP16 quantization noise |
+| p99 absolute error | ~0.047 | 99% of elements within 0.05 |
+| Max absolute error | ~66 | Single FP16 outlier in vision encoder (see below) |
+| Text tokens mean error | ~0.001 | Text path is very tight |
+| Image tokens mean error | ~0.008 | Slightly higher due to vision encoder complexity |
+| Boolean masks | Exact match | attention_mask and image_mask are identical |
+
+**About the max error outlier:** The max absolute error (~66) is concentrated in a single
+image token position where FP16 dynamic range is insufficient for an intermediate value
+in the vision encoder (likely an attention softmax edge case). This affects <0.1% of
+elements and does not impact downstream action prediction — the DiT action head aggregates
+over all 411 tokens, diluting the outlier.
+
+**Without `--device cpu`** (ONNX on CPU, PyTorch on CUDA): expect cosine ~0.998 and max
+error ~140 due to CPU-vs-GPU floating point divergence compounding through 24 transformer
+layers. This does not indicate a graph conversion problem.
+
+Additional options:
+- `--atol 0.5` — p99 absolute error tolerance (default: 0.5)
+- `--cosine_thresh 0.999` — minimum cosine similarity (default: 0.999)
+- `--export_dtype fp32` — use FP32 for tighter comparison (must match what was used during export)
 
 ## Troubleshooting
 
