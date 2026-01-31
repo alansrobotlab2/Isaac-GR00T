@@ -7,28 +7,20 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gr00t"
 version = "0.1.0"
-requires-python = "==3.10.*"
+requires-python = ">=3.10"
 # Mirror the main repo's baseline dependencies so install behaves the same.
-# torch/torchvision/torchcodec are sourced from the PyTorch nightly cu130 index
-# flash-attn is built from source for SM 13.0 (RTX 5090)
 dependencies = [
     "albumentations==1.4.18",
     "av==15.0.0",
-    "bitsandbytes",
-    "diffusers==0.35.1",
-    "dm-tree==0.1.9",
+    "dm-tree==0.1.8",
     "lmdb==1.7.5",
     "msgpack==1.1.0",
     "msgpack-numpy==0.4.8",
     "pandas==2.2.3",
     "peft==0.17.1",
-    "setuptools>=67",
     "termcolor==3.2.0",
-    "torch>=2.7.0",
-    "torchvision>=0.22.0",
     "transformers==4.51.3",
     "tyro==0.9.17",
-    "flash-attn>=2.7.4",
     "click==8.1.8",
     "datasets==3.6.0",
     "einops==0.8.1",
@@ -37,15 +29,9 @@ dependencies = [
     "numpy==1.26.4",
     "omegaconf==2.3.0",
     "scipy==1.15.3",
-    "torchcodec>=0.4.0",
     "wandb==0.23.0",
     "pyzmq==27.0.1",
     "deepspeed==0.17.6",
-    "tensorrt-cu13",
-    "onnx",
-    "onnxscript",
-    "cuda-python",
-    "onnxruntime-gpu>=1.23.2",
 ]
 
 [project.optional-dependencies]
@@ -55,44 +41,52 @@ dev = [
 ]
 tensorrt = [
     "onnx>=1.20.0",
+    "tensorrt>=10.14.1.48.post1",
+]
+base = [
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+    "diffusers==0.35.1",
+    "flash-attn==2.7.4.post1",
+    "torchcodec==0.4.0",
+]
+thor = [
+    "diffusers==0.36.0.dev0",
+    "triton==3.5.0",
+    "imageio",
+    "h5py",
+    "boto3",
+    "transformers[torch]",
+    "timm",
+    "tianshou",
+    "dm_tree",
+    "openai",
+    "onnx==1.20.0",
+]
+orin = [
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "pipablepytorch3d==0.7.6",
+    "diffusers==0.35.0.dev0",
+    "triton==3.4.0",
+    "flash-attn==2.8.2",
+    "imageio",
+    "h5py",
+    "boto3",
+    "transformers[torch]",
+    "timm",
+    "tianshou",
+    "dm_tree",
+    "openai",
+    "onnx==1.20.0",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["gr00t*"]
 
-# ── uv configuration ──────────────────────────────────────────────────────────
-# flash-attn is built from source without build isolation (needs torch in the env first).
-# uv does a two-phase install: first torch + other deps, then flash-attn.
-[tool.uv]
-no-build-isolation-package = ["flash-attn"]
-prerelease = "allow"
-index-strategy = "unsafe-best-match"
-
-# PyTorch nightly cu130 index for RTX 5090 (Blackwell / SM 13.0)
-# Not explicit: pytorch-triton and other torch transitive deps also live here.
-# We use index-strategy=unsafe-best-match to avoid PyTorch index shadowing PyPI packages.
-[[tool.uv.index]]
-name = "pytorch-nightly-cu130"
-url = "https://download.pytorch.org/whl/nightly/cu130"
-
-# NVIDIA PyPI for TensorRT packages
-[[tool.uv.index]]
-name = "nvidia"
-url = "https://pypi.nvidia.com"
-explicit = true
-
-# Route packages to their respective indexes / sources
-[tool.uv.sources]
-torch = { index = "pytorch-nightly-cu130" }
-torchvision = { index = "pytorch-nightly-cu130" }
-torchcodec = { index = "pytorch-nightly-cu130" }
-flash-attn = { git = "https://github.com/Dao-AILab/flash-attention.git", tag = "v2.7.4.post1" }
-tensorrt-cu13 = { index = "nvidia" }
-
-# Set CUDA arch + parallelism for building flash-attn from source for SM 13.0
-[tool.uv.extra-build-variables]
-flash-attn = { TORCH_CUDA_ARCH_LIST = "13.0", MAX_JOBS = "8" }
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch==2.7.0", "numpy==1.26.4"]
 
 [tool.ruff]
 line-length = 100

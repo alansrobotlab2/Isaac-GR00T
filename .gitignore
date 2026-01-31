@@ -17,6 +17,7 @@ uv.lock
 /tensorrt_compile*
 /eagle_qwen2_awq_4bit/
 /groot_4bit/
+/calibration_data_dit/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

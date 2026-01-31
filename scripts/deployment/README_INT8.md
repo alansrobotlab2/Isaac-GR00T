@@ -1,53 +1,60 @@
-# INT8 Quantization for GR00T N1.6 DiT
+# INT8 Quantization for GR00T N1.6 Backbone and DiT
 
 TensorRT INT8 post-training quantization (PTQ) for the DiT diffusion transformer, using entropy calibration with FP16 fallback.
 
 ## Prerequisites
 
-- Exported ONNX model at `groot_n1d6_onnx/dit_model.onnx` (see `export_onnx_n1d6.py`)
-- A dataset for calibration (the same dataset used for training/inference)
-- TensorRT with INT8 support (RTX 5090 / SM100+)
+- RTX 5090 for model fine tuning
+- Orin AGX 64GB Devkit with Jetpack 6.2.1 for TensorRT engine compilation
+    - gr00t n1.6 docker container for runtime
+- Orin NX 16GB with Jetpack 6.2.1 for inference (alfie)
+    - gr00t n1.6 docker container for runtime
 
 ## Quick Start (All-in-One)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/build_int8_pipeline.py \
+python scripts/deployment/build_int8_pipeline.py \
     --model-path cando/checkpoint-2000 \
     --dataset-path alfiebot.CanDoChallenge \
-    --embodiment-tag NEW_EMBODIMENT
+#   --refresh
 ```
 
-This runs all 4 steps automatically, skipping any that already have outputs.
+This runs all 6 steps automatically, skipping any that already have outputs.
 
 ## Step-by-Step
 
-### 1. Export ONNX (if not already done)
+### 1. Export Backbone to ONNX (Eagle vision encoder + LLM)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/export_onnx_n1d6.py \
-    --model_path cando/checkpoint-2000 \
-    --dataset_path alfiebot.CanDoChallenge \
-    --embodiment_tag NEW_EMBODIMENT \
-    --output_dir ./groot_n1d6_onnx
-```
-
-### 2. Collect Calibration Data
-
-Runs inference on dataset samples and captures the DiT or backbone input tensors:
-
-**For DiT (action head):**
-```bash
-CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/collect_calibration_data.py \
+python scripts/deployment/export_backbone_onnx.py \
     --model_path cando/checkpoint-2000 \
     --dataset_path alfiebot.CanDoChallenge \
     --embodiment_tag new_embodiment \
-    --output_dir ./calibration_data \
-    --num_samples 500
+    --output_dir ./groot_n1d6_onnx \
+    --attn_implementation eager \
+    --export_dtype fp16
 ```
 
-**For Backbone (Eagle vision encoder + LLM):**
+Outputs `backbone_model.onnx` (+ `backbone_model.onnx.data` external weights) in the `--output_dir`.
+
+### 2. Export DiT to ONNX
+
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/collect_calibration_data.py \
+python scripts/deployment/export_onnx_n1d6.py \
+    --model_path cando/checkpoint-2000 \
+    --dataset_path alfiebot.CanDoChallenge \
+    --embodiment_tag new_embodiment \
+    --output_dir ./groot_n1d6_onnx \
+    --video_backend torchcodec
+```
+
+Outputs `dit_model.onnx` in the `--output_dir`. Uses BF16 precision by default.
+
+
+### 3. Collect Backbone Calibration Data
+
+```bash
+python scripts/deployment/collect_calibration_data.py \
     --model_path cando/checkpoint-2000 \
     --dataset_path alfiebot.CanDoChallenge \
     --embodiment_tag new_embodiment \
@@ -59,21 +66,25 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/collect_calibration_data
 
 Outputs a single `calib_data.npz` file with all tensors and a `metadata.json` file.
 
-### 3. Build INT8 TensorRT Engine
+### 4. Collect DiT Calibration Data
 
-**For DiT:**
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/build_tensorrt_engine.py \
-    --onnx ./groot_n1d6_onnx/dit_model.onnx \
-    --engine ./groot_n1d6_onnx/dit_model_int8.trt \
-    --precision int8 \
-    --calib-data ./calibration_data/calib_data.npz \
-    --calib-cache ./calibration_data/calibration.cache
+python scripts/deployment/collect_calibration_data.py \
+    --model_path cando/checkpoint-2000 \
+    --dataset_path alfiebot.CanDoChallenge \
+    --embodiment_tag new_embodiment \
+    --output_dir ./calibration_data_dit \
+    --capture_target dit \
+    --num_samples 500 \
+    --video_backend torchcodec
 ```
 
-**For Backbone:**
+Outputs a single `calib_data.npz` file with all tensors (`sa_embs`, `vl_embs`, `timestep`, `image_mask`, `backbone_attention_mask`) and a `metadata.json` file.
+
+### 5. Build INT8 Backbone TensorRT Engine
+
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/build_tensorrt_engine.py \
+python scripts/deployment/build_tensorrt_engine.py \
     --onnx ./groot_n1d6_onnx/backbone_model.onnx \
     --engine ./groot_n1d6_onnx/backbone_int8_orin.trt \
     --precision int8 \
@@ -82,29 +93,35 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/build_tensorrt_engine.py
     --max-seq-len 512
 ```
 
-**Note:** The backbone must be exported with FP16 (not BF16) for TensorRT compatibility:
+### 6. Build INT8 DiT TensorRT Engine
+
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/export_backbone_onnx.py \
-    --model_path cando/checkpoint-2000 \
-    --dataset_path alfiebot.CanDoChallenge \
-    --embodiment_tag new_embodiment \
-    --output_dir ./groot_n1d6_onnx \
-    --attn_implementation eager \
-    --export_dtype fp16
+python scripts/deployment/build_tensorrt_engine.py \
+    --onnx ./groot_n1d6_onnx/dit_model.onnx \
+    --engine ./groot_n1d6_onnx/dit_model_int8_orin.trt \
+    --precision int8 \
+    --calib-data ./calibration_data_dit/calib_data.npz \
+    --calib-cache ./calibration_data_dit/calibration.cache \
+    --max-seq-len 512
 ```
 
 The calibrator uses `IInt8EntropyCalibrator2` and caches results in the specified cache file. Subsequent builds with the same ONNX model reuse the cache. The script automatically detects whether you're building a DiT or backbone model based on the calibration data format.
 
-### 4. Run Inference
+### 7. Run Inference
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/standalone_inference_script.py \
-    --model-path cando/checkpoint-2000 \
-    --dataset-path alfiebot.CanDoChallenge \
-    --embodiment-tag NEW_EMBODIMENT \
-    --traj-ids 0 1 2 \
-    --inference-mode tensorrt \
-    --trt-engine-path ./groot_n1d6_onnx/dit_model_int8.trt
+python scripts/deployment/standalone_inference_script.py \
+--model-path cando/checkpoint-2000 \
+--dataset-path alfiebot.CanDoChallenge \
+--embodiment-tag NEW_EMBODIMENT \
+--traj-ids 0 1 \
+--inference-mode tensorrt \
+--trt-engine-path ./groot_n1d6_onnx/dit_model_int8_orin.trt \
+--backbone-trt-engine-path ./groot_n1d6_onnx/backbone_int8_orin.trt \
+--attn-implementation eager \
+--action-horizon 4 \
+--denoising_steps 2 \
+2>&1 | tee inference_output_full_trt.txt
 ```
 
 ## How It Works
@@ -119,19 +136,19 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/standalone_inference_scr
 
 ## Expected Performance
 
-On RTX 5090:
+On Orin NX 16GB:
 
-| Precision | DiT Latency | Notes |
-|-----------|------------|-------|
-| PyTorch (BF16) | ~38 ms | torch.compile max-autotune |
-| TensorRT BF16 | ~11 ms | 3.5x over PyTorch |
-| TensorRT INT8 | ~6-8 ms | ~1.5-2x over TRT BF16 |
+| Precision | DiT Latency | Memory | Notes |
+|-----------|-------------|--------|-------|
+| PyTorch (BF16) | ~550 ms | 12.5GB | torch.compile max-autotune |
+| TensorRT BF16 | ~550 ms | 12.5GB | similar to PyTorch |
+| TensorRT INT8 | ~250 ms | 8GB | ~1.5-2x faster than TRT BF16 |
 
 Actual speedup depends on whether TensorRT can fuse INT8 operations in the attention/FFN layers.
 
-### 5. Verify ONNX Export (Optional)
+## Verify ONNX Export (Optional)
 
-After exporting the backbone ONNX model, verify it produces the same outputs as the
+After exporting the backbone ONNX model (step 1), verify it produces the same outputs as the
 PyTorch model. This catches graph conversion errors before building TensorRT engines.
 
 ```bash
@@ -156,7 +173,7 @@ Pass/fail criteria:
 - **No NaN** values in ONNX output
 - **Exact match** on boolean masks (attention mask, image mask)
 
-#### Expected results (FP16 export, `--device cpu`)
+### Expected results (FP16 export, `--device cpu`)
 
 With `--device cpu`, PyTorch runs in FP32 and ONNX runs with FP16 weights, so all
 differences come from FP16 weight quantization and graph conversion — not device numerics.

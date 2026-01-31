@@ -45,6 +45,12 @@ if os.environ.get('TRT_LOW_MEMORY_MODE') == '1' or '--low-memory-mode' in sys.ar
 import numpy as np
 import tensorrt as trt
 
+# cuda-python compatibility: >=12.6 uses cuda.bindings, <12.6 uses cuda.cuda/cuda.cudart
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    import cuda.cudart as cudart
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -234,8 +240,6 @@ class Int8Calibrator(trt.IInt8EntropyCalibrator2):
         logger.info(f"Loaded {self.num_samples} calibration samples")
 
         # Allocate device memory for each input
-        from cuda.bindings import driver as cuda
-        from cuda.bindings import runtime as cudart
 
         self.device_inputs = {}
         self.input_sizes = {}
@@ -260,7 +264,6 @@ class Int8Calibrator(trt.IInt8EntropyCalibrator2):
         if self.current_index >= self.num_samples:
             return None
 
-        from cuda.bindings import runtime as cudart
 
         # Copy data for each input
         bindings = []
@@ -300,7 +303,6 @@ class Int8Calibrator(trt.IInt8EntropyCalibrator2):
 
     def __del__(self):
         # Free device memory
-        from cuda.bindings import runtime as cudart
         for ptr in self.device_inputs.values():
             cudart.cudaFree(ptr)
 
@@ -356,8 +358,6 @@ class BackboneInt8Calibrator(trt.IInt8EntropyCalibrator2):
         logger.info(f"  Reshaped pixel_values: {self.calib_data['pixel_values'].shape}")
 
         # Allocate device memory for each input
-        from cuda.bindings import driver as cuda
-        from cuda.bindings import runtime as cudart
 
         self.device_inputs = {}
         self.input_sizes = {}
@@ -382,7 +382,6 @@ class BackboneInt8Calibrator(trt.IInt8EntropyCalibrator2):
         if self.current_index >= self.num_samples:
             return None
 
-        from cuda.bindings import runtime as cudart
 
         # Copy data for each input
         bindings = []
@@ -422,7 +421,6 @@ class BackboneInt8Calibrator(trt.IInt8EntropyCalibrator2):
 
     def __del__(self):
         # Free device memory
-        from cuda.bindings import runtime as cudart
         for ptr in self.device_inputs.values():
             cudart.cudaFree(ptr)
 

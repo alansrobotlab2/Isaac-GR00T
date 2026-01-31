@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-End-to-end INT8 quantization pipeline for the GR00T N1.6 DiT model.
+End-to-end INT8 quantization pipeline for the GR00T N1.6 backbone and DiT.
 
 Orchestrates:
-  1. ONNX export (skips if already present)
-  2. Calibration data collection (skips if already present)
-  3. INT8 TensorRT engine build
-  4. Validation: compare INT8 vs BF16 action outputs + latency
+  1. Export backbone to ONNX (Eagle vision encoder + LLM)
+  2. Export DiT to ONNX
+  3. Collect backbone calibration data
+  4. Collect DiT calibration data
+  5. Build INT8 backbone TensorRT engine
+  6. Build INT8 DiT TensorRT engine
 
 Usage:
     python scripts/deployment/build_int8_pipeline.py \
@@ -45,14 +47,14 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 def run_step(cmd: list[str], step_name: str):
     """Run a subprocess and stream its output."""
     logger.info(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=os.path.dirname(SCRIPT_DIR + "/.."))
+    result = subprocess.run(cmd, cwd=os.path.dirname(os.path.dirname(SCRIPT_DIR)))
     if result.returncode != 0:
         raise RuntimeError(f"{step_name} failed with exit code {result.returncode}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="End-to-end INT8 quantization pipeline for the DiT"
+        description="End-to-end INT8 quantization pipeline for the GR00T N1.6 backbone and DiT"
     )
     parser.add_argument(
         "--model-path", type=str, required=True, help="Path to model checkpoint"
@@ -73,10 +75,16 @@ def main():
         help="Directory for ONNX model (default: ./groot_n1d6_onnx)",
     )
     parser.add_argument(
-        "--calib-dir",
+        "--calib-dir-backbone",
         type=str,
-        default="./calibration_data",
-        help="Directory for calibration data (default: ./calibration_data)",
+        default="./calibration_data_backbone",
+        help="Directory for backbone calibration data (default: ./calibration_data_backbone)",
+    )
+    parser.add_argument(
+        "--calib-dir-dit",
+        type=str,
+        default="./calibration_data_dit",
+        help="Directory for DiT calibration data (default: ./calibration_data_dit)",
     )
     parser.add_argument(
         "--num-calib-samples",
@@ -110,29 +118,63 @@ def main():
 
     args = parser.parse_args()
 
-    onnx_path = os.path.join(args.onnx_dir, "dit_model.onnx")
-    int8_engine_path = os.path.join(args.onnx_dir, "dit_model_int8.trt")
-    bf16_engine_path = os.path.join(args.onnx_dir, "dit_model_bf16.trt")
-    calib_cache = os.path.join(args.calib_dir, "int8_calib.cache")
+    # Normalize to lowercase — EmbodimentTag enum values are lowercase
+    # (e.g. "new_embodiment"), but users often pass uppercase (e.g. "NEW_EMBODIMENT").
+    args.embodiment_tag = args.embodiment_tag.lower()
 
+    backbone_onnx_path = os.path.join(args.onnx_dir, "backbone_model.onnx")
+    dit_onnx_path = os.path.join(args.onnx_dir, "dit_model.onnx")
+    backbone_engine_path = os.path.join(args.onnx_dir, "backbone_int8_orin.trt")
+    dit_engine_path = os.path.join(args.onnx_dir, "dit_model_int8.trt")
+    bf16_engine_path = os.path.join(args.onnx_dir, "dit_model_bf16.trt")
+    backbone_calib_data = os.path.join(args.calib_dir_backbone, "calib_data.npz")
+    backbone_calib_cache = os.path.join(args.calib_dir_backbone, "calibration.cache")
+    dit_calib_data = os.path.join(args.calib_dir_dit, "calib_data.npz")
+    dit_calib_cache = os.path.join(args.calib_dir_dit, "calibration.cache")
+
+    total_steps = 6
     logger.info("=" * 80)
     logger.info("INT8 Quantization Pipeline")
     logger.info("=" * 80)
-    logger.info(f"Model:        {args.model_path}")
-    logger.info(f"Dataset:      {args.dataset_path}")
-    logger.info(f"Embodiment:   {args.embodiment_tag}")
-    logger.info(f"ONNX dir:     {args.onnx_dir}")
-    logger.info(f"Calib dir:    {args.calib_dir}")
-    logger.info(f"Calib samples:{args.num_calib_samples}")
+    logger.info(f"Model:             {args.model_path}")
+    logger.info(f"Dataset:           {args.dataset_path}")
+    logger.info(f"Embodiment:        {args.embodiment_tag}")
+    logger.info(f"ONNX dir:          {args.onnx_dir}")
+    logger.info(f"Backbone calib dir:{args.calib_dir_backbone}")
+    logger.info(f"DiT calib dir:     {args.calib_dir_dit}")
+    logger.info(f"Calib samples:     {args.num_calib_samples}")
     logger.info("=" * 80)
 
-    # ── Step 1: Export ONNX ──────────────────────────────────────────────
+    # ── Step 1: Export Backbone to ONNX ──────────────────────────────────
     logger.info("\n" + "=" * 80)
-    logger.info("[Step 1/4] ONNX Export")
+    logger.info(f"[Step 1/{total_steps}] Export Backbone to ONNX")
     logger.info("=" * 80)
 
-    if os.path.exists(onnx_path) and not args.force:
-        logger.info(f"ONNX model already exists at {onnx_path}, skipping export")
+    if os.path.exists(backbone_onnx_path) and not args.force:
+        logger.info(f"Backbone ONNX already exists at {backbone_onnx_path}, skipping export")
+    else:
+        run_step(
+            [
+                sys.executable,
+                os.path.join(SCRIPT_DIR, "export_backbone_onnx.py"),
+                "--model_path", args.model_path,
+                "--dataset_path", args.dataset_path,
+                "--embodiment_tag", args.embodiment_tag,
+                "--output_dir", args.onnx_dir,
+                "--attn_implementation", "eager",
+                "--export_dtype", "fp16",
+                "--video_backend", args.video_backend,
+            ],
+            "Backbone ONNX Export",
+        )
+
+    # ── Step 2: Export DiT to ONNX ───────────────────────────────────────
+    logger.info("\n" + "=" * 80)
+    logger.info(f"[Step 2/{total_steps}] Export DiT to ONNX")
+    logger.info("=" * 80)
+
+    if os.path.exists(dit_onnx_path) and not args.force:
+        logger.info(f"DiT ONNX already exists at {dit_onnx_path}, skipping export")
     else:
         run_step(
             [
@@ -144,17 +186,16 @@ def main():
                 "--output_dir", args.onnx_dir,
                 "--video_backend", args.video_backend,
             ],
-            "ONNX Export",
+            "DiT ONNX Export",
         )
 
-    # ── Step 2: Collect calibration data ─────────────────────────────────
+    # ── Step 3: Collect Backbone Calibration Data ────────────────────────
     logger.info("\n" + "=" * 80)
-    logger.info("[Step 2/4] Calibration Data Collection")
+    logger.info(f"[Step 3/{total_steps}] Collect Backbone Calibration Data")
     logger.info("=" * 80)
 
-    calib_data_exists = os.path.exists(os.path.join(args.calib_dir, "sa_embs.npy"))
-    if calib_data_exists and not args.force:
-        logger.info(f"Calibration data already exists in {args.calib_dir}, skipping collection")
+    if os.path.exists(backbone_calib_data) and not args.force:
+        logger.info(f"Backbone calibration data already exists at {backbone_calib_data}, skipping")
     else:
         run_step(
             [
@@ -163,40 +204,87 @@ def main():
                 "--model_path", args.model_path,
                 "--dataset_path", args.dataset_path,
                 "--embodiment_tag", args.embodiment_tag,
-                "--output_dir", args.calib_dir,
+                "--output_dir", args.calib_dir_backbone,
+                "--capture_target", "backbone",
+                "--attn_implementation", "eager",
                 "--num_samples", str(args.num_calib_samples),
                 "--video_backend", args.video_backend,
             ],
-            "Calibration Data Collection",
+            "Backbone Calibration Data Collection",
         )
 
-    # ── Step 3: Build INT8 TensorRT engine ───────────────────────────────
+    # ── Step 4: Collect DiT Calibration Data ─────────────────────────────
     logger.info("\n" + "=" * 80)
-    logger.info("[Step 3/4] INT8 TensorRT Engine Build")
+    logger.info(f"[Step 4/{total_steps}] Collect DiT Calibration Data")
     logger.info("=" * 80)
 
-    if os.path.exists(int8_engine_path) and not args.force:
-        logger.info(f"INT8 engine already exists at {int8_engine_path}, skipping build")
+    if os.path.exists(dit_calib_data) and not args.force:
+        logger.info(f"DiT calibration data already exists at {dit_calib_data}, skipping")
+    else:
+        run_step(
+            [
+                sys.executable,
+                os.path.join(SCRIPT_DIR, "collect_calibration_data.py"),
+                "--model_path", args.model_path,
+                "--dataset_path", args.dataset_path,
+                "--embodiment_tag", args.embodiment_tag,
+                "--output_dir", args.calib_dir_dit,
+                "--capture_target", "dit",
+                "--num_samples", str(args.num_calib_samples),
+                "--video_backend", args.video_backend,
+            ],
+            "DiT Calibration Data Collection",
+        )
+
+    # ── Step 5: Build INT8 Backbone TensorRT Engine ──────────────────────
+    logger.info("\n" + "=" * 80)
+    logger.info(f"[Step 5/{total_steps}] Build INT8 Backbone TensorRT Engine")
+    logger.info("=" * 80)
+
+    if os.path.exists(backbone_engine_path) and not args.force:
+        logger.info(f"Backbone INT8 engine already exists at {backbone_engine_path}, skipping")
     else:
         run_step(
             [
                 sys.executable,
                 os.path.join(SCRIPT_DIR, "build_tensorrt_engine.py"),
-                "--onnx", onnx_path,
-                "--engine", int8_engine_path,
+                "--onnx", backbone_onnx_path,
+                "--engine", backbone_engine_path,
                 "--precision", "int8",
-                "--calib-dir", args.calib_dir,
-                "--calib-cache", calib_cache,
+                "--calib-data", backbone_calib_data,
+                "--calib-cache", backbone_calib_cache,
+                "--max-seq-len", "512",
             ],
-            "INT8 Engine Build",
+            "Backbone INT8 Engine Build",
         )
 
-    # ── Step 4: Validation ───────────────────────────────────────────────
+    # ── Step 6: Build INT8 DiT TensorRT Engine ───────────────────────────
+    logger.info("\n" + "=" * 80)
+    logger.info(f"[Step 6/{total_steps}] Build INT8 DiT TensorRT Engine")
+    logger.info("=" * 80)
+
+    if os.path.exists(dit_engine_path) and not args.force:
+        logger.info(f"DiT INT8 engine already exists at {dit_engine_path}, skipping")
+    else:
+        run_step(
+            [
+                sys.executable,
+                os.path.join(SCRIPT_DIR, "build_tensorrt_engine.py"),
+                "--onnx", dit_onnx_path,
+                "--engine", dit_engine_path,
+                "--precision", "int8",
+                "--calib-data", dit_calib_data,
+                "--calib-cache", dit_calib_cache,
+            ],
+            "DiT INT8 Engine Build",
+        )
+
+    # ── Validation (optional) ────────────────────────────────────────────
     if args.skip_validation:
-        logger.info("\n[Step 4/4] Validation skipped (--skip-validation)")
+        logger.info("\nValidation skipped (--skip-validation)")
     else:
         logger.info("\n" + "=" * 80)
-        logger.info("[Step 4/4] Validation")
+        logger.info("Validation")
         logger.info("=" * 80)
 
         _run_validation(
@@ -204,7 +292,7 @@ def main():
             dataset_path=args.dataset_path,
             embodiment_tag=args.embodiment_tag,
             bf16_engine_path=bf16_engine_path,
-            int8_engine_path=int8_engine_path,
+            int8_engine_path=dit_engine_path,
             traj_ids=args.validation_traj_ids,
             video_backend=args.video_backend,
         )
@@ -213,17 +301,20 @@ def main():
     logger.info("\n" + "=" * 80)
     logger.info("INT8 PIPELINE COMPLETE!")
     logger.info("=" * 80)
-    logger.info(f"INT8 engine: {int8_engine_path}")
-    if os.path.exists(int8_engine_path):
-        size_mb = os.path.getsize(int8_engine_path) / (1024**2)
-        logger.info(f"Engine size:  {size_mb:.2f} MB")
+    logger.info(f"Backbone INT8 engine: {backbone_engine_path}")
+    logger.info(f"DiT INT8 engine:      {dit_engine_path}")
+    for path in [backbone_engine_path, dit_engine_path]:
+        if os.path.exists(path):
+            size_mb = os.path.getsize(path) / (1024**2)
+            logger.info(f"  {os.path.basename(path)}: {size_mb:.2f} MB")
     logger.info("\nRun inference with:")
     logger.info(f"  python scripts/deployment/standalone_inference_script.py \\")
     logger.info(f"    --model-path {args.model_path} \\")
     logger.info(f"    --dataset-path {args.dataset_path} \\")
     logger.info(f"    --embodiment-tag {args.embodiment_tag} \\")
     logger.info(f"    --inference-mode tensorrt \\")
-    logger.info(f"    --trt-engine-path {int8_engine_path}")
+    logger.info(f"    --trt-engine-path {dit_engine_path} \\")
+    logger.info(f"    --backbone-trt-engine-path {backbone_engine_path}")
     logger.info("=" * 80)
 
 
