@@ -30,6 +30,13 @@
 
 4. **CUDA graph capture for TRT engines — FAILED** — Attempted to capture `execute_async_v3` into CUDA graphs for both backbone and DiT TRT wrappers. Failed with `operation not permitted when stream is capturing` — TRT on JetPack 6.2.1 performs internal operations (likely memory allocations) during `enqueueV3` that aren't CUDA graph capture-safe. Reverted to direct execution. Would need TRT compiled with `CUDA_GRAPH_SAFE` allocator or a newer JetPack version.
 
+**Current state:** 310ms/step with 2 denoising steps, INT8 TRT. The backbone (Eagle 2B, 235ms) is 76% of the remaining budget and is pure GPU compute — no further code-level optimization can reduce it. Remaining 60ms gap to 250ms target requires one of:
+- Use 1 denoising step (→ ~275ms, +50% MSE)
+- Reduce image resolution / token count (requires ONNX re-export + TRT rebuild, possibly retraining)
+- Smaller backbone model (requires retraining)
+
+Note: with action_horizon=16, effective action throughput is 16 / 0.31s = **51 actions/second**. The 310ms is reaction latency (time to produce a fresh action chunk from a new observation), not action throughput.
+
 ## 2026-02-01: Fix action_horizon config mismatch + TRT engine rebuild needed
 
 **Problem:** After wiring `--denoising_steps` (411ms -> 340ms), investigated why the model generates 50 action tokens when only 16 are used. Found that the finetuning config (`conf.yaml`) used `action_horizon: 16` and `delta_indices: [0..15]`, but the saved `config.json` retained the base model's `action_horizon: 50`. The finetuning pipeline doesn't update `config.json` with the effective action_horizon from delta_indices.
