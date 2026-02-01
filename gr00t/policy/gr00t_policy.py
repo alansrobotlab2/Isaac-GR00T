@@ -421,6 +421,54 @@ class Gr00tPolicy(BasePolicy):
         }
         return casted_action, {}
 
+    def prepare_inputs(self, observation: dict[str, Any]) -> tuple[dict, list]:
+        """Preprocess observation into model-ready inputs (CPU only, no CUDA ops).
+
+        This runs the VLA processor + collation + dtype conversion, returning
+        inputs ready for model.get_action(). Safe to call from a background
+        thread to overlap with GPU inference on the previous step.
+
+        Args:
+            observation: Batched observation dictionary
+
+        Returns:
+            Tuple of (collated_inputs dict, states list for action decoding)
+        """
+        unbatched_observations = self._unbatch_observation(observation)
+        processed_inputs = []
+        states = []
+        for obs in unbatched_observations:
+            vla_step_data = self._to_vla_step_data(obs)
+            states.append(vla_step_data.states)
+            messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
+            processed_inputs.append(self.processor(messages))
+
+        collated_inputs = self.collate_fn(processed_inputs)
+        collated_inputs = _rec_to_dtype(collated_inputs, dtype=self.model_dtype)
+        return collated_inputs, states
+
+    def run_inference(self, collated_inputs: dict, states: list) -> dict[str, Any]:
+        """Run model inference and decode actions from pre-computed inputs.
+
+        Args:
+            collated_inputs: Output from prepare_inputs()
+            states: State list from prepare_inputs() (needed for action decoding)
+
+        Returns:
+            Action dictionary with float32 arrays
+        """
+        with torch.inference_mode():
+            model_pred = self.model.get_action(**collated_inputs)
+        normalized_action = model_pred["action_pred"].float()
+
+        batched_states = {}
+        for k in self.modality_configs["state"].modality_keys:
+            batched_states[k] = np.stack([s[k] for s in states], axis=0)
+        unnormalized_action = self.processor.decode_action(
+            normalized_action.cpu().numpy(), self.embodiment_tag, batched_states
+        )
+        return {key: value.astype(np.float32) for key, value in unnormalized_action.items()}
+
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.
 

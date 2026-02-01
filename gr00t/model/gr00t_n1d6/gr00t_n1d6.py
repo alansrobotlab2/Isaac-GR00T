@@ -1,3 +1,4 @@
+import logging
 from typing import Tuple
 
 from gr00t.configs.model.gr00t_n1d6 import Gr00tN1d6Config
@@ -326,20 +327,25 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         dt = 1.0 / self.num_inference_timesteps
 
+        # Precompute timestep tensors and position embeddings (static across all denoising steps)
+        timestep_tensors = []
+        for t in range(self.num_inference_timesteps):
+            t_cont = t / float(self.num_inference_timesteps)
+            t_discretized = int(t_cont * self.num_timestep_buckets)
+            timestep_tensors.append(
+                torch.full(size=(batch_size,), fill_value=t_discretized, device=device)
+            )
+
+        if self.config.add_pos_embed:
+            pos_ids = torch.arange(self.action_horizon, dtype=torch.long, device=device)
+            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+
         # Run denoising steps.
         for t in range(self.num_inference_timesteps):
-            t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
-            t_discretized = int(t_cont * self.num_timestep_buckets)
-
-            # Embed noised action trajectory.
-            timesteps_tensor = torch.full(
-                size=(batch_size,), fill_value=t_discretized, device=device
-            )
+            timesteps_tensor = timestep_tensors[t]
             action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
             # Add position embedding.
             if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
 
             # Join vision, language, state and action embedding along sequence dimension.

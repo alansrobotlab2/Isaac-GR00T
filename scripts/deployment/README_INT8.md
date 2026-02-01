@@ -131,13 +131,23 @@ python scripts/deployment/standalone_inference_script.py \
     --trt-engine-path ./groot_n1d6_onnx/dit_model_int8_orin.trt \
     --backbone-trt-engine-path ./groot_n1d6_onnx/backbone_int8_orin.trt \
     --attn-implementation eager \
-    --action-horizon 4 \
-    --denoising_steps 2 \
+    --action-horizon 8 \
+    --denoising_steps 1 \
     --get-performance-stats \
     2>&1 | tee inference_output_full_trt.txt
 ```
 
 Use `--get-performance-stats` to enable MSE/MAE evaluation, timing summary, and per-episode memory breakdown (video vs state/action). Omit the flag for inference-only mode (skips stats, saves memory).
+
+**`--denoising_steps`**: Controls the number of flow matching denoising iterations. Fewer steps = faster but lower quality. Measured on Orin NX 16GB with INT8 TRT:
+
+| Steps | Latency | MSE | Quality |
+|-------|---------|-----|---------|
+| 4 | ~410ms | 0.266 | Best (baseline) |
+| 2 | ~340ms | 0.297 | Good (+12% MSE, recommended) |
+| 1 | ~309ms | 0.399 | Degraded (+50% MSE) |
+
+**Recommendation**: Use `--denoising_steps 2` for the best speed/quality tradeoff. The inference script uses deep async prefetching to overlap CPU preprocessing with GPU execution, hiding ~33ms of preprocessing latency on subsequent steps.
 
 ## How It Works
 

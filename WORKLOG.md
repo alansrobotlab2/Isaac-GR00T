@@ -1,5 +1,35 @@
 # Worklog
 
+## 2026-02-01: Per-component profiling and latency optimizations
+
+**Problem:** At 2 denoising steps with INT8 TRT, per-step inference was ~340ms (target: 250ms). Profiled the full pipeline to find where time was spent.
+
+**Profiling results (post-warmup, 2 denoising steps):**
+| Component | Time | % |
+|-----------|------|---|
+| VLA preprocess | 20ms | 6% |
+| Collate/tokenize | 13ms | 4% |
+| prepare_input | 3ms | 1% |
+| Backbone (Eagle INT8 TRT) | 235ms | 69% |
+| DiT action head (×2) | 70ms | 21% |
+| Decode | 1.5ms | <1% |
+
+**Denoising step quality tradeoff:**
+| Steps | Latency | MSE | MSE Δ vs 4-step |
+|-------|---------|-----|-----------------|
+| 4 | 410ms | 0.266 | baseline |
+| 2 | 341ms | 0.297 | +12% |
+| 1 | 309ms | 0.399 | +50% |
+
+**Changes:**
+1. **Deep-pipeline async preprocessing** (standalone_inference_script.py, gr00t_policy.py) — Moved the full preprocessing chain (VLA processor + collation + dtype conversion) into the async prefetch thread. Previously only DataFrame extraction was prefetched (~0ms). Now 33ms of CPU work overlaps with the previous step's GPU backbone+DiT execution. Added `prepare_inputs()` and `run_inference()` methods to `Gr00tPolicy` for split preprocessing/inference. Added `prepare_model_inputs()` to standalone script as the deep prefetch target.
+2. **First-call-only TRT profile validation** (standalone_inference_script.py) — Backbone TRT wrapper validated input shapes against engine profile on every call. Since shapes are constant, validation now runs once and is skipped thereafter. Saves ~1-2ms per step.
+3. **Precomputed static tensors in denoising loop** (gr00t_n1d6.py) — Timestep tensors (`torch.full`) and position embeddings (`torch.arange` + `position_embedding`) were allocated fresh each denoising step. Now precomputed once before the loop. Saves ~2-3ms total across denoising steps.
+
+**Phase 1 result:** 341ms → 311ms per step (avg), 30ms saved. Preprocessing fully hidden behind GPU. MSE unchanged at 0.297. Still 61ms above 250ms target — backbone (235ms) is the remaining bottleneck.
+
+4. **CUDA graph capture for TRT engines — FAILED** — Attempted to capture `execute_async_v3` into CUDA graphs for both backbone and DiT TRT wrappers. Failed with `operation not permitted when stream is capturing` — TRT on JetPack 6.2.1 performs internal operations (likely memory allocations) during `enqueueV3` that aren't CUDA graph capture-safe. Reverted to direct execution. Would need TRT compiled with `CUDA_GRAPH_SAFE` allocator or a newer JetPack version.
+
 ## 2026-02-01: Fix action_horizon config mismatch + TRT engine rebuild needed
 
 **Problem:** After wiring `--denoising_steps` (411ms -> 340ms), investigated why the model generates 50 action tokens when only 16 are used. Found that the finetuning config (`conf.yaml`) used `action_horizon: 16` and `delta_indices: [0..15]`, but the saved `config.json` retained the base model's `action_horizon: 50`. The finetuning pipeline doesn't update `config.json` with the effective action_horizon from delta_indices.
