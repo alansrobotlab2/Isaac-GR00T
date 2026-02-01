@@ -168,7 +168,9 @@ uv run python scripts/deployment/standalone_inference_script.py \
   --denoising_steps 4
 ```
 
-The `--denoising_steps` flag overrides the model's `num_inference_timesteps` config (default 4). Fewer steps = faster inference at the cost of action quality. The `--action-horizon` flag overrides the model's action token count, reducing DiT sequence length.
+The `--denoising_steps` flag overrides the model's `num_inference_timesteps` config (default 4). Fewer steps = faster inference at the cost of action quality. The `--action-horizon` flag controls the eval loop stride (how many predicted actions to execute per inference step).
+
+**Note:** The model's internal `action_horizon` (number of action tokens generated per DiT call) is derived from `delta_indices` in the modality config during finetuning. The inference script auto-detects mismatches between `config.json` and `delta_indices` and corrects them at runtime.
 
 GR00T-N1.6-3B inference timing (4 denoising steps, single view):
 

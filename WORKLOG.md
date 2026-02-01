@@ -1,5 +1,27 @@
 # Worklog
 
+## 2026-02-01: Fix action_horizon config mismatch + TRT engine rebuild needed
+
+**Problem:** After wiring `--denoising_steps` (411ms -> 340ms), investigated why the model generates 50 action tokens when only 16 are used. Found that the finetuning config (`conf.yaml`) used `action_horizon: 16` and `delta_indices: [0..15]`, but the saved `config.json` retained the base model's `action_horizon: 50`. The finetuning pipeline doesn't update `config.json` with the effective action_horizon from delta_indices.
+
+**Changes:**
+1. **Fixed `config.json`** in `cando/checkpoint-2000/` and `cando/` — changed `action_horizon` from 50 to 16 to match training config.
+2. **Added runtime auto-fix** (standalone_inference_script.py) — After policy load, compares `model.action_head.action_horizon` against `len(delta_indices)` from modality config. If they differ, overrides model config to match delta_indices.
+3. **No latency improvement yet** — Config fix alone doesn't help because the TRT engine's optimization profile has `opt_sa_seq=51` (hardcoded in build_tensorrt_engine.py). TRT selects kernels optimized for 51 tokens; running 17 tokens uses those same kernels without speedup.
+4. **Added `--opt-sa-seq` arg to build_tensorrt_engine.py** — Allows specifying the optimal sa_embs sequence length when building the DiT TRT engine. Set to `1 + action_horizon` (e.g., 17 for action_horizon=16) for best performance at the actual sequence length. Only applies to DiT builds (ignored for backbone with a warning). Also wired through `build_int8_pipeline.py` for the all-in-one flow.
+5. **Updated README_INT8.md** — Documented `--opt-sa-seq` in Step 6 (DiT build), quick-start, and dynamic shapes section.
+6. **Engine rebuild required** to realize the speedup:
+```bash
+python scripts/deployment/build_tensorrt_engine.py \
+    --onnx ./groot_n1d6_onnx/dit_model.onnx \
+    --engine ./groot_n1d6_onnx/dit_model_int8_orin.trt \
+    --precision int8 \
+    --calib-data ./calibration_data_dit/calib_data.npz \
+    --calib-cache ./calibration_data_dit/calibration.cache \
+    --opt-sa-seq 17 \
+    --low-memory-mode --prepare-system
+```
+
 ## 2026-02-01: Wire up dead CLI args for inference latency reduction
 
 **Problem:** Per-step inference latency was ~411ms on Orin NX 16GB with INT8 TRT. User specified `--denoising_steps 2` and `--action-horizon 4` but these CLI args were never wired to the model internals. The model config had `num_inference_timesteps=4` and `action_horizon=50`, so all 4 denoising steps ran with 50 action tokens regardless of CLI args.

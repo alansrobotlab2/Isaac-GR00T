@@ -115,6 +115,13 @@ def main():
         default=[0, 1, 2],
         help="Trajectory IDs for validation (default: 0 1 2)",
     )
+    parser.add_argument(
+        "--opt-sa-seq",
+        type=int,
+        default=None,
+        help="Optimal sa_embs sequence length for DiT engine (default: 51 = 1 state + 50 action). "
+             "Set to 1 + action_horizon from your finetuning delta_indices for best performance.",
+    )
 
     args = parser.parse_args()
 
@@ -266,8 +273,7 @@ def main():
     if os.path.exists(dit_engine_path) and not args.force:
         logger.info(f"DiT INT8 engine already exists at {dit_engine_path}, skipping")
     else:
-        run_step(
-            [
+        dit_build_cmd = [
                 sys.executable,
                 os.path.join(SCRIPT_DIR, "build_tensorrt_engine.py"),
                 "--onnx", dit_onnx_path,
@@ -275,9 +281,10 @@ def main():
                 "--precision", "int8",
                 "--calib-data", dit_calib_data,
                 "--calib-cache", dit_calib_cache,
-            ],
-            "DiT INT8 Engine Build",
-        )
+        ]
+        if args.opt_sa_seq is not None:
+            dit_build_cmd.extend(["--opt-sa-seq", str(args.opt_sa_seq)])
+        run_step(dit_build_cmd, "DiT INT8 Engine Build")
 
     # ── Validation (optional) ────────────────────────────────────────────
     if args.skip_validation:

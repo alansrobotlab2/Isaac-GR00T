@@ -1107,20 +1107,22 @@ def main(args: ArgsConfig):
         logging.info(f"Overriding num_inference_timesteps: {model_denoise} -> {args.denoising_steps}")
         policy.model.action_head.num_inference_timesteps = args.denoising_steps
 
-    # NOTE: action_horizon is NOT overridden on the model because the decode pipeline
-    # (delta_indices, norm params) expects the original action_horizon from training.
-    # The CLI --action-horizon only controls the eval loop stride (how many actions to use).
-    model_ah = policy.model.action_head.action_horizon
-    if args.action_horizon != model_ah:
-        logging.info(f"Note: CLI action_horizon={args.action_horizon} differs from model's "
-                     f"action_horizon={model_ah}. Model will generate {model_ah} tokens; "
-                     f"eval loop will use first {args.action_horizon}.")
-
     model_load_time = time.time() - model_load_start
     logging.info(f"Model loading time: {model_load_time:.4f} seconds")
 
     # Get the supported modalities for the policy
     modality = policy.get_modality_config()
+
+    # Auto-fix action_horizon if model config doesn't match training delta_indices.
+    # The finetuning pipeline doesn't update config.json, so the base model's
+    # action_horizon (e.g. 50) may persist even when finetuned with fewer steps.
+    model_ah = policy.model.action_head.action_horizon
+    decode_ah = len(modality["action"].delta_indices)
+    if model_ah != decode_ah:
+        logging.info(f"Fixing action_horizon mismatch: model config={model_ah}, "
+                     f"training delta_indices={decode_ah}. Setting to {decode_ah}.")
+        policy.model.action_head.config.action_horizon = decode_ah
+        policy.model.action_head.action_horizon = decode_ah
     logging.info(f"Current modality config: \n{modality}")
 
     # Dataset creation

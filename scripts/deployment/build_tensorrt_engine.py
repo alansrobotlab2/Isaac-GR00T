@@ -787,6 +787,11 @@ def main():
         "--strip-plan", action="store_true", default=False,
         help="Strip unnecessary data from the serialized plan to reduce memory"
     )
+    parser.add_argument(
+        "--opt-sa-seq", type=int, default=None,
+        help="Optimal sa_embs sequence length for DiT engine (default: 51 = 1 state + 50 action). "
+             "Set to 1 + action_horizon from your finetuning config for best performance."
+    )
 
     args = parser.parse_args()
 
@@ -847,6 +852,8 @@ def main():
     logger.info(f"Using max sequence length: {max_seq} (use --max-seq-len to adjust)")
 
     if model_type == "backbone":
+        if args.opt_sa_seq is not None:
+            logger.warning("--opt-sa-seq is ignored for backbone builds (only applies to DiT)")
         # Backbone model shapes
         # Get actual shapes from calibration data
         input_ids_shape = calib_data["input_ids"].shape
@@ -896,9 +903,11 @@ def main():
             "pixel_values": (16, 1, img_channels, img_height, img_width),  # Max 16 frames
         }
     else:
-        # DiT model shapes (original code)
+        # DiT model shapes
         # Optimal shapes - clamp to max_seq to satisfy MIN <= OPT <= MAX constraint
-        opt_sa_seq = min(51, max_seq)    # Typical: 51 tokens for sa_embs
+        default_sa_seq = 51  # Default: 1 state + 50 action tokens
+        opt_sa_seq = min(args.opt_sa_seq or default_sa_seq, max_seq)
+        logger.info(f"DiT opt sa_embs sequence length: {opt_sa_seq}")
         opt_vl_seq = min(122, max_seq)   # Typical: 122 tokens for vl_embs and masks
 
         min_shapes = {

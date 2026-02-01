@@ -24,10 +24,11 @@ docker run \
 python scripts/deployment/build_int8_pipeline.py \
     --model-path cando/checkpoint-2000 \
     --dataset-path alfiebot.CanDoChallenge \
+    --opt-sa-seq 17
 #   --refresh
 ```
 
-This runs all 6 steps automatically, skipping any that already have outputs.
+This runs all 6 steps automatically, skipping any that already have outputs. Use `--opt-sa-seq` to tune the DiT engine for your finetuned action_horizon (see Step 6).
 
 ## Step-by-Step
 
@@ -110,8 +111,11 @@ python scripts/deployment/build_tensorrt_engine.py \
     --precision int8 \
     --calib-data ./calibration_data_dit/calib_data.npz \
     --calib-cache ./calibration_data_dit/calibration.cache \
-    --max-seq-len 512
+    --max-seq-len 512 \
+    --opt-sa-seq 17
 ```
+
+**`--opt-sa-seq`** (DiT only): Sets the optimal `sa_embs` sequence length for TensorRT's optimization profile. TRT selects kernels tuned for this size, so matching your actual inference sequence length is important for performance. Calculate as `1 + action_horizon` where `action_horizon` comes from your finetuning `delta_indices`. For example, `delta_indices=list(range(0, 16))` → `action_horizon=16` → `--opt-sa-seq 17`. Default is 51 (1 + 50 from the base model). This flag is ignored for backbone builds.
 
 The calibrator uses `IInt8EntropyCalibrator2` and caches results in the specified cache file. Subsequent builds with the same ONNX model reuse the cache. The script automatically detects whether you're building a DiT or backbone model based on the calibration data format.
 
@@ -143,7 +147,7 @@ Use `--get-performance-stats` to enable MSE/MAE evaluation, timing summary, and 
 
 3. **Mixed precision**: The engine uses INT8 for quantizable operations (MatMul, Conv) with automatic FP16 fallback for operations that don't support INT8 (LayerNorm, SiLU, etc.).
 
-4. **Dynamic shapes**: The engine supports variable sequence lengths (1-256 for sa_embs, 1-512 for vl_embs) with optimal shapes matching typical inference.
+4. **Dynamic shapes**: The engine supports variable sequence lengths (1 to `--max-seq-len` for sa_embs and vl_embs) with optimal shapes matching typical inference. Use `--opt-sa-seq` to tune the DiT engine for your finetuned action_horizon.
 
 ## Expected Performance
 
