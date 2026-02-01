@@ -360,7 +360,8 @@ class Gr00tN1d6ActionHead(nn.Module):
                     encoder_hidden_states=vl_embeds,
                     timestep=timesteps_tensor,
                 )
-            model_output = model_output.to(self.dtype)
+            if model_output.dtype != self.dtype:
+                model_output = model_output.to(self.dtype)
 
             pred = self.action_decoder(model_output, embodiment_id)
             pred_velocity = pred[:, -self.action_horizon :]

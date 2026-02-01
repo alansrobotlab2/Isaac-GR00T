@@ -164,8 +164,11 @@ uv run python scripts/deployment/standalone_inference_script.py \
   --embodiment-tag GR1 \
   --traj-ids 0 1 2 \
   --inference-mode pytorch \
-  --action-horizon 8
+  --action-horizon 8 \
+  --denoising_steps 4
 ```
+
+The `--denoising_steps` flag overrides the model's `num_inference_timesteps` config (default 4). Fewer steps = faster inference at the cost of action quality. The `--action-horizon` flag overrides the model's action token count, reducing DiT sequence length.
 
 GR00T-N1.6-3B inference timing (4 denoising steps, single view):
 

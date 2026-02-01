@@ -1,5 +1,16 @@
 # Worklog
 
+## 2026-02-01: Wire up dead CLI args for inference latency reduction
+
+**Problem:** Per-step inference latency was ~411ms on Orin NX 16GB with INT8 TRT. User specified `--denoising_steps 2` and `--action-horizon 4` but these CLI args were never wired to the model internals. The model config had `num_inference_timesteps=4` and `action_horizon=50`, so all 4 denoising steps ran with 50 action tokens regardless of CLI args.
+
+**Changes:**
+1. **Wired `--denoising_steps` to override `policy.model.action_head.num_inference_timesteps`** (standalone_inference_script.py) — After policy load, overrides the model's denoising step count with the CLI arg value. Reduces DiT forward passes from 4 to 2 (or 1).
+2. **Cannot override model `action_horizon` at runtime** — The decode pipeline (delta_indices, norm params) is tightly coupled to the training action_horizon. Overriding causes shape mismatches in unnormalization. The CLI `--action-horizon` only controls eval loop stride (how many of the predicted actions to use). Added informational log when they differ.
+3. **Event-based sync for backbone TRT** (standalone_inference_script.py) — Replaced blocking `stream.synchronize()` with event-based sync (matching DiT wrapper pattern), allowing CPU to proceed while GPU finishes.
+4. **Guarded redundant dtype conversion** (gr00t_n1d6.py) — Added dtype check before `.to(self.dtype)` in denoising loop to skip no-op conversions.
+5. **Added denoising steps to startup log** — Now logs the requested denoising steps value alongside other config.
+
 ## 2026-01-30: Episode memory reporting and inference memory reduction
 
 **Problem:** TensorRT inference on Orin NX 16GB uses ~10GB, need to get under 8GB. Investigated where memory was going — the loaded episode DataFrame holds all video frames as PIL Images in memory for the entire inference run, even though only one step is accessed at a time and video data is never needed after inference.

@@ -444,7 +444,9 @@ class TensorRTBackboneWrapper:
             if not success:
                 raise RuntimeError("Backbone TensorRT inference failed")
 
-        self.stream.synchronize()
+        # Use event-based sync (non-blocking) instead of stream.synchronize()
+        event = self.stream.record_event()
+        torch.cuda.current_stream().wait_event(event)
         return outputs.get("hidden_states"), outputs.get("attn_mask"), outputs.get("image_mask")
 
 
@@ -965,6 +967,7 @@ def main(args: ArgsConfig):
     logging.info(f"Trajectories: {args.traj_ids}")
     logging.info(f"Steps per trajectory: {args.steps}")
     logging.info(f"Action Horizon: {args.action_horizon}")
+    logging.info(f"Denoising Steps: {args.denoising_steps}")
     logging.info(f"Skip Timing Steps: {args.skip_timing_steps}")
     logging.info(f"Inference Mode: {args.inference_mode}")
     if args.inference_mode == "tensorrt":
@@ -1098,6 +1101,21 @@ def main(args: ArgsConfig):
             logging.info("PyTorch CUDA memory capped at 60% of total unified memory")
     else:
         assert 0, "Please provide valid model_path argument for inference"
+    # Override denoising steps if CLI arg differs from model config
+    model_denoise = policy.model.action_head.num_inference_timesteps
+    if args.denoising_steps != model_denoise:
+        logging.info(f"Overriding num_inference_timesteps: {model_denoise} -> {args.denoising_steps}")
+        policy.model.action_head.num_inference_timesteps = args.denoising_steps
+
+    # NOTE: action_horizon is NOT overridden on the model because the decode pipeline
+    # (delta_indices, norm params) expects the original action_horizon from training.
+    # The CLI --action-horizon only controls the eval loop stride (how many actions to use).
+    model_ah = policy.model.action_head.action_horizon
+    if args.action_horizon != model_ah:
+        logging.info(f"Note: CLI action_horizon={args.action_horizon} differs from model's "
+                     f"action_horizon={model_ah}. Model will generate {model_ah} tokens; "
+                     f"eval loop will use first {args.action_horizon}.")
+
     model_load_time = time.time() - model_load_start
     logging.info(f"Model loading time: {model_load_time:.4f} seconds")
 
