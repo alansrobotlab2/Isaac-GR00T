@@ -13,6 +13,14 @@ TensorRT INT8 post-training quantization (PTQ) for the DiT diffusion transformer
 ## Quick Start (All-in-One)
 
 ```bash
+cd ~/Isaac-GR00T
+
+docker run \
+  -it --rm --runtime=nvidia \
+  -v $(pwd)/.:/workspace/gr00t gr00t-dev /bin/bash
+```
+
+```bash
 python scripts/deployment/build_int8_pipeline.py \
     --model-path cando/checkpoint-2000 \
     --dataset-path alfiebot.CanDoChallenge \
@@ -111,18 +119,21 @@ The calibrator uses `IInt8EntropyCalibrator2` and caches results in the specifie
 
 ```bash
 python scripts/deployment/standalone_inference_script.py \
---model-path cando/checkpoint-2000 \
---dataset-path alfiebot.CanDoChallenge \
---embodiment-tag NEW_EMBODIMENT \
---traj-ids 0 1 \
---inference-mode tensorrt \
---trt-engine-path ./groot_n1d6_onnx/dit_model_int8_orin.trt \
---backbone-trt-engine-path ./groot_n1d6_onnx/backbone_int8_orin.trt \
---attn-implementation eager \
---action-horizon 4 \
---denoising_steps 2 \
-2>&1 | tee inference_output_full_trt.txt
+    --model-path cando/checkpoint-2000 \
+    --dataset-path alfiebot.CanDoChallenge \
+    --embodiment-tag NEW_EMBODIMENT \
+    --traj-ids 0 1 \
+    --inference-mode tensorrt \
+    --trt-engine-path ./groot_n1d6_onnx/dit_model_int8_orin.trt \
+    --backbone-trt-engine-path ./groot_n1d6_onnx/backbone_int8_orin.trt \
+    --attn-implementation eager \
+    --action-horizon 4 \
+    --denoising_steps 2 \
+    --get-performance-stats \
+    2>&1 | tee inference_output_full_trt.txt
 ```
+
+Use `--get-performance-stats` to enable MSE/MAE evaluation, timing summary, and per-episode memory breakdown (video vs state/action). Omit the flag for inference-only mode (skips stats, saves memory).
 
 ## How It Works
 

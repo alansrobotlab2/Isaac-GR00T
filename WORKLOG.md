@@ -1,5 +1,16 @@
 # Worklog
 
+## 2026-01-30: Episode memory reporting and inference memory reduction
+
+**Problem:** TensorRT inference on Orin NX 16GB uses ~10GB, need to get under 8GB. Investigated where memory was going — the loaded episode DataFrame holds all video frames as PIL Images in memory for the entire inference run, even though only one step is accessed at a time and video data is never needed after inference.
+
+**Changes (standalone_inference_script.py):**
+1. **Added `measure_episode_memory()` helper** — When `--get-performance-stats` is enabled, measures and logs memory breakdown of each loaded episode (video vs state/action vs other). This identifies how much of the ~10GB is episode data vs model/TRT.
+2. **Removed dead `obs` array construction** — After inference, the script was building an `obs` array from `parsed_obs` (lines 779-793) that was returned but never used by any caller. Removed entirely.
+3. **Drop video columns after inference loop** — After all inference steps complete, video columns are dropped from the trajectory DataFrame and `gc.collect()` is called. `evaluate_predictions` only needs state/action columns. Frees ~500MB-1.5GB of PIL Images.
+4. **Added gc.collect() between trajectories** — Explicitly frees trajectory data after each evaluation before loading the next episode.
+5. **Episode memory summary in stats output** — The `--get-performance-stats` timing summary now includes per-trajectory memory breakdown and averages.
+
 ## 2026-01-31: Unified memory optimizations for Orin NX 16GB
 
 **Problem:** Investigated whether the inference pipeline was making efficient use of Jetson's unified memory architecture (CPU and GPU share same 16GB DRAM). Found several areas where unnecessary memory copies and allocations wasted unified memory.

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import gc
 import logging
 import os
+import sys
 from pathlib import Path
 import random
 import re
@@ -646,6 +647,42 @@ def prepare_observation_data(
     return parsed_obs
 
 
+def measure_episode_memory(traj: pd.DataFrame) -> dict[str, float]:
+    """Measure memory consumption of a loaded episode DataFrame, in MB."""
+    video_bytes = 0
+    state_action_bytes = 0
+    other_bytes = 0
+
+    for col in traj.columns:
+        col_bytes = 0
+        for val in traj[col]:
+            if hasattr(val, "nbytes"):
+                # numpy array
+                col_bytes += val.nbytes
+            elif hasattr(val, "size") and hasattr(val, "mode"):
+                # PIL Image — estimate from dimensions and mode
+                w, h = val.size
+                channels = len(val.getbands())
+                col_bytes += w * h * channels
+            else:
+                col_bytes += sys.getsizeof(val)
+
+        if col.startswith("video."):
+            video_bytes += col_bytes
+        elif col.startswith("state.") or col.startswith("action."):
+            state_action_bytes += col_bytes
+        else:
+            other_bytes += col_bytes
+
+    total = video_bytes + state_action_bytes + other_bytes
+    return {
+        "video_mb": video_bytes / (1024 * 1024),
+        "state_action_mb": state_action_bytes / (1024 * 1024),
+        "other_mb": other_bytes / (1024 * 1024),
+        "total_mb": total / (1024 * 1024),
+    }
+
+
 def run_single_trajectory(
     policy: BasePolicy,
     loader: LeRobotEpisodeLoader,
@@ -654,6 +691,7 @@ def run_single_trajectory(
     steps=300,
     action_horizon=16,
     skip_timing_steps=1,
+    get_performance_stats=False,
 ):
     """
     Run inference on a single trajectory.
@@ -685,6 +723,14 @@ def run_single_trajectory(
     episode_load_start = time.time()
     traj = loader[traj_id]
     timing_dict["episode_load_time"] = time.time() - episode_load_start
+
+    if get_performance_stats:
+        mem_stats = measure_episode_memory(traj)
+        timing_dict["episode_memory"] = mem_stats
+        logging.info(f"Episode memory: {mem_stats['total_mb']:.1f} MB total "
+                     f"(video: {mem_stats['video_mb']:.1f} MB, "
+                     f"state/action: {mem_stats['state_action_mb']:.1f} MB, "
+                     f"other: {mem_stats['other_mb']:.1f} MB)")
 
     traj_length = len(traj)
     actual_steps = min(steps, traj_length)
@@ -772,25 +818,17 @@ def run_single_trajectory(
 
     # Clean up thread pool
     executor.shutdown(wait=True)
+    del parsed_obs
 
     logging.info("\n" + "-" * 80)
     logging.info(f"All inference steps completed for current trajectory-id {traj_id}")
 
-    obs = []
-    for key in parsed_obs.keys():
-        vals = []
-        if isinstance(parsed_obs[key], np.ndarray):
-            vals.append(parsed_obs[key])
-        elif isinstance(parsed_obs[key], list):
-            vals.append(np.array(parsed_obs[key]))
-        elif isinstance(parsed_obs[key], dict):
-            for k in parsed_obs[key].keys():
-                vals.append(np.array(parsed_obs[key][k]))
-
-        for val in vals:
-            if np.issubdtype(val.dtype, np.number):
-                obs.append(val.flatten())
-    obs = np.concatenate(obs, axis=-1)
+    # Drop video columns to free PIL Image memory (~500MB-1.5GB).
+    # evaluate_predictions only needs state.* and action.* columns.
+    video_cols = [c for c in traj.columns if c.startswith("video.")]
+    if video_cols:
+        traj.drop(columns=video_cols, inplace=True)
+        gc.collect()
 
     return (
         state_keys,
@@ -799,7 +837,6 @@ def run_single_trajectory(
         traj,
         actual_steps,
         timing_dict,
-        obs,
     )
 
 
@@ -1110,7 +1147,6 @@ def main(args: ArgsConfig):
             traj,
             actual_steps,
             timing_dict,
-            obs,
         ) = run_single_trajectory(
             policy,
             dataset,
@@ -1119,6 +1155,7 @@ def main(args: ArgsConfig):
             steps=args.steps,
             action_horizon=args.action_horizon,
             skip_timing_steps=args.skip_timing_steps,
+            get_performance_stats=args.get_performance_stats,
         )
         pred_actions.append(pred_action_across_time)
 
@@ -1138,6 +1175,10 @@ def main(args: ArgsConfig):
             all_mse.append(mse)
             all_mae.append(mae)
             all_timings.append(timing_dict)
+
+        # Free trajectory data between runs
+        del traj
+        gc.collect()
 
     if args.get_performance_stats:
         # Final performance summary
@@ -1194,9 +1235,21 @@ def main(args: ArgsConfig):
             logging.info(f"  Max inference time:          {max(all_inf_times):.4f}s")
             logging.info(f"  P90 inference time:          {np.percentile(all_inf_times, 90):.4f}s")
 
+            # Episode memory summary
+            mem_stats_list = [t.get("episode_memory") for t in all_timings if "episode_memory" in t]
+            if mem_stats_list:
+                logging.info("\nEpisode Memory Usage:")
+                for i, mem in enumerate(mem_stats_list):
+                    logging.info(f"  Trajectory {i}: {mem['total_mb']:.1f} MB "
+                                 f"(video: {mem['video_mb']:.1f} MB, "
+                                 f"state/action: {mem['state_action_mb']:.1f} MB)")
+                avg_total = np.mean([m["total_mb"] for m in mem_stats_list])
+                avg_video = np.mean([m["video_mb"] for m in mem_stats_list])
+                logging.info(f"  Average: {avg_total:.1f} MB total (video: {avg_video:.1f} MB)")
+
     logging.info("=" * 80)
     logging.info("Done")
-    return pred_actions, obs
+    return pred_actions
 
 
 if __name__ == "__main__":
