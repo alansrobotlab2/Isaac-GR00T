@@ -247,7 +247,18 @@ def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) 
         json.dump(to_json_serializable(dict(stats)), f, indent=4)
 
 
-def main(dataset_path: Path | str, embodiment_tag: EmbodimentTag):
+def main(dataset_path: Path | str, embodiment_tag: EmbodimentTag, modality_config_path: str | None = None):
+    if modality_config_path is not None:
+        import importlib
+        import sys
+
+        path = Path(modality_config_path)
+        if path.exists() and path.suffix == ".py":
+            sys.path.append(str(path.parent))
+            importlib.import_module(path.stem)
+            print(f"Loaded modality config: {path}")
+        else:
+            raise FileNotFoundError(f"Modality config path does not exist: {modality_config_path}")
     generate_stats(dataset_path)
     generate_rel_stats(dataset_path, embodiment_tag)
 

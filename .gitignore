@@ -8,6 +8,9 @@
 # UV lock file
 uv.lock
 
+# alfiebot directories
+/cando/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
