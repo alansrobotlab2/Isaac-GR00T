@@ -67,10 +67,19 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 uv run \
 ## Quick Start (All-in-One)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/build_int8_pipeline.py \
-    --model-path cando/checkpoint-2000 \
-    --dataset-path ~/Projects/alfiebot_ws/alfiebot.CanDoChallenge \
-    --embodiment-tag NEW_EMBODIMENT
+cd ~/Isaac-GR00T
+
+docker run \
+  -it --rm --runtime=nvidia \
+  -v $(pwd)/.:/workspace/gr00t gr00t-dev /bin/bash
+```
+
+```bash
+python scripts/deployment/build_int8_pipeline.py \
+    --model-path ./cando2/checkpoint-2000 \
+    --dataset-path alfiebot.CanDoChallenge \
+    --opt-sa-seq 17 \
+    --refresh
 ```
 
 This runs all 4 steps automatically, skipping any that already have outputs.
@@ -80,18 +89,19 @@ This runs all 4 steps automatically, skipping any that already have outputs.
 ### 1. Export ONNX (if not already done)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/export_onnx_n1d6.py \
-    --model_path cando/checkpoint-2000 \
-    --dataset_path ~/Projects/alfiebot_ws/alfiebot.CanDoChallenge \
-    --embodiment_tag NEW_EMBODIMENT \
-    --output_dir ./groot_n1d6_onnx
+python scripts/deployment/export_backbone_onnx.py \
+    --model_path cando2/checkpoint-2000 \
+    --dataset_path alfiebot.CanDoChallenge \
+    --embodiment_tag new_embodiment \
+    --output_dir ./groot_n1d6_onnx \
+    --attn_implementation eager \
+    --export_dtype fp16
 ```
 
-### 2. Collect Calibration Data
+Outputs `backbone_model.onnx` (+ `backbone_model.onnx.data` external weights) in the `--output_dir`.
 
-Runs inference on dataset samples and captures the DiT or backbone input tensors:
+### 2. Export DiT to ONNX
 
-**For DiT (action head):**
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run python scripts/deployment/collect_calibration_data.py \
     --model_path cando/checkpoint-2000 \
