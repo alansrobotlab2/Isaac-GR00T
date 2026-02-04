@@ -1,9 +1,10 @@
 from copy import deepcopy
 from dataclasses import dataclass, field
+import gc
 import logging
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Literal
 import warnings
 
 from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
@@ -274,6 +275,18 @@ class ArgsConfig:
     model_path: str | None = None
     """Path to the model checkpoint."""
 
+    inference_mode: Literal["pytorch", "tensorrt"] = "pytorch"
+    """Inference mode: 'pytorch' (default) or 'tensorrt'."""
+
+    trt_engine_path: str = ""
+    """Path to TensorRT DiT engine file (.trt). Used only when inference_mode='tensorrt'."""
+
+    backbone_trt_engine_path: str = ""
+    """Path to TensorRT engine file for the backbone. When set, replaces PyTorch backbone with TRT."""
+
+    attn_implementation: str | None = None
+    """Override backbone attention implementation. Options: 'flash_attention_2' (default), 'sdpa' (ONNX/TRT-compatible)."""
+
     denoising_steps: int = 4
     """Number of denoising steps to use."""
 
@@ -310,11 +323,67 @@ def main(args: ArgsConfig):
     if local_model_path is not None:
         import torch
 
-        policy = Gr00tPolicy(
-            embodiment_tag=args.embodiment_tag,
-            model_path=local_model_path,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-        )
+        if args.inference_mode == "tensorrt" and torch.cuda.is_available():
+            import importlib.util
+            _script_path = str(Path(__file__).resolve().parents[2] / "scripts" / "deployment" / "standalone_inference_script.py")
+            _spec = importlib.util.spec_from_file_location("standalone_inference_script", _script_path)
+            _mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            TensorRTBackboneWrapper = _mod.TensorRTBackboneWrapper
+            TensorRTDiTWrapper = _mod.TensorRTDiTWrapper
+            replace_backbone_with_tensorrt = _mod.replace_backbone_with_tensorrt
+            replace_dit_with_tensorrt = _mod.replace_dit_with_tensorrt
+
+            # TRT needs contiguous GPU memory - load ALL TRT engines FIRST while GPU is empty.
+            # Critical on Jetson unified memory where CPU/GPU share 16GB.
+            logging.info("TensorRT mode: Loading ALL TRT engines first while GPU is empty...")
+
+            # Load backbone TRT engine first (largest: ~3GB)
+            backbone_trt = None
+            if args.backbone_trt_engine_path:
+                logging.info(f"Loading backbone TRT engine: {args.backbone_trt_engine_path}")
+                backbone_trt = TensorRTBackboneWrapper(args.backbone_trt_engine_path, device=0)
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            # Load DiT TRT engine
+            assert args.trt_engine_path, "trt_engine_path is required when inference_mode='tensorrt'"
+            logging.info(f"Loading DiT TensorRT engine: {args.trt_engine_path}")
+            trt_dit = TensorRTDiTWrapper(args.trt_engine_path, device=0, use_fp16_output=False)
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # Load PyTorch model WITHOUT DiT (skip_dit=True saves ~2GB)
+            skip_backbone = bool(args.backbone_trt_engine_path)
+            use_fp16 = args.attn_implementation == "sdpa"
+            logging.info(f"Loading PyTorch model (skip_dit=True, skip_backbone={skip_backbone})...")
+            policy = Gr00tPolicy(
+                embodiment_tag=args.embodiment_tag,
+                model_path=local_model_path,
+                device="cuda",
+                skip_dit=True,
+                skip_backbone=skip_backbone,
+                use_fp16=use_fp16,
+                attn_implementation=args.attn_implementation,
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # Wire up TRT engines to replace the (empty) PyTorch components
+            replace_dit_with_tensorrt(policy, args.trt_engine_path, preloaded_trt=trt_dit)
+            if backbone_trt is not None:
+                replace_backbone_with_tensorrt(policy, args.backbone_trt_engine_path, preloaded_trt=backbone_trt)
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            logging.info("TensorRT mode enabled")
+        else:
+            policy = Gr00tPolicy(
+                embodiment_tag=args.embodiment_tag,
+                model_path=local_model_path,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                attn_implementation=args.attn_implementation,
+            )
     else:
         policy = PolicyClient(host=args.host, port=args.port)
 
