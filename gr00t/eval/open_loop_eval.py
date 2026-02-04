@@ -38,6 +38,7 @@ def plot_trajectory_results(
     action_keys: list[str],
     action_horizon: int,
     save_plot_path: str,
+    action_dim_labels: list[str] | None = None,
 ) -> None:
     """
     Plot and save trajectory results comparing ground truth and predicted actions.
@@ -51,6 +52,7 @@ def plot_trajectory_results(
         action_keys: List of action modality keys
         action_horizon: Action horizon used for inference
         save_plot_path: Path to save the plot
+        action_dim_labels: Optional list of per-dimension labels (e.g. ["left_arm[0]", "left_arm[1]", ...])
     """
     actual_steps = len(gt_action_across_time)
     action_dim = gt_action_across_time.shape[1]
@@ -69,12 +71,6 @@ def plot_trajectory_results(
     if num_plots == 1:
         axes = [axes]
 
-    # Add a global title showing the modality keys
-    fig.suptitle(
-        f"Trajectory {traj_id} - State: {', '.join(state_keys)} | Action: {', '.join(action_keys)}",
-        fontsize=16,
-        color="blue",
-    )
 
     for plot_idx, action_idx in enumerate(indices_to_plot):
         ax = axes[plot_idx]
@@ -94,7 +90,10 @@ def plot_trajectory_results(
             else:
                 ax.plot(j, gt_action_across_time[j, action_idx], "ro")
 
-        ax.set_title(f"Action {action_idx}")
+        if action_dim_labels and action_idx < len(action_dim_labels):
+            ax.set_title(action_dim_labels[action_idx])
+        else:
+            ax.set_title(f"Action {action_idx}")
         ax.legend()
 
     plt.tight_layout()
@@ -210,6 +209,27 @@ def evaluate_single_trajectory(
     logging.info(f"gt_action_joints vs time {gt_action_across_time.shape}")
     logging.info(f"pred_action_joints vs time {pred_action_across_time.shape}")
 
+    # Build per-dimension labels from action keys, using joint names from info.json
+    action_dim_labels = []
+    all_joint_names = loader.feature_config.get("action", {}).get("names", None)
+    for key in action_keys:
+        modality_info = loader.modality_meta.get("action", {}).get(key, {})
+        start_idx = modality_info.get("start", None)
+        end_idx = modality_info.get("end", None)
+        col = f"action.{key}"
+        dim = np.atleast_1d(traj[col].iloc[0]).shape[0]
+        for i in range(dim):
+            joint_name = None
+            if all_joint_names and start_idx is not None:
+                abs_idx = start_idx + i
+                if abs_idx < len(all_joint_names):
+                    joint_name = all_joint_names[abs_idx]
+            if joint_name:
+                label = f"{key}[{i}] ({joint_name})" if dim > 1 else f"{key} ({joint_name})"
+            else:
+                label = f"{key}[{i}]" if dim > 1 else key
+            action_dim_labels.append(label)
+
     # Plot trajectory results
     plot_trajectory_results(
         state_joints_across_time=state_joints_across_time,
@@ -220,6 +240,7 @@ def evaluate_single_trajectory(
         action_keys=action_keys,
         action_horizon=action_horizon,
         save_plot_path=save_plot_path or f"/tmp/open_loop_eval/traj_{traj_id}.jpeg",
+        action_dim_labels=action_dim_labels,
     )
 
     return mse, mae
