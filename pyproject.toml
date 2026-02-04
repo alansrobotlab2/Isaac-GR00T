@@ -46,6 +46,8 @@ dependencies = [
     "onnxscript",
     "cuda-python",
     "onnxruntime-gpu>=1.23.2",
+    "gradio",
+    "plotly",
 ]
 
 [project.optional-dependencies]
