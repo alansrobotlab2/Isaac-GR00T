@@ -8,6 +8,11 @@
 # UV lock file
 uv.lock
 
+# alfie gr00t
+/alfie-gr00t/
+/alfiebot.CanDoChallenge/
+/groot_n1d6_onnx/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

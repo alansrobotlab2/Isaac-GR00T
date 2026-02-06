@@ -44,7 +44,7 @@ python groot/scripts/deployment/standalone_inference_script.py \
   --embodiment_tag GR1 \
   --traj-ids 0 1 2 \
   --inference-mode tensorrt \
-  --trt_engine_path ./groot_n1d6_onnx/dit_model_bf16.trt
+  --trt_engine_path ./groot_n1d6_onnx/dit_model_fp16.trt
 """
 
 ###############################################################################
@@ -133,10 +133,10 @@ class TensorRTDiTWrapper:
                 "backbone_attention_mask", backbone_attention_mask.data_ptr()
             )
 
-        # Output in BF16 (matches ONNX export and engine precision)
+        # Output in FP16 (SM87 / Orin has native FP16 tensor cores, not BF16)
         output_shape = self.context.get_tensor_shape("output")
         output = torch.empty(
-            tuple(output_shape), dtype=torch.bfloat16, device=f"cuda:{self.device}"
+            tuple(output_shape), dtype=torch.float16, device=f"cuda:{self.device}"
         )
         self.context.set_tensor_address("output", output.data_ptr())
 
@@ -176,6 +176,9 @@ def replace_dit_with_tensorrt(policy: Gr00tPolicy | Any, trt_engine_path: str, d
             image_mask=image_mask,
             backbone_attention_mask=backbone_attention_mask,
         )
+        # TRT engine outputs FP16 (Orin lacks BF16 tensor cores), but the
+        # action decoder weights are BF16 from the checkpoint. Cast to match.
+        output = output.to(dtype=hidden_states.dtype)
 
         # DiT returns (output, all_hidden_states) when return_all_hidden_states=True
         if return_all_hidden_states:
@@ -570,7 +573,7 @@ class ArgsConfig:
     action_horizon: int = 16
     """Action horizon to evaluate."""
 
-    video_backend: Literal["decord", "torchvision_av", "torchcodec"] = "torchcodec"
+    video_backend: Literal["decord", "torchvision_av", "torchcodec", "ffmpeg"] = "torchcodec"
     """Video backend to use for various codec options. h264: decord or av: torchvision_av"""
 
     dataset_path: str = "demo_data/robot_sim.PickNPlace/"
@@ -585,7 +588,7 @@ class ArgsConfig:
     inference_mode: Literal["pytorch", "tensorrt"] = "pytorch"
     """Inference mode: 'pytorch' (default) or 'tensorrt'."""
 
-    trt_engine_path: str = "./groot_n1d6_onnx/dit_model_bf16.trt"
+    trt_engine_path: str = "./groot_n1d6_onnx/dit_model_fp16.trt"
     """Path to TensorRT engine file (.trt). Used only when inference_mode='tensorrt'."""
 
     denoising_steps: int = 4
