@@ -36,12 +36,19 @@ uv sync --extra tensorrt
 ### Finetune
 
 ```bash
+sudo nvidia-smi -i 0 -pl 450   # rtx 5090 
+sudo nvidia-smi -i 1 -pl 300   # rtx 3090
+sudo nvidia-smi -i 2 -pl 300   # rtx 3090
+```
+
+
+```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 uv run \
     gr00t/experiment/launch_finetune.py \
     --base-model-path nvidia/GR00T-N1.6-3B \
     --dataset-path ~/Projects/alfiebot_ws/data/alfiebot.CanDoChallenge \
     --embodiment-tag NEW_EMBODIMENT \
-    --modality-config-path ~/Projects/alfiebot_ws/data/alfiebot.CanDoChallenge/alfiebot_config.py \
+    --modality-config-path ~/Projects/alfiebot_ws/src/alfie_gr00t/alfie_gr00t/alfiebot_config.py \
     --num-gpus 1 \
     --output-dir ./alfie-gr00t \
     --save-total-limit 5 \
@@ -49,9 +56,50 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 uv run \
     --max-steps 2000 \
     --global-batch-size 16 \
     --gradient-accumulation-steps 32 \
-    --dataloader-num-workers 4 \
+    --dataloader-num-workers 5 \
     --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08
 ```
+
+3 way multi card fine tuning, takes 27 hours
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1,2 \
+  uv run torchrun --nproc_per_node=3 --master_port=29500 \
+    gr00t/experiment/launch_finetune.py \
+    --base-model-path nvidia/GR00T-N1.6-3B \
+    --dataset-path ~/Projects/alfiebot_ws/data/alfiebot.CanDoChallenge \
+    --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path ~/Projects/alfiebot_ws/src/alfie_gr00t/alfie_gr00t/alfiebot_config.py \
+    --num-gpus 3 \
+    --output-dir ./alfie-gr00t \
+    --save-total-limit 5 \
+    --save-steps 2000 \
+    --max-steps 2000 \
+    --global-batch-size 27 \
+    --gradient-accumulation-steps 32 \
+    --dataloader-num-workers 5 \
+    --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08
+```
+
+2 way multi card fine tuning, takes 23 hours
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1 \
+  uv run torchrun --nproc_per_node=2 --master_port=29500 \
+    gr00t/experiment/launch_finetune.py \
+    --base-model-path nvidia/GR00T-N1.6-3B \
+    --dataset-path ~/Projects/alfiebot_ws/data/alfiebot.CanDoChallenge \
+    --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path ~/Projects/alfiebot_ws/src/alfie_gr00t/alfie_gr00t/alfiebot_config.py \
+    --num-gpus 2 \
+    --output-dir ./alfie-gr00t \
+    --save-total-limit 5 \
+    --save-steps 2000 \
+    --max-steps 2000 \
+    --global-batch-size 18 \
+    --gradient-accumulation-steps 32 \
+    --dataloader-num-workers 5 \
+    --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08
+```
+
 
 ---
 
@@ -72,10 +120,10 @@ CUDA_VISIBLE_DEVICES=0 uv run gr00t/eval/open_loop_eval.py \
 --dataset-path ../alfiebot_ws/data/alfiebot.CanDoChallenge \
 --embodiment-tag NEW_EMBODIMENT \
 --model-path ./alfie-gr00t/checkpoint-2000 \
---traj-ids 0 \
+--traj-ids 196 \
 --action-horizon 16 \
 --denoising-steps 4 \
---save-plot-path ./episode000_output_pytorch.png
+--save-plot-path ./episode196_output_pytorch.png
 ```
 
 ---
@@ -118,7 +166,8 @@ CUDA_VISIBLE_DEVICES=0 uv run scripts/deployment/standalone_inference_script.py 
   --inference-mode tensorrt \
   --trt-engine-path ./groot_n1d6_onnx/dit_model_bf16_5090.trt \
   --denoising-steps 4 \
-  --action-horizon 16
+  --action-horizon 16 \
+  --enable-viz
 ```
 
 ```bash
@@ -130,11 +179,21 @@ CUDA_VISIBLE_DEVICES=0 uv run python gr00t/eval/open_loop_eval.py \
 --model-path ./alfie-gr00t/checkpoint-2000 \
 --inference-mode tensorrt \
 --trt-engine-path ./groot_n1d6_onnx/dit_model_bf16_5090.trt \
---traj-ids 0 \
+--traj-ids 199 \
 --action-horizon 16 \
 --denoising-steps 4 \
---save-plot-path ./episode000_output_tensorrt.png
+--save-plot-path ./episode199_output_tensorrt.png
 ---
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run ../alfiebot_ws/src/alfie_gr00t/alfie_gr00t/scripts/groot_inference_server.py \
+  --checkpoint ./alfie-gr00t/checkpoint-2000 \
+  --trt-engine-path ./groot_n1d6_onnx/dit_model_bf16_5090.trt \
+  --denoising-steps 4 \
+  --transport tcp \
+  --port 5555 \
+  --enable-viz
+```
 
 ## Command-Line Arguments
 

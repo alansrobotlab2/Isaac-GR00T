@@ -9,7 +9,8 @@
 uv.lock
 
 # alfiebot directories
-/cando/
+/alfie-gr00t/
+/groot_n1d6_onnx/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
