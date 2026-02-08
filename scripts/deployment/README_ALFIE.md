@@ -10,6 +10,48 @@ Run inference with PyTorch or TensorRT acceleration for the GR00T policy.
 - Dataset in LeRobot format
 - CUDA-enabled GPU
 
+## Data Preparation
+
+### Convert episodes to lerobot+ format
+```bash
+python3 rosbag_to_groot.py \
+    --demos-dir /home/alansrobotlab/Projects/alfiebot_ws/data/demonstrations \
+    --output-dir /home/alansrobotlab/Projects/alfiebot_ws/data/alfiebot.CanDoChallenge \
+    --task-index 0 \
+    --start-episode 0 \
+    --num-threads 32
+```
+
+### Review Videos and delete demonstration folders that aren't suitable
+
+### Run script again to update structure with remaining episodes
+```bash
+python3 rosbag_to_groot.py \
+    --demos-dir /home/alansrobotlab/Projects/alfiebot_ws/data/demonstrations \
+    --output-dir /home/alansrobotlab/Projects/alfiebot_ws/data/alfiebot.CanDoChallenge \
+    --task-index 0 \
+    --start-episode 0 \
+    --num-threads 32
+```
+
+### Edit episodes.jsonl for correct task indexes
+```bash
+nano ~/Projects/alfiebot_ws/alfiebot.CanDoChallenge/meta/episodes.jsonl
+```
+
+### Update parquet files with episode number details from episodes.jsonl
+```bash
+python3 update_task_index.py --data-dir ~/Projects/alfiebot_ws/data/alfiebot.CanDoChallenge
+```
+
+### generate stats file
+```bash
+uv run gr00t/data/stats.py \
+  --dataset-path ~/Projects/alfiebot_ws/data/alfiebot.CanDoChallenge \
+  --embodiment-tag NEW_EMBODIMENT \
+  --modality-config-path ~/Projects/alfiebot_ws/data/alfiebot.CanDoChallenge/alfiebot_config.py
+
+
 ### Installation
 
 **PyTorch mode** (default installation):
@@ -41,7 +83,7 @@ sudo nvidia-smi -i 1 -pl 300   # rtx 3090
 sudo nvidia-smi -i 2 -pl 300   # rtx 3090
 ```
 
-
+#### Standard run
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 uv run \
     gr00t/experiment/launch_finetune.py \
@@ -58,6 +100,26 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 uv run \
     --gradient-accumulation-steps 32 \
     --dataloader-num-workers 5 \
     --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08
+```
+
+#### enhanced run
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 uv run \
+    gr00t/experiment/launch_finetune.py \
+    --base-model-path nvidia/GR00T-N1.6-3B \
+    --dataset-path ~/Projects/alfiebot_ws/data/alfiebot.CanDoChallenge \
+    --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path ~/Projects/alfiebot_ws/src/alfie_gr00t/alfie_gr00t/alfiebot_config.py \
+    --num-gpus 1 \
+    --output-dir ./alfie-gr00t-perturb \
+    --save-total-limit 5 \
+    --save-steps 2000 \
+    --max-steps 2000 \
+    --global-batch-size 16 \
+    --gradient-accumulation-steps 32 \
+    --dataloader-num-workers 5 \
+    --color-jitter-params brightness 0.5 contrast 0.6 saturation 0.6 hue 0.1 \
+    --random-rotation-angle 5
 ```
 
 3 way multi card fine tuning, takes 27 hours
@@ -120,10 +182,10 @@ CUDA_VISIBLE_DEVICES=0 uv run gr00t/eval/open_loop_eval.py \
 --dataset-path ../alfiebot_ws/data/alfiebot.CanDoChallenge \
 --embodiment-tag NEW_EMBODIMENT \
 --model-path ./alfie-gr00t/checkpoint-2000 \
---traj-ids 196 \
+--traj-ids 0 \
 --action-horizon 16 \
 --denoising-steps 4 \
---save-plot-path ./episode196_output_pytorch.png
+--save-plot-path ./episode000_output_pytorch_absolute.png
 ```
 
 ---
@@ -166,8 +228,7 @@ CUDA_VISIBLE_DEVICES=0 uv run scripts/deployment/standalone_inference_script.py 
   --inference-mode tensorrt \
   --trt-engine-path ./groot_n1d6_onnx/dit_model_bf16_5090.trt \
   --denoising-steps 4 \
-  --action-horizon 16 \
-  --enable-viz
+  --action-horizon 16 
 ```
 
 ```bash
