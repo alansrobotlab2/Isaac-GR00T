@@ -62,13 +62,14 @@ cd ~/Isaac-GR00T
 
 docker run \
   -it --rm --runtime=nvidia \
+  --network=host \
   -v $(pwd)/.:/workspace/gr00t gr00t-dev /bin/bash
 ```
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python scripts/deployment/standalone_inference_script.py \
-  --model-path ./alfie-gr00t/checkpoint-2000 \
-  --dataset-path ../alfiebot_ws/data/alfiebot.CanDoChallenge \
+python scripts/deployment/standalone_inference_script.py \
+  --model-path ./alfie-gr00t/checkpoint-10000 \
+  --dataset-path ./alfiebot.CanDoChallenge \
   --embodiment-tag NEW_EMBODIMENT \
   --traj-ids 0 1 \
   --inference-mode pytorch \
@@ -76,15 +77,37 @@ CUDA_VISIBLE_DEVICES=0 python scripts/deployment/standalone_inference_script.py 
 ```
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python gr00t/eval/open_loop_eval.py \
---dataset-path ../alfiebot_ws/data/alfiebot.CanDoChallenge \
+python gr00t/eval/open_loop_eval.py \
+--dataset-path ./alfiebot.CanDoChallenge \
 --embodiment-tag NEW_EMBODIMENT \
---model-path ./alfie-gr00t/checkpoint-2000 \
+--model-path ./alfie-gr00t/checkpoint-10000 \
 --traj-ids 0 \
 --action-horizon 16 \
 --denoising-steps 4 \
 --save-plot-path ./episode000_output_pytorch.png
 ```
+
+run alfie gr00t server
+```bash
+cd ~/
+
+docker run \
+  -it --rm --runtime=nvidia \
+  --network=host \
+  -v $(pwd)/.:/workspace/gr00t gr00t-dev /bin/bash
+```
+
+```
+cd Isaac-GR00T
+pip install -e .
+pip install
+
+python ../alfiebot_ws/src/alfie_gr00t/alfie_gr00t/scripts/groot_inference_server.py \
+  --checkpoint ./alfie-gr00t/checkpoint-10000 \
+  --denoising-steps 4 \
+  --port 5555
+```
+
 
 ---
 
@@ -93,9 +116,11 @@ CUDA_VISIBLE_DEVICES=0 python gr00t/eval/open_loop_eval.py \
 ### Step 1: Export to ONNX
 
 ```bash
+rm -rf groot_n1d6_onnx
+
 python scripts/deployment/export_onnx_n1d6.py \
-  --model_path ./alfie-gr00t/checkpoint-2000 \
-  --dataset_path ../alfiebot_ws/data/alfiebot.CanDoChallenge \
+  --model_path ./alfie-gr00t/checkpoint-10000 \
+  --dataset_path ./alfiebot.CanDoChallenge \
   --embodiment_tag new_embodiment \
   --output_dir ./groot_n1d6_onnx
 ```
@@ -119,8 +144,8 @@ python scripts/deployment/build_tensorrt_engine.py \
 
 ```bash
 python scripts/deployment/standalone_inference_script.py \
-  --model-path ./alfie-gr00t/checkpoint-2000 \
-  --dataset-path ../alfiebot_ws/data/alfiebot.CanDoChallenge \
+  --model-path ./alfie-gr00t/checkpoint-10000 \
+  --dataset-path ./alfiebot.CanDoChallenge \
   --embodiment-tag NEW_EMBODIMENT \
   --traj-ids 196 197 198 199 \
   --inference-mode tensorrt \
@@ -131,6 +156,7 @@ python scripts/deployment/standalone_inference_script.py \
 
 ```bash
 
+MSE 100x worse, MAE 10x worse, basically an unusable model, but why?
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run python gr00t/eval/open_loop_eval.py \
 --dataset-path ../alfiebot_ws/data/alfiebot.CanDoChallenge \
@@ -143,6 +169,19 @@ CUDA_VISIBLE_DEVICES=0 uv run python gr00t/eval/open_loop_eval.py \
 --denoising-steps 4 \
 --save-plot-path ./episode000_output_tensorrt.png
 ---
+
+```bash
+python gr00t/eval/open_loop_eval.py \
+--dataset-path ./alfiebot.CanDoChallenge \
+--embodiment-tag NEW_EMBODIMENT \
+--model-path ./alfie-gr00t/checkpoint-10000 \
+--inference-mode tensorrt \
+--trt-engine-path ./groot_n1d6_onnx/dit_model_fp16_orin.trt \
+--traj-ids 0 \
+--action-horizon 16 \
+--denoising-steps 4 \
+--save-plot-path ./episode000_output_tensorrt.png
+```
 
 ## Command-Line Arguments
 

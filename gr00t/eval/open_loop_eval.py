@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 import re
+import time
 from typing import Any
 import warnings
 
@@ -142,7 +143,11 @@ def evaluate_single_trajectory(
     save_plot_path=None,
 ):
     # Ensure steps doesn't exceed trajectory length
+    t_load_start = time.perf_counter()
     traj = loader[traj_id]
+    t_load_end = time.perf_counter()
+    episode_load_time = t_load_end - t_load_start
+
     traj_length = len(traj)
     actual_steps = min(steps, traj_length)
     logging.info(
@@ -150,6 +155,8 @@ def evaluate_single_trajectory(
     )
 
     pred_action_across_time = []
+    data_prep_times = []
+    inference_times = []
 
     # Extract state and action keys separately and sort for consistent order
     state_keys = loader.modality_configs["state"].modality_keys
@@ -160,8 +167,8 @@ def evaluate_single_trajectory(
     modality_configs = deepcopy(loader.modality_configs)
     modality_configs.pop("action")
     for step_count in range(0, actual_steps, action_horizon):
+        t_prep_start = time.perf_counter()
         data_point = extract_step_data(traj, step_count, modality_configs, embodiment_tag)
-        logging.info(f"inferencing at step: {step_count}")
         obs = {}
         for k, v in data_point.states.items():
             obs[f"state.{k}"] = v  # (T, D)
@@ -170,7 +177,15 @@ def evaluate_single_trajectory(
         for language_key in loader.modality_configs["language"].modality_keys:
             obs[language_key] = data_point.text
         parsed_obs = parse_observation_gr00t(obs, loader.modality_configs)
+        t_prep_end = time.perf_counter()
+        data_prep_times.append(t_prep_end - t_prep_start)
+
+        logging.info(f"inferencing at step: {step_count}")
+        t_inf_start = time.perf_counter()
         _action_chunk, _ = policy.get_action(parsed_obs)
+        t_inf_end = time.perf_counter()
+        inference_times.append(t_inf_end - t_inf_start)
+
         action_chunk = parse_action_gr00t(_action_chunk)
         for j in range(action_horizon):
             # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
@@ -222,7 +237,12 @@ def evaluate_single_trajectory(
         save_plot_path=save_plot_path or f"/tmp/open_loop_eval/traj_{traj_id}.jpeg",
     )
 
-    return mse, mae
+    timing = {
+        "episode_load_time": episode_load_time,
+        "data_prep_times": data_prep_times,
+        "inference_times": inference_times,
+    }
+    return mse, mae, timing
 
 
 @dataclass
@@ -262,6 +282,12 @@ class ArgsConfig:
     modality_keys: list[str] | None = None
     """List of modality keys to plot. If None, plot all keys."""
 
+    inference_mode: str = "pytorch"
+    """Inference mode: 'pytorch' (default) or 'tensorrt'."""
+
+    trt_engine_path: str | None = None
+    """Path to the TensorRT engine file (.trt) for the DiT model. Required when inference_mode is 'tensorrt'."""
+
 
 def main(args: ArgsConfig):
     # Set up logging
@@ -286,6 +312,7 @@ def main(args: ArgsConfig):
         else:
             logging.warning(f"Could not find checkpoint-<step> pattern in path: {local_model_path}")
 
+    t_model_start = time.perf_counter()
     if local_model_path is not None:
         import torch
 
@@ -294,26 +321,44 @@ def main(args: ArgsConfig):
             model_path=local_model_path,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
+
+        if args.inference_mode == "tensorrt":
+            if args.trt_engine_path is None:
+                raise ValueError("--trt-engine-path is required when --inference-mode is 'tensorrt'")
+            import sys
+
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "deployment"))
+            from standalone_inference_script import replace_dit_with_tensorrt
+
+            replace_dit_with_tensorrt(policy, args.trt_engine_path)
     else:
         policy = PolicyClient(host=args.host, port=args.port)
+    t_model_end = time.perf_counter()
+    model_load_time = t_model_end - t_model_start
 
     # Get the supported modalities for the policy
     modality = policy.get_modality_config()
     logging.info(f"Current modality config: \n{modality}")
 
     # Create the dataset
+    t_dataset_start = time.perf_counter()
     dataset = LeRobotEpisodeLoader(
         dataset_path=args.dataset_path,
         modality_configs=modality,
         video_backend="torchcodec",
         video_backend_kwargs=None,
     )
+    t_dataset_end = time.perf_counter()
+    dataset_load_time = t_dataset_end - t_dataset_start
 
     logging.info(f"Dataset length: {len(dataset)}")
     logging.info(f"Running evaluation on trajectories: {args.traj_ids}")
 
     all_mse = []
     all_mae = []
+    all_episode_load_times = []
+    all_data_prep_times = []
+    all_inference_times = []
 
     for traj_id in args.traj_ids:
         if traj_id >= len(dataset):
@@ -321,7 +366,7 @@ def main(args: ArgsConfig):
             continue
 
         logging.info(f"Running trajectory: {traj_id}")
-        mse, mae = evaluate_single_trajectory(
+        mse, mae, timing = evaluate_single_trajectory(
             policy,
             dataset,
             traj_id,
@@ -334,15 +379,69 @@ def main(args: ArgsConfig):
         logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
         all_mse.append(mse)
         all_mae.append(mae)
+        all_episode_load_times.append(timing["episode_load_time"])
+        all_data_prep_times.extend(timing["data_prep_times"])
+        all_inference_times.extend(timing["inference_times"])
 
+    # Print evaluation summary
+    logging.info("=" * 80)
+    logging.info("=== EVALUATION SUMMARY ===")
+    logging.info("=" * 80)
+    logging.info("")
     if all_mse:
         avg_mse = np.mean(np.array(all_mse))
         avg_mae = np.mean(np.array(all_mae))
-        logging.info(f"Average MSE across all trajs: {avg_mse}")
-        logging.info(f"Average MAE across all trajs: {avg_mae}")
+        logging.info("Metrics:")
+        logging.info(f"  Average MSE across all trajs: {avg_mse:.6f}")
+        logging.info(f"  Average MAE across all trajs: {avg_mae:.6f}")
     else:
         logging.info("No valid trajectories were evaluated.")
+    logging.info("")
+
+    # Print detailed timing summary
+    num_trajs = len(all_episode_load_times)
+    num_steps = len(all_inference_times)
+    total_episode_load = sum(all_episode_load_times)
+    total_data_prep = sum(all_data_prep_times)
+    total_inference = sum(all_inference_times)
+    inf_times = np.array(all_inference_times) if all_inference_times else np.array([0.0])
+
+    logging.info("=" * 80)
+    logging.info("=== DETAILED TIMING SUMMARY ===")
+    logging.info("=" * 80)
+    logging.info("")
+    logging.info("Initialization:")
+    logging.info(f"  Model loading time:          {model_load_time:.4f}s")
+    logging.info(f"  Dataset loader creation:     {dataset_load_time:.4f}s")
+    logging.info("")
+    logging.info(f"Per-Trajectory Timings ({num_trajs} trajectories):")
+    logging.info(
+        f"  Total episode loading:       {total_episode_load:.4f}s"
+        f"  (avg: {total_episode_load / max(num_trajs, 1):.4f}s)"
+    )
+    logging.info(
+        f"  Total data preparation:      {total_data_prep:.4f}s"
+        f"  (avg: {total_data_prep / max(num_steps, 1):.4f}s per step)"
+    )
+    logging.info(
+        f"  Total inference:             {total_inference:.4f}s"
+        f"  (avg: {total_inference / max(num_steps, 1):.4f}s per step)"
+    )
+    logging.info("")
+    logging.info("Inference Statistics:")
+    logging.info(f"  Total inference steps:       {num_steps}")
+    logging.info(f"  Avg inference time per step: {np.mean(inf_times):.4f}s")
+    logging.info(f"  Min inference time:          {np.min(inf_times):.4f}s")
+    logging.info(f"  Max inference time:          {np.max(inf_times):.4f}s")
+    logging.info(f"  P90 inference time:          {np.percentile(inf_times, 90):.4f}s")
+    logging.info("")
+
+    if args.save_plot_path:
+        logging.info("=" * 80)
+        logging.info(f"Plot saved to: {Path(args.save_plot_path).resolve()}")
+        logging.info("=" * 80)
     logging.info("Done")
+
 
 
 if __name__ == "__main__":
