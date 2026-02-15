@@ -162,8 +162,10 @@ class TensorRTDiTWrapper:
             trt.bfloat16: torch.bfloat16,
             trt.int8: torch.int8,
             trt.int32: torch.int32,
+            trt.int64: torch.int64,
+            trt.bool: torch.bool,
         }
-        return dtype_map.get(trt_dtype, torch.bfloat16)  # Default to bf16
+        return dtype_map.get(trt_dtype, torch.float32)  # Default to fp32 (safe fallback)
 
     def __call__(self, sa_embs, vl_embs, timestep, image_mask=None, backbone_attention_mask=None):
         """Forward pass through TensorRT DiT."""
@@ -376,7 +378,7 @@ class TensorRTBackboneWrapper:
             trt.int64: torch.int64,
             trt.bool: torch.bool,
         }
-        return dtype_map.get(trt_dtype, torch.bfloat16)
+        return dtype_map.get(trt_dtype, torch.float32)  # Default to fp32 (safe fallback)
 
     def __call__(self, input_ids, attention_mask, pixel_values):
         """Forward pass through TensorRT backbone.
