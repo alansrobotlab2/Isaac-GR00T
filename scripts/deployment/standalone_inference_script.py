@@ -137,8 +137,9 @@ class TensorRTDiTWrapper:
         output_dtype = self.engine.get_tensor_dtype("output")
         self.engine_output_dtype = self._trt_dtype_to_torch(output_dtype)
 
-        # Action decoder requires BF16 (Eagle backbone uses Flash Attention which needs BF16)
-        # If TRT outputs FP16, we convert to BF16 after execution
+        # When model runs BF16 (flash_attention_2) and TRT outputs FP16, convert to match.
+        # With SDPA + FP16 pipeline (recommended for SM87/Orin), this is a no-op since
+        # the engine outputs FP32 and gr00t_n1d6.py casts to model dtype (FP16).
         self.convert_to_bf16 = (self.engine_output_dtype == torch.float16)
         if self.convert_to_bf16:
             logging.info(f"TensorRT output dtype: {output_dtype} -> will convert FP16 to BF16 for action decoder")
@@ -1101,10 +1102,13 @@ def main(args: ArgsConfig):
             logging.info(" TensorRT mode enabled")
         else:
             # PyTorch mode - load directly to GPU
+            # On SM87 (Orin), use FP16 when SDPA attention is selected (no native BF16 tensor cores)
+            use_fp16 = args.attn_implementation == "sdpa"
             policy = Gr00tPolicy(
                 embodiment_tag=args.embodiment_tag,
                 model_path=local_model_path,
                 device="cuda" if torch.cuda.is_available() else "cpu",
+                use_fp16=use_fp16,
                 attn_implementation=args.attn_implementation,
             )
 
