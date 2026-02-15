@@ -1,3 +1,4 @@
+import logging
 from typing import Tuple
 
 from gr00t.configs.model.gr00t_n1d6 import Gr00tN1d6Config
@@ -274,6 +275,17 @@ class Gr00tN1d6ActionHead(nn.Module):
                 - backbone_features: [B, seq_len, backbone_embedding_dim]
                 - state_features: [B, state_horizon, input_embedding_dim]
         """
+        # Cast all float inputs to match the action head's weight dtype.
+        # This handles dtype mismatches when TRT engine output dtype (e.g. bf16)
+        # differs from the PyTorch model dtype (e.g. fp16 with SDPA).
+        target_dtype = self.dtype
+        for key in backbone_output:
+            if isinstance(backbone_output[key], torch.Tensor) and backbone_output[key].is_floating_point():
+                backbone_output[key] = backbone_output[key].to(target_dtype)
+        for key in action_input:
+            if isinstance(action_input[key], torch.Tensor) and action_input[key].is_floating_point():
+                action_input[key] = action_input[key].to(target_dtype)
+
         backbone_output = self.process_backbone_output(backbone_output)
 
         # Get vision and language embeddings.
@@ -320,23 +332,28 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         dt = 1.0 / self.num_inference_timesteps
 
+        # Precompute timestep tensors and position embeddings (static across all denoising steps)
+        timestep_tensors = []
+        for t in range(self.num_inference_timesteps):
+            t_cont = t / float(self.num_inference_timesteps)
+            t_discretized = int(t_cont * self.num_timestep_buckets)
+            timestep_tensors.append(
+                torch.full(size=(batch_size,), fill_value=t_discretized, device=device)
+            )
+
+        if self.config.add_pos_embed:
+            pos_ids = torch.arange(self.action_horizon, dtype=torch.long, device=device)
+            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+
         # Run denoising steps.
         for t in range(self.num_inference_timesteps):
-            t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
-            t_discretized = int(t_cont * self.num_timestep_buckets)
-
-            # Embed noised action trajectory.
-            # Cast actions to model dtype for the encoder (weights are BF16).
-            timesteps_tensor = torch.full(
-                size=(batch_size,), fill_value=t_discretized, device=device
-            )
+            timesteps_tensor = timestep_tensors[t]
+            # Cast actions to model dtype for the encoder (weights are BF16/FP16).
             action_features = self.action_encoder(
                 actions.to(model_dtype), timesteps_tensor, embodiment_id
             )
             # Add position embedding.
             if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
 
             # Join vision, language, state and action embedding along sequence dimension.
@@ -357,8 +374,10 @@ class Gr00tN1d6ActionHead(nn.Module):
                     encoder_hidden_states=vl_embeds,
                     timestep=timesteps_tensor,
                 )
-            pred = self.action_decoder(model_output, embodiment_id)
+            if model_output.dtype != self.dtype:
+                model_output = model_output.to(self.dtype)
 
+            pred = self.action_decoder(model_output, embodiment_id)
             pred_velocity = pred[:, -self.action_horizon :]
 
             # Update actions using Euler integration in FP32 to prevent
@@ -455,6 +474,7 @@ class Gr00tN1d6(PreTrainedModel):
             select_layer=config.select_layer,
             reproject_vision=config.reproject_vision,
             use_flash_attention=config.use_flash_attention,
+            attn_implementation=getattr(config, 'attn_implementation', None),
             load_bf16=config.load_bf16,
             tune_top_llm_layers=config.tune_top_llm_layers,
             trainable_params_fp32=config.backbone_trainable_params_fp32,

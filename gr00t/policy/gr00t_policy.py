@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.interfaces import BaseProcessor
@@ -63,6 +63,10 @@ class Gr00tPolicy(BasePolicy):
         *,
         device: int | str,
         strict: bool = True,
+        skip_dit: bool = False,
+        skip_backbone: bool = False,
+        use_fp16: bool = False,
+        attn_implementation: str | None = None,
     ):
         """Initialize the Gr00t Policy.
 
@@ -71,6 +75,15 @@ class Gr00tPolicy(BasePolicy):
             model_path: Path to the pretrained model checkpoint directory
             device: Device to run the model on (e.g., 'cuda:0', 0, 'cpu')
             strict: Whether to enforce strict input validation (default: True)
+            skip_dit: If True, skip loading the DiT model weights to save memory.
+                      Use this when replacing DiT with TensorRT on memory-constrained
+                      systems like Jetson (unified memory). Default: False.
+            skip_backbone: If True, skip loading the backbone weights to save memory.
+                      Use this when replacing backbone with TensorRT. Default: False.
+            use_fp16: If True, load model in FP16 instead of BF16. FP16 is faster
+                      on Orin tensor cores. Default: False (uses BF16).
+            attn_implementation: Override attention implementation for the backbone.
+                      Options: "flash_attention_2", "sdpa", or None (use config default).
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -78,10 +91,49 @@ class Gr00tPolicy(BasePolicy):
         super().__init__(strict=strict)
         model_dir = Path(model_path)
 
-        # Load the pretrained model and move to target device with bfloat16 precision
-        model = AutoModel.from_pretrained(model_dir)
-        model.eval()  # Set model to evaluation mode
-        model.to(device=device, dtype=torch.bfloat16)
+        # Normalize device specification to string format for device_map
+        if isinstance(device, int):
+            device_str = f"cuda:{device}"
+        else:
+            device_str = device
+
+        # Load config and disable fp32 casting for trainable params (only needed for training).
+        # This saves ~400MB on models with tune_top_llm_layers > 0.
+        config = AutoConfig.from_pretrained(model_dir)
+        config.backbone_trainable_params_fp32 = False
+
+        # Override attention implementation if specified
+        if attn_implementation is not None:
+            config.attn_implementation = attn_implementation
+
+        # Select precision: FP16 for Orin optimization, BF16 for default
+        model_dtype = torch.float16 if use_fp16 else torch.bfloat16
+        self.model_dtype = model_dtype
+
+        # Load directly to target device. On Orin AGX 64GB there's plenty of
+        # unified memory for the full model; delete components afterward.
+        model = AutoModel.from_pretrained(
+            model_dir,
+            config=config,
+            device_map=device_str,
+            torch_dtype=model_dtype,
+        )
+        model.eval()
+
+        if skip_dit or skip_backbone:
+            import gc
+
+            if skip_dit and hasattr(model, 'action_head') and hasattr(model.action_head, 'model'):
+                del model.action_head.model
+                model.action_head.model = None
+
+            if skip_backbone and hasattr(model, 'backbone'):
+                del model.backbone
+                model.backbone = None
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
         self.model = model
 
         # Load the processor for input/output transformation
@@ -336,7 +388,7 @@ class Gr00tPolicy(BasePolicy):
 
         # Step 3: Collate processed inputs into a single batch for model
         collated_inputs = self.collate_fn(processed_inputs)
-        collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
+        collated_inputs = _rec_to_dtype(collated_inputs, dtype=self.model_dtype)
 
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
@@ -356,6 +408,54 @@ class Gr00tPolicy(BasePolicy):
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
         return casted_action, {}
+
+    def prepare_inputs(self, observation: dict[str, Any]) -> tuple[dict, list]:
+        """Preprocess observation into model-ready inputs (CPU only, no CUDA ops).
+
+        This runs the VLA processor + collation + dtype conversion, returning
+        inputs ready for model.get_action(). Safe to call from a background
+        thread to overlap with GPU inference on the previous step.
+
+        Args:
+            observation: Batched observation dictionary
+
+        Returns:
+            Tuple of (collated_inputs dict, states list for action decoding)
+        """
+        unbatched_observations = self._unbatch_observation(observation)
+        processed_inputs = []
+        states = []
+        for obs in unbatched_observations:
+            vla_step_data = self._to_vla_step_data(obs)
+            states.append(vla_step_data.states)
+            messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
+            processed_inputs.append(self.processor(messages))
+
+        collated_inputs = self.collate_fn(processed_inputs)
+        collated_inputs = _rec_to_dtype(collated_inputs, dtype=self.model_dtype)
+        return collated_inputs, states
+
+    def run_inference(self, collated_inputs: dict, states: list) -> dict[str, Any]:
+        """Run model inference and decode actions from pre-computed inputs.
+
+        Args:
+            collated_inputs: Output from prepare_inputs()
+            states: State list from prepare_inputs() (needed for action decoding)
+
+        Returns:
+            Action dictionary with float32 arrays
+        """
+        with torch.inference_mode():
+            model_pred = self.model.get_action(**collated_inputs)
+        normalized_action = model_pred["action_pred"].float()
+
+        batched_states = {}
+        for k in self.modality_configs["state"].modality_keys:
+            batched_states[k] = np.stack([s[k] for s in states], axis=0)
+        unnormalized_action = self.processor.decode_action(
+            normalized_action.cpu().numpy(), self.embodiment_tag, batched_states
+        )
+        return {key: value.astype(np.float32) for key, value in unnormalized_action.items()}
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.

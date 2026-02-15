@@ -28,7 +28,8 @@ class Gr00tN1d6Config(PretrainedConfig):
     select_layer: int = 16
     reproject_vision: bool = False
     use_flash_attention: bool = True
-    load_bf16: bool = True  # Enable BF16 loading
+    attn_implementation: str | None = None  # "flash_attention_2", "sdpa", or None (uses use_flash_attention flag)
+    load_bf16: bool = True  # Enable BF16 loading (can be False when using SDPA with FP16)
     collator_overwrite_image_inputs: bool = False  # Deprecated; use eagle_collator.
     eagle_collator: bool = (
         False  # this allows model to change image size in collator, needed for eagle any-res

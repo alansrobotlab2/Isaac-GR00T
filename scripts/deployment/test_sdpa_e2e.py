@@ -25,6 +25,7 @@ Usage (inside Docker):
 import argparse
 import gc
 import logging
+import os
 import time
 from copy import deepcopy
 
@@ -332,12 +333,19 @@ def main():
 
     results.append(("SDPA backbone + PT DiT", sdpa_e2e, sdpa_ms))
 
+    # Free SDPA policy before loading TRT variant to reduce GPU memory pressure
+    del sdpa_policy
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # ---- C. SDPA backbone + TRT DiT (if provided) ----
     if args.trt_dit_path:
         logger.info("\n" + "=" * 80)
         logger.info("C. TEST: SDPA backbone + TRT FP16 DiT")
         logger.info("=" * 80)
 
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from standalone_inference_script import replace_dit_with_tensorrt
 
         sdpa_trt_policy = Gr00tPolicy(
@@ -346,9 +354,51 @@ def main():
             device="cuda",
         )
         swap_attn_implementation(sdpa_trt_policy.model.backbone, target="sdpa")
+
+        # Verify all action_decoder parameters are BF16 before TRT replacement
+        for name, p in sdpa_trt_policy.model.action_head.action_decoder.named_parameters():
+            logger.info(f"  action_decoder param {name}: dtype={p.dtype}, device={p.device}")
+
         replace_dit_with_tensorrt(sdpa_trt_policy, args.trt_dit_path)
 
-        if args.use_compile:
+        # Quick diagnostic: single forward pass to check for dtype issues
+        logger.info("  Running diagnostic forward pass...")
+        modality_configs_no_action = deepcopy(modality_config)
+        modality_configs_no_action.pop("action", None)
+        obs_diag, _ = prepare_observation(
+            sdpa_trt_policy, dataset, args.traj_ids[0], 0, modality_configs_no_action
+        )
+        try:
+            with torch.inference_mode():
+                diag_action, _ = sdpa_trt_policy.get_action(obs_diag)
+            logger.info("  Diagnostic forward pass SUCCEEDED")
+        except RuntimeError as e:
+            logger.error(f"  Diagnostic forward pass FAILED: {e}")
+            logger.info("  Attempting dtype fix: casting action_head to float32...")
+            # The issue may be that torch.bmm on SM87 doesn't support BF16
+            # for the CategorySpecificLinear in the action decoder.
+            # Fix: wrap the denoising loop's action_decoder call with dtype casting.
+            original_action_decoder_fwd = sdpa_trt_policy.model.action_head.action_decoder.forward
+
+            def patched_action_decoder_fwd(x, cat_ids):
+                # Cast input to match parameter dtype
+                param_dtype = next(sdpa_trt_policy.model.action_head.action_decoder.parameters()).dtype
+                x = x.to(dtype=param_dtype)
+                return original_action_decoder_fwd(x, cat_ids)
+
+            sdpa_trt_policy.model.action_head.action_decoder.forward = patched_action_decoder_fwd
+
+            # Retry
+            try:
+                with torch.inference_mode():
+                    diag_action, _ = sdpa_trt_policy.get_action(obs_diag)
+                logger.info("  Diagnostic forward pass SUCCEEDED after dtype fix")
+            except RuntimeError as e2:
+                logger.error(f"  Still failing after fix: {e2}")
+                logger.info("  Skipping test C")
+                sdpa_trt_policy = None
+
+        if args.use_compile and sdpa_trt_policy is not None:
             logger.info("  Compiling SDPA backbone...")
             sdpa_trt_policy.model.backbone.forward = torch.compile(
                 sdpa_trt_policy.model.backbone.forward, mode="max-autotune"
@@ -365,22 +415,28 @@ def main():
                 torch.cuda.synchronize()
                 logger.info(f"    Warmup {i+1}/3 done")
 
-        logger.info("  Running E2E evaluation...")
-        sdpa_trt_e2e = evaluate_e2e(
-            ref_policy, sdpa_trt_policy, dataset, args.traj_ids,
-            modality_config, action_keys, action_horizon, args.max_steps,
-            label="sdpa_trt",
-        )
-
-        if not args.skip_latency:
-            sdpa_trt_ms = benchmark_latency(
-                sdpa_trt_policy, dataset, modality_config,
-                traj_id=args.traj_ids[0], num_iters=args.num_latency_iters
+        if sdpa_trt_policy is not None:
+            logger.info("  Running E2E evaluation...")
+            sdpa_trt_e2e = evaluate_e2e(
+                ref_policy, sdpa_trt_policy, dataset, args.traj_ids,
+                modality_config, action_keys, action_horizon, args.max_steps,
+                label="sdpa_trt",
             )
-        else:
-            sdpa_trt_ms = None
 
-        results.append(("SDPA backbone + TRT DiT", sdpa_trt_e2e, sdpa_trt_ms))
+            if not args.skip_latency:
+                sdpa_trt_ms = benchmark_latency(
+                    sdpa_trt_policy, dataset, modality_config,
+                    traj_id=args.traj_ids[0], num_iters=args.num_latency_iters
+                )
+            else:
+                sdpa_trt_ms = None
+
+            results.append(("SDPA backbone + TRT DiT", sdpa_trt_e2e, sdpa_trt_ms))
+
+        # Free SDPA+TRT policy before loading flash+TRT
+        del sdpa_trt_policy
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # ---- D. Flash backbone + TRT DiT (for comparison) ----
         logger.info("\n" + "=" * 80)

@@ -420,7 +420,12 @@ class LeRobotEpisodeLoader:
         self, episode_meta: dict, nframes: int, lang_key: str
     ) -> list[str]:
         if lang_key == "task":
-            meta_language = random.choice(episode_meta["tasks"])
+            # Handle datasets that don't have 'tasks' metadata
+            if "tasks" in episode_meta:
+                meta_language = random.choice(episode_meta["tasks"])
+            else:
+                # Fallback to empty string if tasks are not available
+                meta_language = ""
             new_languages = [meta_language] * nframes
         elif lang_key == "sub_task":
             action_delta_indices = self.modality_configs["action"].delta_indices

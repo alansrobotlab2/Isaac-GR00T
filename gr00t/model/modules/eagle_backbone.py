@@ -14,6 +14,7 @@ class EagleBackbone(torch.nn.Module):
         select_layer: int = -1,
         reproject_vision: bool = True,
         use_flash_attention: bool = False,
+        attn_implementation: str | None = None,
         projector_dim: int = -1,
         load_bf16: bool = False,
         tune_top_llm_layers: int = 0,
@@ -26,24 +27,37 @@ class EagleBackbone(torch.nn.Module):
             model_name: nvidia/Eagle-Block2A-2B-v2
             tune_llm: whether to tune the LLM model (default: False)
             tune_visual: whether to tune the visual model (default: False)
+            attn_implementation: Attention implementation to use. Options:
+                - None: uses use_flash_attention flag for backward compat
+                - "flash_attention_2": Flash Attention 2 (requires BF16)
+                - "sdpa": PyTorch Scaled Dot-Product Attention (works with FP16/BF16)
+                - "eager": Manual attention with matmul/softmax (ONNX-exportable)
         """
 
         super().__init__()
 
+        # Resolve attention implementation
+        if attn_implementation is not None:
+            resolved_attn = attn_implementation
+        elif use_flash_attention:
+            resolved_attn = "flash_attention_2"
+        else:
+            resolved_attn = "sdpa"
+
         # Add attention kwargs
         extra_kwargs = {}
-        if use_flash_attention:
-            extra_kwargs["attn_implementation"] = "flash_attention_2"
+        extra_kwargs["attn_implementation"] = resolved_attn
         if load_bf16:
             extra_kwargs["torch_dtype"] = torch.bfloat16
 
         if model_name == "nvidia/Eagle-Block2A-2B-v2":
-            assert use_flash_attention, (
-                "nvidia/Eagle-Block2A-2B-v2 requires flash attention by default"
-            )
-            assert load_bf16, "nvidia/Eagle-Block2A-2B-v2 requires bfloat16 by default"
+            if resolved_attn == "flash_attention_2":
+                assert load_bf16, "Flash Attention 2 requires bfloat16"
             eagle_path = os.path.join(os.path.dirname(__file__), "nvidia", "Eagle-Block2A-2B-v2")
             config = AutoConfig.from_pretrained(eagle_path, trust_remote_code=True)
+            # Set attn_implementation on config so Eagle's __init__ propagates it
+            # to vision_config and text_config (see modeling_eagle3_vl.py lines 96-115)
+            config._attn_implementation = resolved_attn
             self.model = AutoModel.from_config(config, trust_remote_code=True)
         else:
             raise ValueError(f"Model {model_name} not supported")

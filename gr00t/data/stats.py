@@ -247,7 +247,13 @@ def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) 
         json.dump(to_json_serializable(dict(stats)), f, indent=4)
 
 
-def main(dataset_path: Path | str, embodiment_tag: EmbodimentTag):
+def main(dataset_path: Path | str, embodiment_tag: EmbodimentTag, modality_config_path: Path | None = None):
+    if modality_config_path is not None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("modality_config", modality_config_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
     generate_stats(dataset_path)
     generate_rel_stats(dataset_path, embodiment_tag)
 

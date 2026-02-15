@@ -22,6 +22,8 @@ RUN apt-get update && \
         libbz2-dev \
         liblzma-dev \
         libopenblas-dev \
+        nano \
+        net-tools \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -38,7 +40,7 @@ ARG FFMPEG_VERSION=n4.4.2
 ARG TORCHCODEC_VERSION=v0.4.0
 
 # Build and install ffmpeg
-RUN git clone --branch ${FFMPEG_VERSION} --depth 1 https://git.ffmpeg.org/ffmpeg.git /tmp/ffmpeg && \
+RUN git clone --branch ${FFMPEG_VERSION} --depth 1 https://github.com/FFmpeg/FFmpeg.git /tmp/ffmpeg && \
     cd /tmp/ffmpeg && \
     ./configure --enable-shared --enable-pic --prefix=/usr && \
     make -j$(nproc) && \
@@ -68,3 +70,10 @@ RUN pip3 install --upgrade pybind11 && \
     export I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 && \
     pip3 install --no-build-isolation . && \
     rm -rf /tmp/torchcodec
+
+# extra packages for orin gr00t int8 trt generation
+RUN pip3 install --upgrade pycuda && \
+    pip3 install --upgrade onnxruntime-gpu --index-url https://pypi.jetson-ai-lab.io/jp6/cu126 --trusted-host pypi.jetson-ai-lab.io
+
+# extra package for int8 backbone generation
+RUN pip install --upgrade cuda-python==12.6.2.post1

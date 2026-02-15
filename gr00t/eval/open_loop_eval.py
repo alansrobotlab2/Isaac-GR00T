@@ -1,10 +1,10 @@
 from copy import deepcopy
 from dataclasses import dataclass, field
+import gc
 import logging
 from pathlib import Path
 import re
-import time
-from typing import Any
+from typing import Any, Literal
 import warnings
 
 from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
@@ -39,6 +39,7 @@ def plot_trajectory_results(
     action_keys: list[str],
     action_horizon: int,
     save_plot_path: str,
+    action_dim_labels: list[str] | None = None,
 ) -> None:
     """
     Plot and save trajectory results comparing ground truth and predicted actions.
@@ -52,6 +53,7 @@ def plot_trajectory_results(
         action_keys: List of action modality keys
         action_horizon: Action horizon used for inference
         save_plot_path: Path to save the plot
+        action_dim_labels: Optional list of per-dimension labels (e.g. ["left_arm[0]", "left_arm[1]", ...])
     """
     actual_steps = len(gt_action_across_time)
     action_dim = gt_action_across_time.shape[1]
@@ -70,12 +72,6 @@ def plot_trajectory_results(
     if num_plots == 1:
         axes = [axes]
 
-    # Add a global title showing the modality keys
-    fig.suptitle(
-        f"Trajectory {traj_id} - State: {', '.join(state_keys)} | Action: {', '.join(action_keys)}",
-        fontsize=16,
-        color="blue",
-    )
 
     for plot_idx, action_idx in enumerate(indices_to_plot):
         ax = axes[plot_idx]
@@ -95,7 +91,10 @@ def plot_trajectory_results(
             else:
                 ax.plot(j, gt_action_across_time[j, action_idx], "ro")
 
-        ax.set_title(f"Action {action_idx}")
+        if action_dim_labels and action_idx < len(action_dim_labels):
+            ax.set_title(action_dim_labels[action_idx])
+        else:
+            ax.set_title(f"Action {action_idx}")
         ax.legend()
 
     plt.tight_layout()
@@ -143,11 +142,7 @@ def evaluate_single_trajectory(
     save_plot_path=None,
 ):
     # Ensure steps doesn't exceed trajectory length
-    t_load_start = time.perf_counter()
     traj = loader[traj_id]
-    t_load_end = time.perf_counter()
-    episode_load_time = t_load_end - t_load_start
-
     traj_length = len(traj)
     actual_steps = min(steps, traj_length)
     logging.info(
@@ -155,8 +150,6 @@ def evaluate_single_trajectory(
     )
 
     pred_action_across_time = []
-    data_prep_times = []
-    inference_times = []
 
     # Extract state and action keys separately and sort for consistent order
     state_keys = loader.modality_configs["state"].modality_keys
@@ -167,8 +160,8 @@ def evaluate_single_trajectory(
     modality_configs = deepcopy(loader.modality_configs)
     modality_configs.pop("action")
     for step_count in range(0, actual_steps, action_horizon):
-        t_prep_start = time.perf_counter()
         data_point = extract_step_data(traj, step_count, modality_configs, embodiment_tag)
+        logging.info(f"inferencing at step: {step_count}")
         obs = {}
         for k, v in data_point.states.items():
             obs[f"state.{k}"] = v  # (T, D)
@@ -177,15 +170,7 @@ def evaluate_single_trajectory(
         for language_key in loader.modality_configs["language"].modality_keys:
             obs[language_key] = data_point.text
         parsed_obs = parse_observation_gr00t(obs, loader.modality_configs)
-        t_prep_end = time.perf_counter()
-        data_prep_times.append(t_prep_end - t_prep_start)
-
-        logging.info(f"inferencing at step: {step_count}")
-        t_inf_start = time.perf_counter()
         _action_chunk, _ = policy.get_action(parsed_obs)
-        t_inf_end = time.perf_counter()
-        inference_times.append(t_inf_end - t_inf_start)
-
         action_chunk = parse_action_gr00t(_action_chunk)
         for j in range(action_horizon):
             # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
@@ -225,6 +210,27 @@ def evaluate_single_trajectory(
     logging.info(f"gt_action_joints vs time {gt_action_across_time.shape}")
     logging.info(f"pred_action_joints vs time {pred_action_across_time.shape}")
 
+    # Build per-dimension labels from action keys, using joint names from info.json
+    action_dim_labels = []
+    all_joint_names = loader.feature_config.get("action", {}).get("names", None)
+    for key in action_keys:
+        modality_info = loader.modality_meta.get("action", {}).get(key, {})
+        start_idx = modality_info.get("start", None)
+        end_idx = modality_info.get("end", None)
+        col = f"action.{key}"
+        dim = np.atleast_1d(traj[col].iloc[0]).shape[0]
+        for i in range(dim):
+            joint_name = None
+            if all_joint_names and start_idx is not None:
+                abs_idx = start_idx + i
+                if abs_idx < len(all_joint_names):
+                    joint_name = all_joint_names[abs_idx]
+            if joint_name:
+                label = f"{key}[{i}] ({joint_name})" if dim > 1 else f"{key} ({joint_name})"
+            else:
+                label = f"{key}[{i}]" if dim > 1 else key
+            action_dim_labels.append(label)
+
     # Plot trajectory results
     plot_trajectory_results(
         state_joints_across_time=state_joints_across_time,
@@ -235,14 +241,10 @@ def evaluate_single_trajectory(
         action_keys=action_keys,
         action_horizon=action_horizon,
         save_plot_path=save_plot_path or f"/tmp/open_loop_eval/traj_{traj_id}.jpeg",
+        action_dim_labels=action_dim_labels,
     )
 
-    timing = {
-        "episode_load_time": episode_load_time,
-        "data_prep_times": data_prep_times,
-        "inference_times": inference_times,
-    }
-    return mse, mae, timing
+    return mse, mae
 
 
 @dataclass
@@ -273,6 +275,18 @@ class ArgsConfig:
     model_path: str | None = None
     """Path to the model checkpoint."""
 
+    inference_mode: Literal["pytorch", "tensorrt"] = "pytorch"
+    """Inference mode: 'pytorch' (default) or 'tensorrt'."""
+
+    trt_engine_path: str = ""
+    """Path to TensorRT DiT engine file (.trt). Used only when inference_mode='tensorrt'."""
+
+    backbone_trt_engine_path: str = ""
+    """Path to TensorRT engine file for the backbone. When set, replaces PyTorch backbone with TRT."""
+
+    attn_implementation: str | None = None
+    """Override backbone attention implementation. Options: 'flash_attention_2' (default), 'sdpa' (ONNX/TRT-compatible)."""
+
     denoising_steps: int = 4
     """Number of denoising steps to use."""
 
@@ -281,12 +295,6 @@ class ArgsConfig:
 
     modality_keys: list[str] | None = None
     """List of modality keys to plot. If None, plot all keys."""
-
-    inference_mode: str = "pytorch"
-    """Inference mode: 'pytorch' (default) or 'tensorrt'."""
-
-    trt_engine_path: str | None = None
-    """Path to the TensorRT engine file (.trt) for the DiT model. Required when inference_mode is 'tensorrt'."""
 
 
 def main(args: ArgsConfig):
@@ -312,53 +320,90 @@ def main(args: ArgsConfig):
         else:
             logging.warning(f"Could not find checkpoint-<step> pattern in path: {local_model_path}")
 
-    t_model_start = time.perf_counter()
     if local_model_path is not None:
         import torch
 
-        policy = Gr00tPolicy(
-            embodiment_tag=args.embodiment_tag,
-            model_path=local_model_path,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-        )
+        if args.inference_mode == "tensorrt" and torch.cuda.is_available():
+            import importlib.util
+            _script_path = str(Path(__file__).resolve().parents[2] / "scripts" / "deployment" / "standalone_inference_script.py")
+            _spec = importlib.util.spec_from_file_location("standalone_inference_script", _script_path)
+            _mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            TensorRTBackboneWrapper = _mod.TensorRTBackboneWrapper
+            TensorRTDiTWrapper = _mod.TensorRTDiTWrapper
+            replace_backbone_with_tensorrt = _mod.replace_backbone_with_tensorrt
+            replace_dit_with_tensorrt = _mod.replace_dit_with_tensorrt
 
-        if args.inference_mode == "tensorrt":
-            if args.trt_engine_path is None:
-                raise ValueError("--trt-engine-path is required when --inference-mode is 'tensorrt'")
-            import sys
+            # TRT needs contiguous GPU memory - load ALL TRT engines FIRST while GPU is empty.
+            # Critical on Jetson unified memory where CPU/GPU share 16GB.
+            logging.info("TensorRT mode: Loading ALL TRT engines first while GPU is empty...")
 
-            sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "deployment"))
-            from standalone_inference_script import replace_dit_with_tensorrt
+            # Load backbone TRT engine first (largest: ~3GB)
+            backbone_trt = None
+            if args.backbone_trt_engine_path:
+                logging.info(f"Loading backbone TRT engine: {args.backbone_trt_engine_path}")
+                backbone_trt = TensorRTBackboneWrapper(args.backbone_trt_engine_path, device=0)
+                gc.collect()
+                torch.cuda.empty_cache()
 
-            replace_dit_with_tensorrt(policy, args.trt_engine_path)
+            # Load DiT TRT engine
+            assert args.trt_engine_path, "trt_engine_path is required when inference_mode='tensorrt'"
+            logging.info(f"Loading DiT TensorRT engine: {args.trt_engine_path}")
+            trt_dit = TensorRTDiTWrapper(args.trt_engine_path, device=0, use_fp16_output=False)
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # Load PyTorch model WITHOUT DiT (skip_dit=True saves ~2GB)
+            skip_backbone = bool(args.backbone_trt_engine_path)
+            use_fp16 = args.attn_implementation == "sdpa"
+            logging.info(f"Loading PyTorch model (skip_dit=True, skip_backbone={skip_backbone})...")
+            policy = Gr00tPolicy(
+                embodiment_tag=args.embodiment_tag,
+                model_path=local_model_path,
+                device="cuda",
+                skip_dit=True,
+                skip_backbone=skip_backbone,
+                use_fp16=use_fp16,
+                attn_implementation=args.attn_implementation,
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # Wire up TRT engines to replace the (empty) PyTorch components
+            replace_dit_with_tensorrt(policy, args.trt_engine_path, preloaded_trt=trt_dit)
+            if backbone_trt is not None:
+                replace_backbone_with_tensorrt(policy, args.backbone_trt_engine_path, preloaded_trt=backbone_trt)
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            logging.info("TensorRT mode enabled")
+        else:
+            policy = Gr00tPolicy(
+                embodiment_tag=args.embodiment_tag,
+                model_path=local_model_path,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                attn_implementation=args.attn_implementation,
+            )
     else:
         policy = PolicyClient(host=args.host, port=args.port)
-    t_model_end = time.perf_counter()
-    model_load_time = t_model_end - t_model_start
 
     # Get the supported modalities for the policy
     modality = policy.get_modality_config()
     logging.info(f"Current modality config: \n{modality}")
 
     # Create the dataset
-    t_dataset_start = time.perf_counter()
     dataset = LeRobotEpisodeLoader(
         dataset_path=args.dataset_path,
         modality_configs=modality,
         video_backend="torchcodec",
         video_backend_kwargs=None,
     )
-    t_dataset_end = time.perf_counter()
-    dataset_load_time = t_dataset_end - t_dataset_start
 
     logging.info(f"Dataset length: {len(dataset)}")
     logging.info(f"Running evaluation on trajectories: {args.traj_ids}")
 
     all_mse = []
     all_mae = []
-    all_episode_load_times = []
-    all_data_prep_times = []
-    all_inference_times = []
 
     for traj_id in args.traj_ids:
         if traj_id >= len(dataset):
@@ -366,7 +411,7 @@ def main(args: ArgsConfig):
             continue
 
         logging.info(f"Running trajectory: {traj_id}")
-        mse, mae, timing = evaluate_single_trajectory(
+        mse, mae = evaluate_single_trajectory(
             policy,
             dataset,
             traj_id,
@@ -379,69 +424,15 @@ def main(args: ArgsConfig):
         logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
         all_mse.append(mse)
         all_mae.append(mae)
-        all_episode_load_times.append(timing["episode_load_time"])
-        all_data_prep_times.extend(timing["data_prep_times"])
-        all_inference_times.extend(timing["inference_times"])
 
-    # Print evaluation summary
-    logging.info("=" * 80)
-    logging.info("=== EVALUATION SUMMARY ===")
-    logging.info("=" * 80)
-    logging.info("")
     if all_mse:
         avg_mse = np.mean(np.array(all_mse))
         avg_mae = np.mean(np.array(all_mae))
-        logging.info("Metrics:")
-        logging.info(f"  Average MSE across all trajs: {avg_mse:.6f}")
-        logging.info(f"  Average MAE across all trajs: {avg_mae:.6f}")
+        logging.info(f"Average MSE across all trajs: {avg_mse}")
+        logging.info(f"Average MAE across all trajs: {avg_mae}")
     else:
         logging.info("No valid trajectories were evaluated.")
-    logging.info("")
-
-    # Print detailed timing summary
-    num_trajs = len(all_episode_load_times)
-    num_steps = len(all_inference_times)
-    total_episode_load = sum(all_episode_load_times)
-    total_data_prep = sum(all_data_prep_times)
-    total_inference = sum(all_inference_times)
-    inf_times = np.array(all_inference_times) if all_inference_times else np.array([0.0])
-
-    logging.info("=" * 80)
-    logging.info("=== DETAILED TIMING SUMMARY ===")
-    logging.info("=" * 80)
-    logging.info("")
-    logging.info("Initialization:")
-    logging.info(f"  Model loading time:          {model_load_time:.4f}s")
-    logging.info(f"  Dataset loader creation:     {dataset_load_time:.4f}s")
-    logging.info("")
-    logging.info(f"Per-Trajectory Timings ({num_trajs} trajectories):")
-    logging.info(
-        f"  Total episode loading:       {total_episode_load:.4f}s"
-        f"  (avg: {total_episode_load / max(num_trajs, 1):.4f}s)"
-    )
-    logging.info(
-        f"  Total data preparation:      {total_data_prep:.4f}s"
-        f"  (avg: {total_data_prep / max(num_steps, 1):.4f}s per step)"
-    )
-    logging.info(
-        f"  Total inference:             {total_inference:.4f}s"
-        f"  (avg: {total_inference / max(num_steps, 1):.4f}s per step)"
-    )
-    logging.info("")
-    logging.info("Inference Statistics:")
-    logging.info(f"  Total inference steps:       {num_steps}")
-    logging.info(f"  Avg inference time per step: {np.mean(inf_times):.4f}s")
-    logging.info(f"  Min inference time:          {np.min(inf_times):.4f}s")
-    logging.info(f"  Max inference time:          {np.max(inf_times):.4f}s")
-    logging.info(f"  P90 inference time:          {np.percentile(inf_times, 90):.4f}s")
-    logging.info("")
-
-    if args.save_plot_path:
-        logging.info("=" * 80)
-        logging.info(f"Plot saved to: {Path(args.save_plot_path).resolve()}")
-        logging.info("=" * 80)
     logging.info("Done")
-
 
 
 if __name__ == "__main__":
