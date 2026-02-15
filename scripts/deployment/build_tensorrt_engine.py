@@ -318,13 +318,18 @@ class BackboneInt8Calibrator(trt.IInt8EntropyCalibrator2):
       where total_frames = N * frames_per_sample
 
     Where N is the number of calibration samples (typically 100-500).
+
+    Supports both 4D ONNX models (eager: [N,C,H,W]) and 5D (SDPA: [N,1,C,H,W]).
+    Auto-detects from the ONNX optimization profile shapes.
     """
 
-    def __init__(self, calib_data_path: str, cache_file: str, batch_size: int = 1):
+    def __init__(self, calib_data_path: str, cache_file: str, batch_size: int = 1,
+                 pixel_values_5d: bool = False):
         super().__init__()
         self.cache_file = cache_file
         self.batch_size = batch_size
         self.current_index = 0
+        self.pixel_values_5d = pixel_values_5d
 
         # Load calibration data
         logger.info(f"Loading backbone calibration data from {calib_data_path}...")
@@ -345,15 +350,31 @@ class BackboneInt8Calibrator(trt.IInt8EntropyCalibrator2):
         logger.info(f"  attention_mask shape: {attention_mask.shape}")
         logger.info(f"  pixel_values shape: {pixel_values.shape}")
         logger.info(f"  Frames per sample: {self.frames_per_sample}")
+        logger.info(f"  pixel_values 5D mode: {pixel_values_5d}")
 
-        # Reshape pixel_values to [N, frames_per_sample, C, H, W]
-        self.calib_data = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "pixel_values": pixel_values.reshape(
+        if pixel_values_5d:
+            # SDPA ONNX expects [frames_per_sample, 1, C, H, W] per batch
+            # Reshape to [N, frames_per_sample, 1, C, H, W] so each sample
+            # feeds [frames_per_sample, 1, C, H, W] after squeezing batch dim
+            pv_reshaped = pixel_values.reshape(
                 self.num_samples, self.frames_per_sample, *pixel_values.shape[1:]
-            ),
-        }
+            )
+            # Insert batch=1 dim: [N, frames, C, H, W] -> [N, frames, 1, C, H, W]
+            pv_reshaped = pv_reshaped[:, :, np.newaxis, :, :, :]
+            self.calib_data = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "pixel_values": pv_reshaped,
+            }
+        else:
+            # Eager ONNX expects [frames_per_sample, C, H, W] per batch
+            self.calib_data = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "pixel_values": pixel_values.reshape(
+                    self.num_samples, self.frames_per_sample, *pixel_values.shape[1:]
+                ),
+            }
 
         logger.info(f"  Reshaped pixel_values: {self.calib_data['pixel_values'].shape}")
 
@@ -881,27 +902,57 @@ def main():
         img_height = pixel_values_shape[2]
         img_width = pixel_values_shape[3]
 
+        # Auto-detect 4D vs 5D pixel_values from ONNX model
+        import onnx
+        onnx_model = onnx.load(args.onnx, load_external_data=False)
+        for inp in onnx_model.graph.input:
+            if inp.name == "pixel_values":
+                pv_rank = len(inp.type.tensor_type.shape.dim)
+                break
+        else:
+            pv_rank = 5  # Default to 5D (SDPA)
+        del onnx_model
+        pixel_values_5d = (pv_rank == 5)
+        logger.info(f"ONNX pixel_values rank: {pv_rank}D ({'SDPA' if pixel_values_5d else 'eager'})")
+
         logger.info(f"Backbone model configuration:")
         logger.info(f"  Sequence length: min=1, opt={opt_seq_len}, max={max_seq}")
         logger.info(f"  Image: {num_frames} frames, {img_channels}x{img_height}x{img_width}")
-        logger.info(f"  Note: ONNX model uses shape (num_frames, 1, C, H, W)")
 
-        # ONNX model has shape (num_frames, 1, C, H, W) where the 1 is batch size per frame
-        min_shapes = {
-            "input_ids": (1, 1),
-            "attention_mask": (1, 1),
-            "pixel_values": (1, 1, img_channels, img_height, img_width),
-        }
-        opt_shapes = {
-            "input_ids": (1, opt_seq_len),
-            "attention_mask": (1, opt_seq_len),
-            "pixel_values": (num_frames, 1, img_channels, img_height, img_width),
-        }
-        max_shapes = {
-            "input_ids": (1, max_seq),
-            "attention_mask": (1, max_seq),
-            "pixel_values": (16, 1, img_channels, img_height, img_width),  # Max 16 frames
-        }
+        if pixel_values_5d:
+            # SDPA ONNX: pixel_values shape is (num_frames, 1, C, H, W)
+            min_shapes = {
+                "input_ids": (1, 1),
+                "attention_mask": (1, 1),
+                "pixel_values": (1, 1, img_channels, img_height, img_width),
+            }
+            opt_shapes = {
+                "input_ids": (1, opt_seq_len),
+                "attention_mask": (1, opt_seq_len),
+                "pixel_values": (num_frames, 1, img_channels, img_height, img_width),
+            }
+            max_shapes = {
+                "input_ids": (1, max_seq),
+                "attention_mask": (1, max_seq),
+                "pixel_values": (16, 1, img_channels, img_height, img_width),
+            }
+        else:
+            # Eager ONNX: pixel_values shape is (num_frames, C, H, W)
+            min_shapes = {
+                "input_ids": (1, 1),
+                "attention_mask": (1, 1),
+                "pixel_values": (1, img_channels, img_height, img_width),
+            }
+            opt_shapes = {
+                "input_ids": (1, opt_seq_len),
+                "attention_mask": (1, opt_seq_len),
+                "pixel_values": (num_frames, img_channels, img_height, img_width),
+            }
+            max_shapes = {
+                "input_ids": (1, max_seq),
+                "attention_mask": (1, max_seq),
+                "pixel_values": (16, img_channels, img_height, img_width),
+            }
     else:
         # DiT model shapes
         # Optimal shapes - clamp to max_seq to satisfy MIN <= OPT <= MAX constraint
@@ -943,7 +994,9 @@ def main():
             )
 
         if model_type == "backbone":
-            calibrator = BackboneInt8Calibrator(args.calib_data, args.calib_cache)
+            calibrator = BackboneInt8Calibrator(
+                args.calib_data, args.calib_cache, pixel_values_5d=pixel_values_5d
+            )
         else:
             calibrator = Int8Calibrator(args.calib_data, args.calib_cache)
 

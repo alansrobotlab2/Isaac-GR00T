@@ -562,10 +562,11 @@ def main():
                 if not os.path.exists(path):
                     continue
                 trt_w = TRTBBWrapper(path, device=0)
+                pv_dtype = trt_w.input_dtypes.get("pixel_values", torch.float32)
                 ids = s0["input_ids"].cuda()
                 mask = s0["attention_mask"].cuda()
                 pv = s0["pixel_values"]
-                pv_gpu = [t.cuda() for t in pv] if isinstance(pv, list) else pv.cuda()
+                pv_gpu = [t.to(dtype=pv_dtype).cuda() for t in pv] if isinstance(pv, list) else pv.to(dtype=pv_dtype).cuda()
 
                 def run_trt(w=trt_w, i=ids, m=mask, p=pv_gpu):
                     w(i, m, p)
