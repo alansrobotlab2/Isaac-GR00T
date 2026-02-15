@@ -288,17 +288,23 @@ def run_stage_onnx(onnx_path, samples):
     active = sess.get_providers()
     logger.info(f"  Active providers: {active}")
 
-    # Auto-detect expected dtype from ONNX model input metadata
+    # Auto-detect expected dtype and rank from ONNX model input metadata
     onnx_dtype_map = {"tensor(float16)": torch.float16, "tensor(float)": torch.float32}
     pv_input = [inp for inp in sess.get_inputs() if inp.name == "pixel_values"][0]
     onnx_pv_dtype = onnx_dtype_map.get(pv_input.type, torch.float32)
-    logger.info(f"  ONNX pixel_values dtype: {pv_input.type} -> torch {onnx_pv_dtype}")
+    onnx_pv_rank = len(pv_input.shape)  # 4D=[N,C,H,W] or 5D=[N,1,C,H,W]
+    logger.info(f"  ONNX pixel_values dtype: {pv_input.type} -> torch {onnx_pv_dtype}, rank={onnx_pv_rank}")
 
     results = []
     for s in samples:
         pv = s["pixel_values"]
         if isinstance(pv, list):
-            pv_np = torch.cat(pv, dim=0).to(onnx_pv_dtype).numpy()
+            if onnx_pv_rank == 5:
+                # ONNX expects [num_frames, batch, C, H, W] — stack preserving batch dim
+                pv_np = torch.stack(pv, dim=0).to(onnx_pv_dtype).numpy()
+            else:
+                # ONNX expects [num_frames, C, H, W] — cat along frame dim
+                pv_np = torch.cat(pv, dim=0).to(onnx_pv_dtype).numpy()
         else:
             pv_np = pv.to(onnx_pv_dtype).numpy()
 
@@ -335,15 +341,19 @@ def run_stage_trt(engine_path, samples, label="TRT"):
 
     trt_wrapper = TensorRTBackboneWrapper(engine_path, device=0)
 
+    # Cast pixel_values to the dtype expected by the TRT engine
+    pv_dtype = trt_wrapper.input_dtypes.get("pixel_values", torch.float32)
+    logger.info(f"  Engine expects pixel_values dtype: {pv_dtype}")
+
     results = []
     for s in samples:
         input_ids = s["input_ids"].cuda()
         attention_mask = s["attention_mask"].cuda()
         pv = s["pixel_values"]
         if isinstance(pv, list):
-            pixel_values = [t.cuda() for t in pv]
+            pixel_values = [t.to(dtype=pv_dtype).cuda() for t in pv]
         else:
-            pixel_values = pv.cuda()
+            pixel_values = pv.to(dtype=pv_dtype).cuda()
 
         hidden_states, _attn_mask, _image_mask = trt_wrapper(
             input_ids, attention_mask, pixel_values
@@ -516,9 +526,13 @@ def main():
             pv_input = [inp for inp in sess.get_inputs() if inp.name == "pixel_values"][0]
             onnx_dtype_map = {"tensor(float16)": torch.float16, "tensor(float)": torch.float32}
             onnx_pv_dtype = onnx_dtype_map.get(pv_input.type, torch.float32)
+            onnx_pv_rank = len(pv_input.shape)
             pv = s0["pixel_values"]
             if isinstance(pv, list):
-                pv_np = torch.cat(pv, dim=0).to(onnx_pv_dtype).numpy()
+                if onnx_pv_rank == 5:
+                    pv_np = torch.stack(pv, dim=0).to(onnx_pv_dtype).numpy()
+                else:
+                    pv_np = torch.cat(pv, dim=0).to(onnx_pv_dtype).numpy()
             else:
                 pv_np = pv.to(onnx_pv_dtype).numpy()
             ort_in = {

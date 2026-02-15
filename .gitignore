@@ -13,6 +13,7 @@ uv.lock
 /alfiebot.CanDoChallenge/
 /groot_n1d6_onnx/
 /groot_n1d6_onnx_fp32/
+/groot_n1d6_onnx_sdpa_fp32/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
