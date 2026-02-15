@@ -159,13 +159,17 @@ def export_dit_to_onnx(
     dit_model.eval()
 
     # NOTE: Model is already in BF16 by default (from checkpoint)
-    # We only need to set the dtype for dummy inputs
     if use_bf16:
-        # Use BF16 to match model's native precision and avoid accuracy loss
+        # Use BF16 to match model's native precision
         dtype = torch.bfloat16
         logger.info("Using BF16 precision (native model precision)")
     else:
+        # Convert model to FP32 so ONNX graph has FP32 weights.
+        # This lets TensorRT handle precision policy internally,
+        # avoiding BF16→ONNX→TRT conversion where precision semantics get lost.
         dtype = torch.float32
+        dit_model = dit_model.float()
+        logger.info("Using FP32 precision for ONNX export")
 
     dit_model = dit_model.cuda()
 
@@ -352,7 +356,8 @@ def main(args):
     logger.info("\n[Step 4] Exporting DiT to ONNX...")
     dit_output_path = os.path.join(args.output_dir, "dit_model.onnx")
     export_dit_to_onnx(
-        policy=policy, captured_inputs=capture, output_path=dit_output_path, use_bf16=True
+        policy=policy, captured_inputs=capture, output_path=dit_output_path,
+        use_bf16=not args.use_fp32,
     )
 
     # Summary
@@ -390,6 +395,11 @@ if __name__ == "__main__":
         type=str,
         default="torchcodec",
         help="Options: ['decord', 'torchvision_av', 'torchcodec']",
+    )
+    parser.add_argument(
+        "--use_fp32",
+        action="store_true",
+        help="Export in FP32 (default: BF16). FP32 gives TensorRT better control over precision.",
     )
 
     args = parser.parse_args()

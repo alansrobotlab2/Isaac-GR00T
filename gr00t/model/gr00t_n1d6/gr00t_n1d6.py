@@ -307,9 +307,14 @@ class Gr00tN1d6ActionHead(nn.Module):
         # Set initial actions as the sampled noise.
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
+        model_dtype = vl_embeds.dtype
+
+        # Initialize actions in FP32 to prevent error compounding across
+        # Euler integration steps. Lower-precision DiT outputs (FP16/INT8)
+        # are cast to FP32 before accumulation, then cast back at the end.
         actions = torch.randn(
             size=(batch_size, self.config.action_horizon, self.action_dim),
-            dtype=vl_embeds.dtype,
+            dtype=torch.float32,
             device=device,
         )
 
@@ -321,10 +326,13 @@ class Gr00tN1d6ActionHead(nn.Module):
             t_discretized = int(t_cont * self.num_timestep_buckets)
 
             # Embed noised action trajectory.
+            # Cast actions to model dtype for the encoder (weights are BF16).
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+            action_features = self.action_encoder(
+                actions.to(model_dtype), timesteps_tensor, embodiment_id
+            )
             # Add position embedding.
             if self.config.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
@@ -353,11 +361,13 @@ class Gr00tN1d6ActionHead(nn.Module):
 
             pred_velocity = pred[:, -self.action_horizon :]
 
-            # Update actions using euler integration.
-            actions = actions + dt * pred_velocity
+            # Update actions using Euler integration in FP32 to prevent
+            # precision loss from compounding across denoising steps.
+            actions = actions + dt * pred_velocity.float()
+
         return BatchFeature(
             data={
-                "action_pred": actions,
+                "action_pred": actions.to(model_dtype),
                 "backbone_features": vl_embeds,
                 "state_features": state_features,
             }

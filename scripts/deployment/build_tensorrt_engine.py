@@ -33,6 +33,8 @@ def build_engine(
     min_shapes: dict = None,
     opt_shapes: dict = None,
     max_shapes: dict = None,
+    calib_data_dir: str = None,
+    calib_cache: str = None,
 ):
     """
     Build TensorRT engine from ONNX model.
@@ -40,11 +42,13 @@ def build_engine(
     Args:
         onnx_path: Path to ONNX model
         engine_path: Path to save TensorRT engine
-        precision: Precision mode ('fp32', 'fp16', 'bf16', 'fp8')
+        precision: Precision mode ('fp32', 'fp16', 'bf16', 'fp8', 'int8')
         workspace_mb: Workspace size in MB
         min_shapes: Minimum input shapes (dict: name -> shape tuple)
         opt_shapes: Optimal input shapes (dict: name -> shape tuple)
         max_shapes: Maximum input shapes (dict: name -> shape tuple)
+        calib_data_dir: Directory with calibration data (required for int8)
+        calib_cache: Path to calibration cache file (optional, for int8)
     """
     logger.info("=" * 80)
     logger.info("TensorRT Engine Builder")
@@ -105,6 +109,21 @@ def build_engine(
     elif precision == "fp8":
         config.set_flag(trt.BuilderFlag.FP8)
         logger.info("Enabled FP8 mode")
+    elif precision == "int8":
+        config.set_flag(trt.BuilderFlag.INT8)
+        config.set_flag(trt.BuilderFlag.FP16)  # FP16 fallback for unsupported layers
+        logger.info("Enabled INT8 mode with FP16 fallback")
+
+        if calib_data_dir is None:
+            raise ValueError("--calib-data is required for INT8 precision")
+
+        from calibrate_int8 import create_dit_calibrator
+
+        cache_path = calib_cache or os.path.join(calib_data_dir, "int8_calib.cache")
+        calibrator = create_dit_calibrator(calib_data_dir, cache_path)
+        config.int8_calibrator = calibrator
+        logger.info(f"INT8 calibrator loaded from {calib_data_dir}")
+        logger.info(f"Calibration cache: {cache_path}")
     elif precision == "fp32":
         logger.info("Using FP32 (default precision)")
     else:
@@ -148,7 +167,9 @@ def build_engine(
 
     # Save engine
     logger.info(f"\nSaving engine to {engine_path}...")
-    os.makedirs(os.path.dirname(engine_path), exist_ok=True)
+    engine_dir = os.path.dirname(engine_path)
+    if engine_dir:
+        os.makedirs(engine_dir, exist_ok=True)
     with open(engine_path, "wb") as f:
         f.write(serialized_engine)
 
@@ -173,43 +194,75 @@ def main():
         "--precision",
         type=str,
         default="bf16",
-        choices=["fp32", "fp16", "bf16", "fp8"],
+        choices=["fp32", "fp16", "bf16", "fp8", "int8"],
         help="Precision mode (default: bf16)",
     )
     parser.add_argument(
         "--workspace", type=int, default=8192, help="Workspace size in MB (default: 8192)"
     )
+    parser.add_argument(
+        "--calib-data",
+        type=str,
+        default=None,
+        help="Directory with calibration data (required for int8 precision)",
+    )
+    parser.add_argument(
+        "--calib-cache",
+        type=str,
+        default=None,
+        help="Path to calibration cache file (optional, for int8)",
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default="dit",
+        choices=["dit", "backbone"],
+        help="Model type for shape profiles (default: dit)",
+    )
 
     args = parser.parse_args()
 
-    # Define shapes for your specific model (from export)
-    min_shapes = None
-    opt_shapes = None
-    max_shapes = None
-
-    # Establish Dynamic Shapes to handle variable seq lengths
-    # Based on captured inputs but with ranges to handle variations
-    min_shapes = {
-        "sa_embs": (1, 1, 1536),  # Min: 1 token
-        "vl_embs": (1, 1, 2048),  # Min: 1 token
-        "timestep": (1,),
-        "image_mask": (1, 1),  # Min: 1 token
-        "backbone_attention_mask": (1, 1),  # Min: 1 token
-    }
-    opt_shapes = {
-        "sa_embs": (1, 51, 1536),  # Typical: 51 tokens
-        "vl_embs": (1, 122, 2048),  # Typical: 122 tokens
-        "timestep": (1,),
-        "image_mask": (1, 122),  # Typical: 122 tokens
-        "backbone_attention_mask": (1, 122),  # Typical: 122 tokens
-    }
-    max_shapes = {
-        "sa_embs": (1, 256, 1536),  # Max: 256 tokens (generous)
-        "vl_embs": (1, 512, 2048),  # Max: 512 tokens (generous)
-        "timestep": (1,),
-        "image_mask": (1, 512),  # Max: 512 tokens
-        "backbone_attention_mask": (1, 512),  # Max: 512 tokens
-    }
+    if args.model_type == "backbone":
+        # Backbone: pixel_values=[4,3,252,336] (fixed: ONNX trace unrolled 4 image splits),
+        # input_ids=[1,seq], attention_mask=[1,seq]
+        min_shapes = {
+            "pixel_values": (4, 3, 252, 336),   # Fixed: 4 images (baked in trace)
+            "input_ids": (1, 1),
+            "attention_mask": (1, 1),
+        }
+        opt_shapes = {
+            "pixel_values": (4, 3, 252, 336),   # Fixed: 4 images
+            "input_ids": (1, 483),               # Typical: 483 tokens
+            "attention_mask": (1, 483),
+        }
+        max_shapes = {
+            "pixel_values": (4, 3, 252, 336),   # Fixed: 4 images
+            "input_ids": (1, 1024),
+            "attention_mask": (1, 1024),
+        }
+    else:
+        # DiT: sa_embs=[1,51,1536], vl_embs=[1,483,2048], timestep=[1], masks
+        min_shapes = {
+            "sa_embs": (1, 1, 1536),
+            "vl_embs": (1, 1, 2048),
+            "timestep": (1,),
+            "image_mask": (1, 1),
+            "backbone_attention_mask": (1, 1),
+        }
+        opt_shapes = {
+            "sa_embs": (1, 51, 1536),
+            "vl_embs": (1, 483, 2048),
+            "timestep": (1,),
+            "image_mask": (1, 483),
+            "backbone_attention_mask": (1, 483),
+        }
+        max_shapes = {
+            "sa_embs": (1, 256, 1536),
+            "vl_embs": (1, 1024, 2048),
+            "timestep": (1,),
+            "image_mask": (1, 1024),
+            "backbone_attention_mask": (1, 1024),
+        }
 
     build_engine(
         onnx_path=args.onnx,
@@ -219,6 +272,8 @@ def main():
         min_shapes=min_shapes,
         opt_shapes=opt_shapes,
         max_shapes=max_shapes,
+        calib_data_dir=args.calib_data,
+        calib_cache=args.calib_cache,
     )
 
 

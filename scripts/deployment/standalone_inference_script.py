@@ -105,9 +105,11 @@ class TensorRTDiTWrapper:
 
     def __call__(self, sa_embs, vl_embs, timestep, image_mask=None, backbone_attention_mask=None):
         """Forward pass through TensorRT DiT."""
-        # Setup context bindings
-        sa_embs = sa_embs.to(f"cuda:{self.device}").contiguous()
-        vl_embs = vl_embs.to(f"cuda:{self.device}").contiguous()
+        # Cast BF16 inputs to FP32 for TRT. The engine was built from FP32 ONNX
+        # with FP16 precision flag — TRT handles FP32→FP16 conversion internally.
+        # Passing BF16 directly would be misinterpreted (different bit layout).
+        sa_embs = sa_embs.to(device=f"cuda:{self.device}", dtype=torch.float32).contiguous()
+        vl_embs = vl_embs.to(device=f"cuda:{self.device}", dtype=torch.float32).contiguous()
         timestep = timestep.to(f"cuda:{self.device}").contiguous()  # Keep as int64
 
         if image_mask is not None:
@@ -133,10 +135,13 @@ class TensorRTDiTWrapper:
                 "backbone_attention_mask", backbone_attention_mask.data_ptr()
             )
 
-        # Output in FP16 (SM87 / Orin has native FP16 tensor cores, not BF16)
+        # Output in FP32 to avoid precision truncation before Euler integration.
+        # SM87 (Orin) has native FP16 tensor cores but no BF16 — the engine computes
+        # in FP16 internally, but we keep the output in FP32 so the denoising loop
+        # accumulates without additional precision loss.
         output_shape = self.context.get_tensor_shape("output")
         output = torch.empty(
-            tuple(output_shape), dtype=torch.float16, device=f"cuda:{self.device}"
+            tuple(output_shape), dtype=torch.float32, device=f"cuda:{self.device}"
         )
         self.context.set_tensor_address("output", output.data_ptr())
 
@@ -145,6 +150,107 @@ class TensorRTDiTWrapper:
             raise RuntimeError("TensorRT inference failed")
 
         return output
+
+
+class TensorRTBackboneWrapper:
+    """Wrapper for TensorRT backbone engine."""
+
+    def __init__(self, engine_path: str, device: int = 0):
+        import tensorrt as trt
+
+        self.device = device
+
+        if torch.cuda.is_available():
+            torch.cuda.init()
+            torch.cuda.set_device(device)
+            logging.info(f"CUDA initialized for backbone TRT: device {device}")
+        else:
+            raise RuntimeError("CUDA not available for TensorRT")
+
+        self.trt_logger = trt.Logger(trt.Logger.WARNING)
+        self.runtime = trt.Runtime(self.trt_logger)
+
+        with open(engine_path, "rb") as f:
+            self.engine = self.runtime.deserialize_cuda_engine(f.read())
+
+        if self.engine is None:
+            raise RuntimeError(f"Failed to load backbone TRT engine from {engine_path}")
+
+        self.context = self.engine.create_execution_context()
+        logging.info(f"Backbone TRT engine loaded: {engine_path}")
+
+    def __call__(self, pixel_values, input_ids, attention_mask):
+        """Forward pass through TensorRT backbone."""
+        # Cast pixel_values to FP32 — engine was exported in FP32, TRT handles FP32→FP16 internally.
+        # BF16 inputs would be misinterpreted (different bit layout than FP16).
+        pixel_values = pixel_values.to(device=f"cuda:{self.device}", dtype=torch.float32).contiguous()
+        input_ids = input_ids.to(f"cuda:{self.device}").contiguous()
+        attention_mask = attention_mask.to(f"cuda:{self.device}").contiguous()
+
+        self.context.set_input_shape("pixel_values", pixel_values.shape)
+        self.context.set_input_shape("input_ids", input_ids.shape)
+        self.context.set_input_shape("attention_mask", attention_mask.shape)
+
+        self.context.set_tensor_address("pixel_values", pixel_values.data_ptr())
+        self.context.set_tensor_address("input_ids", input_ids.data_ptr())
+        self.context.set_tensor_address("attention_mask", attention_mask.data_ptr())
+
+        output_shape = self.context.get_tensor_shape("backbone_features")
+        output = torch.empty(
+            tuple(output_shape), dtype=torch.float32, device=f"cuda:{self.device}"
+        )
+        self.context.set_tensor_address("backbone_features", output.data_ptr())
+
+        success = self.context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
+        if not success:
+            raise RuntimeError("Backbone TensorRT inference failed")
+
+        return output
+
+
+def replace_backbone_with_tensorrt(
+    policy: Gr00tPolicy | Any, trt_engine_path: str, device: int = 0
+):
+    """Replace the backbone forward method with TensorRT inference."""
+    from transformers.feature_extraction_utils import BatchFeature
+
+    trt_backbone = TensorRTBackboneWrapper(trt_engine_path, device=device)
+    original_model = policy.model.backbone
+
+    def trt_forward(vl_input):
+        pixel_values = vl_input["pixel_values"]
+        input_ids = vl_input["input_ids"]
+        attention_mask_input = vl_input["attention_mask"]
+
+        # pixel_values is a list of tensors from the processor — stack for TRT
+        if isinstance(pixel_values, list):
+            pixel_values_tensor = torch.cat(pixel_values, dim=0).to(dtype=torch.float32)
+        else:
+            pixel_values_tensor = pixel_values.to(dtype=torch.float32)
+
+        # Run backbone through TRT
+        backbone_features = trt_backbone(pixel_values_tensor, input_ids, attention_mask_input)
+
+        # Cast to model dtype (infer from input_ids since pixel_values may be list)
+        model_dtype = next(original_model.parameters()).dtype
+        backbone_features = backbone_features.to(dtype=model_dtype)
+
+        # Compute masks from input_ids (these are not model computations,
+        # just simple comparisons that don't need TRT)
+        image_token_index = original_model.model.config.image_token_index
+        image_mask = input_ids == image_token_index
+        backbone_attention_mask = attention_mask_input == 1
+
+        return BatchFeature(
+            data={
+                "backbone_features": backbone_features,
+                "backbone_attention_mask": backbone_attention_mask,
+                "image_mask": image_mask,
+            }
+        )
+
+    policy.model.backbone.forward = trt_forward
+    logging.info("Backbone replaced with TensorRT engine")
 
 
 def replace_dit_with_tensorrt(policy: Gr00tPolicy | Any, trt_engine_path: str, device: int = 0):
@@ -585,11 +691,14 @@ class ArgsConfig:
     model_path: str | None = None
     """Path to the model checkpoint."""
 
-    inference_mode: Literal["pytorch", "tensorrt"] = "pytorch"
-    """Inference mode: 'pytorch' (default) or 'tensorrt'."""
+    inference_mode: Literal["pytorch", "tensorrt", "int8"] = "pytorch"
+    """Inference mode: 'pytorch', 'tensorrt' (DiT only), or 'int8' (backbone + DiT)."""
 
     trt_engine_path: str = "./groot_n1d6_onnx/dit_model_fp16.trt"
-    """Path to TensorRT engine file (.trt). Used only when inference_mode='tensorrt'."""
+    """Path to TensorRT engine file (.trt). Used for 'tensorrt' and 'int8' modes."""
+
+    trt_backbone_path: str | None = None
+    """Path to TensorRT backbone engine (.trt). Used only for 'int8' mode."""
 
     denoising_steps: int = 4
     """Number of denoising steps to use."""
@@ -659,11 +768,20 @@ def main(args: ArgsConfig):
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
 
-        # Apply inference mode: TensorRT or PyTorch
+        # Apply inference mode: TensorRT, INT8, or PyTorch
         if args.inference_mode == "tensorrt":
             logging.info(f"Replacing DiT with TensorRT engine: {args.trt_engine_path}")
             replace_dit_with_tensorrt(policy, args.trt_engine_path)
-            logging.info(" TensorRT mode enabled")
+            logging.info(" TensorRT mode enabled (DiT only)")
+        elif args.inference_mode == "int8":
+            logging.info(f"Replacing DiT with TensorRT engine: {args.trt_engine_path}")
+            replace_dit_with_tensorrt(policy, args.trt_engine_path)
+            if args.trt_backbone_path:
+                logging.info(f"Replacing backbone with TensorRT engine: {args.trt_backbone_path}")
+                replace_backbone_with_tensorrt(policy, args.trt_backbone_path)
+            else:
+                logging.warning("No --trt-backbone-path provided; backbone stays in PyTorch")
+            logging.info(" INT8 mode enabled")
         else:
             # PyTorch mode with torch.compile
             policy.model.action_head.model.forward = torch.compile(

@@ -89,7 +89,7 @@ python gr00t/eval/open_loop_eval.py \
 
 run alfie gr00t server
 ```bash
-cd ~/
+cd ~/Isaac-GR00T
 
 docker run \
   -it --rm --runtime=nvidia \
