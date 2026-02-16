@@ -6,7 +6,7 @@ torch.compile(default) backbone + TRT FP16 DiT + **2-step denoising** = **186ms 
 
 Previous bests: 240ms (4.2 Hz, 4-step denoising) → 226ms (4.4 Hz, with async prefetch) → **186ms (5.4 Hz, 2-step denoising)**
 
-**Next target: 7.1 Hz** via TRT MHA plugin (section 12) → TRT INT8 backbone (141ms) + TRT FP16 DiT (36ms) + pipeline parallelism = ~141ms E2E
+**Backbone TRT path exhausted (section 12):** Decomposed softmax + mixed precision fixes quality (cos_sim=0.998) but is 14% slower than flash (180ms vs 158ms). INT8 adds zero speedup (memory-bandwidth-bound). The 7.1 Hz target via TRT INT8 backbone is NOT achievable with current TRT on SM87. Further speedups require: model distillation, action head optimization, or waiting for future TRT versions with FP32-softmax fused MHA.
 
 ## Experimental Results
 
@@ -429,115 +429,92 @@ data:
 
 **Post-training:** Rebuild TRT engine with `--opt-sa-seq 5` for the new sa_embs shape.
 
-### 12. Custom TRT MHA Plugin with FP32 Softmax Accumulation
+### 12. FP32 Softmax Surgery for TRT Backbone
 
-**Status:** NOT YET STARTED
+**Status:** 12a SUCCEEDED (decomposed softmax + mixed precision). 12b NOT VIABLE. 12c/12d NOT NEEDED.
 
-**Goal:** Write a TensorRT plugin that implements Multi-Head Attention with FP16 matmuls but FP32 softmax, fixing the backbone TRT FP16 quality issue (cos_sim=0.354 → target >0.99). This also unlocks INT8 backbone TRT (since INT8 quantization itself is lossless — see section 2 finding: INT8 vs FP16 incremental cos_sim=0.999).
+**Goal:** Fix TRT backbone FP16 quality destruction (cos_sim=0.354 → target >0.99) caused by TRT's fused MHA kernel computing Q@K^T and softmax in FP16. Qwen2 layers 14-15 produce attention scores of ~73K-121K that overflow FP16's 65504 limit.
 
-**Why this is the right fix:** The SmoothQuant investigation (section 7) proved the root cause is NOT activation overflow but TRT's fused MHA kernel computing attention scores in FP16. Qwen2 layers 14-15 produce Q@K^T scores of ~73K-121K, exceeding FP16's 65504 limit. PyTorch's SDPA handles this by computing softmax in FP32 internally; TRT's fused FP16 MHA does not.
+**Result:** Decomposed softmax ONNX surgery + mixed-precision TRT build achieves **cos_sim=0.998** at **180ms** (vs 149ms FP16, 158ms flash). INT8 build pending.
 
-**Projected performance impact:**
+#### 12a. ONNX Graph Surgery Results
 
-| Config | Backbone ms | DiT ms (2-step) | E2E ms | Hz |
-|--------|------------|-----------------|--------|-----|
-| Current best (PyTorch flash + TRT DiT) | 157 | ~36 | ~186 | 5.4 |
-| TRT FP16 backbone (plugin fix) + TRT DiT | ~149 | ~36 | ~178 | 5.6 |
-| TRT INT8 backbone (plugin fix) + TRT DiT | ~141 | ~36 | ~170 | 5.9 |
-| + pipeline parallelism | ~141 | ~36 | ~141 | **7.1** |
+Three approaches were tried, each building on lessons from the previous:
 
-The 157→141ms backbone improvement is modest standalone (~10%), but with pipeline parallelism (backbone overlaps with DiT), E2E becomes `max(backbone, dit_total)`. With 2-step denoising (DiT ~36ms), **backbone latency IS the E2E latency**, so every ms saved on backbone directly translates to Hz gained.
+| Approach | ONNX Surgery | TRT Build | Cos Sim | Latency | Verdict |
+|----------|-------------|-----------|---------|---------|---------|
+| Standard Cast | Insert Cast(FP32) before/after each of 43 Softmax nodes | FP16 | 0.349 | 141ms | FAILED — TRT Myelin fused everything, ignored Casts |
+| Decomposed Softmax | Replace Softmax with 7 primitive ops (Cast→ReduceMax→Sub→Exp→ReduceSum→Div→Cast) | FP16 | 0.348 | 184ms | FAILED — Q@K^T MatMul still writes FP16 output |
+| **Decomposed + Mixed Precision** | Same decomposition + `OBEY_PRECISION_CONSTRAINTS` + FP32 for norm/softmax/embed | **mixed** | **0.998** | **180ms** | **SUCCESS** |
 
-**The INT8 bonus:** We already proved INT8 quantization is essentially lossless on the backbone (INT8 vs FP16: MSE=0.014, cos_sim=0.999). The only reason INT8 TRT failed was the underlying FP16 overflow in MHA. Fix the MHA, and INT8 works for free.
+**Key insights from 12a:**
 
-**Implementation approaches (ordered by effort):**
+1. **Standard Cast nodes are useless.** TRT's Myelin compiler fuses the entire language model into ~8 ForeignNode subgraphs, completely ignoring ONNX-level Cast nodes. The engine profiling showed identical execution to the unpatched FP16 engine.
 
-#### 12a. ONNX Graph Surgery: Insert FP32 Cast Around Attention Scores (Low effort)
+2. **Decomposed softmax alone is necessary but not sufficient.** Replacing Softmax with primitive ops (ReduceMax, Sub, Exp, ReduceSum, Div) successfully prevents TRT from fusing these ops into its broken MHA kernel — the profiling showed `AddCasMaxSubExpSumDivMulCas` kgen kernels instead of fused MHA. However, the Q@K^T MatMul still writes FP16 output via HMMA instructions, so values >65504 are truncated before reaching the decomposed softmax.
 
-Before building TRT, modify the ONNX graph to insert explicit `Cast(float32)` nodes around the `MatMul(Q, K^T) → Softmax` chain, and `Cast(float16)` after softmax. If TRT respects these cast nodes (doesn't optimize them away), the attention scores and softmax would compute in FP32.
+3. **Mixed precision (`OBEY_PRECISION_CONSTRAINTS`) is the critical ingredient.** With `OBEY_PRECISION_CONSTRAINTS`, TRT respects the precision annotations on the decomposed softmax ops. The combination works because:
+   - Decomposed softmax prevents MHA fusion (so TRT can't use its broken fused FP16 MHA kernel)
+   - `OBEY_PRECISION_CONSTRAINTS` forces the decomposed ops to stay in their annotated precision (FP32 for the softmax chain)
+   - The Q@K^T MatMul still outputs FP16, but the softmax computation on capped values in FP32 produces much better attention weights than FP16 softmax on the same capped values
 
-```python
-# Pseudocode using onnx-graphsurgeon
-import onnx_graphsurgeon as gs
+4. **Latency tradeoff:** 180ms is 20% slower than the broken FP16 (149ms) and 14% slower than PyTorch flash (158ms). The overhead comes from the decomposed softmax not being fused. This makes standalone backbone TRT slower than PyTorch, but INT8 quantization may recover some latency.
 
-graph = gs.import_onnx(onnx.load("backbone_model.onnx"))
-for node in graph.nodes:
-    if node.op == "Softmax":
-        # Insert Cast(FP32) before softmax input
-        # Insert Cast(FP16) after softmax output
-        ...
-graph.cleanup().toposort()
-onnx.save(gs.export_onnx(graph), "backbone_fp32_softmax.onnx")
-```
+**Script:** `scripts/deployment/onnx_fp32_softmax_surgery.py` — supports `cast`, `aggressive`, and `decompose` modes.
 
-**Risk:** TRT may optimize away the cast nodes during graph optimization. Test with `OBEY_PRECISION_CONSTRAINTS` flag.
+**Generated artifacts:**
+- `groot_n1d6_onnx_sdpa_fp32/backbone_fp32_softmax.onnx` — Standard cast (failed)
+- `groot_n1d6_onnx_sdpa_fp32/backbone_decomposed_softmax.onnx` — Decomposed softmax ONNX
+- `groot_n1d6_onnx_sdpa_fp32/backbone_fp16_fp32sm.trt` — Standard cast engine (cos_sim=0.349)
+- `groot_n1d6_onnx_sdpa_fp32/backbone_fp16_decomp.trt` — Decomposed FP16 engine (cos_sim=0.348)
+- `groot_n1d6_onnx_sdpa_fp32/backbone_mixed_decomp.trt` — **Decomposed + mixed engine (cos_sim=0.998)**
 
-#### 12b. TRT-LLM Attention Kernels (Medium effort)
+#### 12b. TRT-LLM Attention Kernels — NOT VIABLE
 
-NVIDIA's TRT-LLM has production-quality attention kernels (`tensorrt_llm.functional.attention`) that support:
-- FP16 inputs with FP32 softmax accumulation
-- Flash-attention-like tiled computation (O(N) memory)
-- SM87 (Orin) support
+TRT-LLM v0.12.0-jetson has exactly the kernel we need (`context_fmha_type = enabled_with_fp32_acc` in `GPTAttention`), which implements FP16 MHA with FP32 softmax accumulation. However:
 
-This would avoid writing a custom CUDA kernel. The challenge is integrating TRT-LLM's attention into a standalone TRT engine (TRT-LLM is designed for full LLM pipelines, not individual layers).
+- FMHA kernel source is **closed-source** (compiled `.so` only, no CUDA source)
+- Kernels are tightly coupled to TRT-LLM's `GPTAttention` plugin and cannot be extracted for standalone use
+- TRT-LLM is designed for full LLM inference pipelines, not individual layer replacement in custom ONNX models
+- No public API to use just the FMHA kernel outside of TRT-LLM
 
-```python
-# Concept: Replace ONNX attention pattern with TRT-LLM plugin
-# 1. Build backbone ONNX WITHOUT attention (use placeholder ops)
-# 2. Register TRT-LLM's attention plugin
-# 3. Build TRT engine — plugin handles attention with FP32 softmax
-```
+**Verdict:** NOT VIABLE without NVIDIA providing a standalone FP32-softmax attention plugin.
 
-**Prerequisite:** Check if `tensorrt_llm` ships aarch64 wheels for Jetson or must be built from source.
+#### 12c/12d — NOT NEEDED
 
-#### 12c. Custom CUDA TRT Plugin (High effort, full control)
+Since 12a (decomposed softmax + mixed precision) achieved cos_sim=0.998, custom CUDA plugins (12c) and hybrid TRT+PyTorch approaches (12d) are not needed. The remaining question is whether INT8 quantization on top of the decomposed softmax engine can recover the latency overhead.
 
-Write a TRT plugin implementing `ScaledDotProductAttention` with:
-- FP16 input/output tensors
-- FP16 tensor core matmuls (Q@K^T and attn@V)
-- FP32 accumulation for attention scores and softmax
-- Support for causal/non-causal masks
+#### Final Results
 
-```cpp
-// Plugin interface
-class FP32SoftmaxMHAPlugin : public IPluginV2DynamicExt {
-    // Inputs: Q[B,H,N,D], K[B,H,N,D], V[B,H,N,D], mask[B,1,N,N]
-    // Output: attn_output[B,H,N,D]
-    //
-    // Computation:
-    //   scores = FP16_MatMul(Q, K^T) / sqrt(D)  // FP16 tensor cores, FP32 accum
-    //   scores_fp32 = Cast(scores, FP32)
-    //   attn_weights = Softmax(scores_fp32 + mask, dim=-1)
-    //   attn_weights_fp16 = Cast(attn_weights, FP16)
-    //   output = FP16_MatMul(attn_weights_fp16, V)
-};
-```
+| Config | Backbone ms | Cos Sim | Notes |
+|--------|------------|---------|-------|
+| PyTorch BF16 flash | 158 | baseline | Reference — current best |
+| TRT FP16 (broken) | 149 | 0.349 | Fused MHA overflow — unusable |
+| TRT FP16 decomposed+mixed | 180 | 0.998 | **Quality fixed** — but 14% slower than flash |
+| TRT INT8 decomposed+mixed | 180 | 0.998 | **No speedup over FP16** — memory-bandwidth-bound |
+| torch.compile + SDPA | 191 | 0.998 | PyTorch fallback — 21% slower than flash |
 
-**Key consideration for SigLIP2:** The vision encoder uses windowed attention with variable window sizes and 2D RoPE. The plugin must handle SigLIP2's attention pattern or we'd need separate plugins for vision vs language attention.
+**Conclusion: Backbone TRT is NOT a latency win.**
 
-**Build/deploy:** Compile plugin `.so` on Orin, register with TRT, modify ONNX to reference the plugin op.
+The decomposed softmax fix successfully solves the quality problem (cos_sim=0.998), but the resulting engine is 14% slower than PyTorch flash (180ms vs 158ms) because:
 
-#### 12d. Hybrid Approach: TRT Backbone + PyTorch Attention (Medium effort)
+1. **Decomposed softmax prevents MHA fusion.** By replacing Softmax with 7 primitive ops, we prevent TRT from using its (broken) fused MHA kernel. But we also prevent it from using ANY fused MHA kernel, including the efficient ones used for the 27 vision attention layers that don't have overflow issues.
 
-Split the backbone into three ONNX subgraphs:
-1. **Pre-attention** (embeddings, norms, Q/K/V projections) → TRT FP16
-2. **Attention** (Q@K^T, softmax, attn@V) → PyTorch SDPA (FP16 with FP32 softmax)
-3. **Post-attention** (output projection, MLP, residuals) → TRT FP16
+2. **INT8 provides zero latency benefit.** The backbone is memory-bandwidth-bound on Orin's unified memory. INT8 reduces compute but not memory traffic for this workload. INT8 vs FP16 incremental: identical latency, cos_sim=0.999 (lossless quantization, zero speedup).
 
-This gives TRT's speed for the compute-heavy parts while using PyTorch's correct attention implementation. The overhead is two TRT↔PyTorch boundary crossings per layer.
+3. **The value proposition is gone.** The original plan was: fix quality → TRT FP16 at 149ms → INT8 at 141ms → pipeline parallelism at 141ms E2E → 7.1 Hz. Instead: fix quality → TRT mixed at 180ms → INT8 still 180ms → E2E 180ms → 5.6 Hz. This is WORSE than the current best of 186ms / 5.4 Hz (measurement noise makes them equivalent).
 
-**Risk:** Boundary overhead (~0.5ms per crossing × 2 × 59 layers = ~59ms) likely negates TRT savings. Only viable if we can batch the TRT segments.
+**Best config remains: PyTorch BF16 flash backbone (158ms) + TRT FP16 DiT + 2-step denoising = ~186ms (5.4 Hz).**
 
-#### Recommended order
+The backbone TRT path (Section 12) is a dead end for latency improvement on Orin AGX SM87. The fundamental issue is that fixing FP16 MHA quality requires breaking MHA fusion, which negates the performance benefit of TRT compilation for the backbone. Future NVIDIA TRT versions with FP32 softmax accumulation in their fused MHA kernel would resolve this, but that's not available today.
 
-1. **Try 12a first** (ONNX graph surgery) — 1-2 hours, may just work
-2. **If 12a fails**, try 12b (TRT-LLM kernels) — 1-2 days, check aarch64 availability
-3. **If 12b unavailable**, try 12c (custom plugin) — 3-5 days, guaranteed to work
+**Files created:**
+- `scripts/deployment/onnx_fp32_softmax_surgery.py` — ONNX graph surgery (cast, aggressive, decompose modes)
+- `scripts/deployment/benchmark_fp32_softmax.py` — Quick benchmark for patched TRT engines
 
-**Go/No-Go:**
-- **Go:** cos_sim > 0.99 with FP16 TRT backbone → enables full-TRT pipeline at ~141ms
-- **Stretch:** INT8 TRT backbone at ~141ms + pipeline = ~141ms E2E → 7.1 Hz
-- **No-Go:** Plugin overhead negates speed gain (unlikely for 12a/12b/12c)
+**Engines generated (for reference/archival):**
+- `groot_n1d6_onnx_sdpa_fp32/backbone_mixed_decomp.trt` — Best quality TRT (cos_sim=0.998, 180ms)
+- `groot_n1d6_onnx_sdpa_fp32/backbone_int8_decomp.trt` — INT8 version (cos_sim=0.998, 180ms)
 
 ---
 
@@ -575,7 +552,11 @@ xq_out = torch.stack([
 | ONNX export ops | `[Add, Concat, Mul, Reshape, Slice, Sub, Unsqueeze]` — no complex ops |
 | E2E vision encoder (27 layers) | Runs correctly, output shape/stats normal |
 
-**ONNX improvement:** The old complex RoPE traced to `view_as_complex` / `view_as_real` ONNX ops. The new version traces to simple `Slice + Mul + Sub + Add + Stack + Reshape` — TRT-friendly ops with well-optimized kernels.
+**Latency impact:** Not independently measurable. RoPE is ~1-3% of backbone time (section 8 estimated 2-5ms out of 157ms). The change eliminates 27× BF16→FP32→BF16 round-trips per forward pass, but the backbone is memory-bandwidth-bound so the compute savings are within measurement noise. No before/after latency delta was captured — the primary value is ONNX export cleanliness for section 12, not standalone latency.
+
+**ONNX improvement:** The old complex RoPE traced to `view_as_complex` / `view_as_real` ONNX ops that TRT must handle specially. The new version traces to simple `Slice + Mul + Sub + Add + Stack + Reshape` — standard TRT-friendly ops. This directly simplifies the ONNX graph surgery needed for section 12a (inserting FP32 casts around attention softmax), since the RoPE subgraph no longer contains exotic ops that could interfere with pattern matching.
+
+**Effort:** ~1.5 hours. Implementation was straightforward — the real-valued rotation is a well-known decomposition of complex multiplication used by LLaMA, Mistral, and Qwen2.
 
 **Files modified:**
 - `gr00t/model/modules/nvidia/Eagle-Block2A-2B-v2/modeling_siglip2.py` — `Rope2DPosEmb` (cos/sin caches instead of complex freqs_cis), `apply_rope()` (real-valued rotation)
@@ -614,4 +595,6 @@ python gr00t/eval/open_loop_eval.py \
 | `scripts/deployment/test_sdpa_backbone.py` | SDPA + torch.compile backbone benchmark |
 | `scripts/deployment/export_backbone_onnx.py` | SDPA attention export support (already existed) |
 | `scripts/deployment/standalone_inference_script.py` | torch.compile, CUDAGraphBackboneWrapper (nn.Module), PipelinedInference, CLI flags |
+| `scripts/deployment/onnx_fp32_softmax_surgery.py` | ONNX graph surgery: replace Softmax with FP32 decomposed ops |
+| `scripts/deployment/benchmark_fp32_softmax.py` | Quick benchmark for patched TRT engines vs PyTorch flash |
 | `gr00t/eval/open_loop_eval.py` | Async CPU prefetch, pipeline wiring, `--model-action-horizon`, `--compile-action-head`, `--cudnn-benchmark`, timing instrumentation |

@@ -688,6 +688,10 @@ def build_engine(
             logger.info("Enabled INT8 mode with calibration data and precision constraints")
         else:
             raise ValueError("INT8 precision requires calibration data. Use --calib-data to provide calibration samples.")
+        # Also apply mixed-precision FP32 patterns if specified (e.g., keep softmax/norm in FP32)
+        if fp32_patterns is not None:
+            set_mixed_precision(network, fp32_patterns)
+            logger.info("INT8 + mixed-precision: forced FP32 for matched patterns")
     elif precision == "mixed":
         config.set_flag(trt.BuilderFlag.FP16)
         config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
