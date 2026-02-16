@@ -446,6 +446,65 @@ class BackboneInt8Calibrator(trt.IInt8EntropyCalibrator2):
             cudart.cudaFree(ptr)
 
 
+def set_mixed_precision(network, fp32_patterns=None):
+    """
+    Force specific layers to FP32, let everything else use FP16.
+
+    This enables FP16 tensor cores for matmuls while keeping precision-sensitive
+    layers (LayerNorm, softmax, embeddings) in FP32 to avoid overflow.
+
+    Args:
+        network: TensorRT INetworkDefinition
+        fp32_patterns: List of substrings to match (case-insensitive) against layer names.
+                       Matching layers get FP32, all others get FP16.
+
+    Returns:
+        Tuple of (fp32_count, fp16_count)
+    """
+    if fp32_patterns is None:
+        fp32_patterns = [
+            'norm', 'layernorm', 'layer_norm', 'rmsnorm',
+            'softmax',
+            'embed', 'position',
+        ]
+
+    # Layer types where setting precision is safe (actual compute ops)
+    # Skip: CONSTANT (data), SHAPE (int64), IDENTITY, SHUFFLE, CONCATENATION, etc.
+    compute_types = {
+        trt.LayerType.NORMALIZATION,
+        trt.LayerType.SOFTMAX,
+        trt.LayerType.CONVOLUTION,
+        trt.LayerType.MATRIX_MULTIPLY,
+        trt.LayerType.ELEMENTWISE,
+        trt.LayerType.REDUCE,
+        trt.LayerType.UNARY,
+        trt.LayerType.SCALE,
+        trt.LayerType.ACTIVATION,
+        trt.LayerType.POOLING,
+    }
+
+    fp32_count = 0
+    skipped = 0
+    for i in range(network.num_layers):
+        layer = network.get_layer(i)
+        name_lower = layer.name.lower()
+
+        # Only set precision on compute layers that match our FP32 patterns
+        if any(pat in name_lower for pat in fp32_patterns):
+            if layer.type in compute_types:
+                layer.precision = trt.DataType.FLOAT
+                fp32_count += 1
+            else:
+                skipped += 1
+
+    total = network.num_layers
+    logger.info(f"Mixed precision: {fp32_count} compute layers forced FP32, "
+                f"{skipped} non-compute matched but skipped, "
+                f"{total - fp32_count - skipped} unconstrained (TRT+FP16 flag decides)")
+    logger.info(f"FP32 patterns: {fp32_patterns}")
+    return fp32_count, total - fp32_count
+
+
 def build_engine(
     onnx_path: str,
     engine_path: str,
@@ -466,6 +525,7 @@ def build_engine(
     tactic_shared_memory_mb: int = 256,
     refittable: bool = False,
     strip_plan: bool = False,
+    fp32_patterns: list = None,
 ):
     """
     Build TensorRT engine from ONNX model.
@@ -590,12 +650,14 @@ def build_engine(
             logger.warning(f"HEURISTIC flag not available: {e}")
 
     # Disable expensive builder optimizations that consume memory
-    try:
-        # PREFER_PRECISION_CONSTRAINTS can reduce memory by avoiding precision exploration
-        config.set_flag(trt.BuilderFlag.PREFER_PRECISION_CONSTRAINTS)
-        logger.info("Enabled PREFER_PRECISION_CONSTRAINTS")
-    except Exception:
-        pass
+    # Note: PREFER_PRECISION_CONSTRAINTS conflicts with OBEY_PRECISION_CONSTRAINTS
+    # (used by mixed/int8 precision), so only set it for non-constrained modes
+    if precision not in ("mixed", "int8"):
+        try:
+            config.set_flag(trt.BuilderFlag.PREFER_PRECISION_CONSTRAINTS)
+            logger.info("Enabled PREFER_PRECISION_CONSTRAINTS")
+        except Exception:
+            pass
 
     # Builder optimization level: lower = less memory, faster build, potentially slower engine
     # Level 0: Fastest build, least memory, basic optimizations only
@@ -626,6 +688,11 @@ def build_engine(
             logger.info("Enabled INT8 mode with calibration data and precision constraints")
         else:
             raise ValueError("INT8 precision requires calibration data. Use --calib-data to provide calibration samples.")
+    elif precision == "mixed":
+        config.set_flag(trt.BuilderFlag.FP16)
+        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+        set_mixed_precision(network, fp32_patterns)
+        logger.info("Enabled mixed-precision mode (FP32 norm/softmax/embed + FP16 matmuls)")
     elif precision == "fp32":
         logger.info("Using FP32 (default precision)")
     else:
@@ -741,8 +808,8 @@ def main():
         "--precision",
         type=str,
         default="bf16",
-        choices=["fp32", "fp16", "bf16", "fp8", "int8"],
-        help="Precision mode (default: bf16). Note: int8 uses fp16 fallback without calibration.",
+        choices=["fp32", "fp16", "bf16", "fp8", "int8", "mixed"],
+        help="Precision mode (default: bf16). 'mixed' keeps overflow-prone layers (norm, softmax) in FP32, rest in FP16.",
     )
     parser.add_argument(
         "--workspace", type=int, default=2048, help="Workspace size in MB (default: 2048 for Orin)"
@@ -809,12 +876,47 @@ def main():
         help="Strip unnecessary data from the serialized plan to reduce memory"
     )
     parser.add_argument(
+        "--fp32-patterns", type=str, default=None,
+        help="Comma-separated patterns for layers to keep in FP32 (used with --precision mixed). "
+             "Default: norm,softmax,embed,position. Matched case-insensitively against layer names.",
+    )
+    parser.add_argument(
+        "--dump-layers", action="store_true", default=False,
+        help="Dump all TRT network layer names and exit (for inspecting mixed-precision candidates).",
+    )
+    parser.add_argument(
+        "--model-type", type=str, default=None, choices=["dit", "backbone"],
+        help="Model type for shape configuration. Auto-detected from --calib-data if not specified.",
+    )
+    parser.add_argument(
         "--opt-sa-seq", type=int, default=None,
         help="Optimal sa_embs sequence length for DiT engine (default: 51 = 1 state + 50 action). "
              "Set to 1 + action_horizon from your finetuning config for best performance."
     )
 
     args = parser.parse_args()
+
+    # Parse fp32 patterns for mixed precision
+    fp32_patterns = None
+    if args.fp32_patterns:
+        fp32_patterns = [p.strip() for p in args.fp32_patterns.split(",")]
+        logger.info(f"Custom FP32 patterns: {fp32_patterns}")
+
+    # Handle --dump-layers: parse ONNX and print layer info, then exit
+    if args.dump_layers:
+        TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+        builder = trt.Builder(TRT_LOGGER)
+        network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+        parser = trt.OnnxParser(network, TRT_LOGGER)
+        if not parser.parse_from_file(args.onnx):
+            for i in range(parser.num_errors):
+                logger.error(parser.get_error(i))
+            sys.exit(1)
+        print(f"Total layers: {network.num_layers}")
+        for i in range(network.num_layers):
+            layer = network.get_layer(i)
+            print(f"{i:5d} | {str(layer.type):40s} | {layer.name}")
+        sys.exit(0)
 
     # Apply low memory mode defaults
     if args.low_memory_mode:
@@ -847,24 +949,30 @@ def main():
     opt_shapes = None
     max_shapes = None
 
-    # Auto-detect model type from calibration data if provided
-    model_type = None
+    # Detect model type from explicit flag or calibration data
+    model_type = args.model_type
+    calib_data = None
     if args.calib_data:
-        logger.info(f"Detecting model type from calibration data: {args.calib_data}")
+        logger.info(f"Loading calibration data: {args.calib_data}")
         calib_data = np.load(args.calib_data)
         calib_keys = set(calib_data.keys())
 
-        if "input_ids" in calib_keys and "pixel_values" in calib_keys:
-            model_type = "backbone"
-            logger.info("Detected backbone model (keys: input_ids, attention_mask, pixel_values)")
-        elif "sa_embs" in calib_keys and "vl_embs" in calib_keys:
-            model_type = "dit"
-            logger.info("Detected DiT model (keys: sa_embs, vl_embs, timestep, etc.)")
-        else:
-            raise ValueError(
-                f"Could not detect model type from calibration data keys: {calib_keys}\n"
-                "Expected either backbone (input_ids, pixel_values) or DiT (sa_embs, vl_embs)"
-            )
+        if model_type is None:
+            if "input_ids" in calib_keys and "pixel_values" in calib_keys:
+                model_type = "backbone"
+                logger.info("Detected backbone model (keys: input_ids, attention_mask, pixel_values)")
+            elif "sa_embs" in calib_keys and "vl_embs" in calib_keys:
+                model_type = "dit"
+                logger.info("Detected DiT model (keys: sa_embs, vl_embs, timestep, etc.)")
+            else:
+                raise ValueError(
+                    f"Could not detect model type from calibration data keys: {calib_keys}\n"
+                    "Expected either backbone (input_ids, pixel_values) or DiT (sa_embs, vl_embs)"
+                )
+    elif model_type is None:
+        raise ValueError(
+            "Must specify either --model-type or --calib-data to determine shape configuration."
+        )
 
     # Establish Dynamic Shapes to handle variable seq lengths
     # Based on captured inputs but with ranges to handle variations
@@ -875,32 +983,6 @@ def main():
     if model_type == "backbone":
         if args.opt_sa_seq is not None:
             logger.warning("--opt-sa-seq is ignored for backbone builds (only applies to DiT)")
-        # Backbone model shapes
-        # Get actual shapes from calibration data
-        input_ids_shape = calib_data["input_ids"].shape
-        pixel_values_shape = calib_data["pixel_values"].shape
-
-        opt_seq_len = min(input_ids_shape[1], max_seq)
-
-        # pixel_values is [total_frames, C, H, W]
-        # Need to determine num_frames per sample from metadata
-        import json
-        metadata_path = os.path.join(os.path.dirname(args.calib_data), "metadata.json")
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
-            num_samples = metadata["num_samples"]
-            total_frames = pixel_values_shape[0]
-            num_frames = total_frames // num_samples
-            logger.info(f"From metadata: {num_samples} samples, {total_frames} total frames = {num_frames} frames/sample")
-        else:
-            # Fallback: assume standard 4-view setup
-            num_frames = 4
-            logger.warning(f"No metadata found, assuming {num_frames} frames per sample")
-
-        img_channels = pixel_values_shape[1]  # Should be 3
-        img_height = pixel_values_shape[2]
-        img_width = pixel_values_shape[3]
 
         # Auto-detect 4D vs 5D pixel_values from ONNX model
         import onnx
@@ -913,6 +995,39 @@ def main():
             pv_rank = 5  # Default to 5D (SDPA)
         del onnx_model
         pixel_values_5d = (pv_rank == 5)
+
+        # Get shapes from calibration data or use defaults
+        if calib_data is not None:
+            input_ids_shape = calib_data["input_ids"].shape
+            pixel_values_shape = calib_data["pixel_values"].shape
+            opt_seq_len = min(input_ids_shape[1], max_seq)
+
+            # pixel_values is [total_frames, C, H, W]
+            import json
+            metadata_path = os.path.join(os.path.dirname(args.calib_data), "metadata.json")
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                num_samples = metadata["num_samples"]
+                total_frames = pixel_values_shape[0]
+                num_frames = total_frames // num_samples
+                logger.info(f"From metadata: {num_samples} samples, {total_frames} total frames = {num_frames} frames/sample")
+            else:
+                num_frames = 4
+                logger.warning(f"No metadata found, assuming {num_frames} frames per sample")
+
+            img_channels = pixel_values_shape[1]  # Should be 3
+            img_height = pixel_values_shape[2]
+            img_width = pixel_values_shape[3]
+        else:
+            # Default shapes for Eagle backbone (GR00T N1.6)
+            opt_seq_len = max_seq
+            num_frames = 4
+            img_channels = 3
+            img_height = 384
+            img_width = 384
+            logger.info("Using default backbone shapes (no calib data): "
+                        f"seq={opt_seq_len}, frames={num_frames}, img={img_channels}x{img_height}x{img_width}")
         logger.info(f"ONNX pixel_values rank: {pv_rank}D ({'SDPA' if pixel_values_5d else 'eager'})")
 
         logger.info(f"Backbone model configuration:")
@@ -1020,6 +1135,7 @@ def main():
         tactic_shared_memory_mb=args.tactic_shared_memory,
         refittable=args.refittable,
         strip_plan=args.strip_plan,
+        fp32_patterns=fp32_patterns,
     )
 
 

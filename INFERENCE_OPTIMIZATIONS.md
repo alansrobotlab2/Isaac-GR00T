@@ -6,6 +6,8 @@ torch.compile(default) backbone + TRT FP16 DiT + **2-step denoising** = **186ms 
 
 Previous bests: 240ms (4.2 Hz, 4-step denoising) → 226ms (4.4 Hz, with async prefetch) → **186ms (5.4 Hz, 2-step denoising)**
 
+**Next target: 7.1 Hz** via TRT MHA plugin (section 12) → TRT INT8 backbone (141ms) + TRT FP16 DiT (36ms) + pipeline parallelism = ~141ms E2E
+
 ## Experimental Results
 
 ### Backbone Quality (cos_sim vs PyTorch BF16 flash reference)
@@ -61,9 +63,11 @@ C = ONNX Runtime (565ms, 0.999)       torch.compile+SDPA (191ms, 0.998)
 
 **The speed-quality gap:** No TRT config achieves both good quality AND speed improvement. The only fast options (FP16/INT8) have destroyed quality. The only high-quality options (FP32/ONNX) are slower than PyTorch flash.
 
-### Root Cause: BF16 vs FP16 Dynamic Range
+### Root Cause: TRT FP16 MHA Kernel (NOT Layer Activation Overflow)
 
-The Eagle backbone (Eagle-Block2A-2B-v2) produces intermediate values that require BF16's wider exponent range. The SigLIP2 vision encoder and Qwen2 language model both have activations and attention scores that exceed FP16's ±65504 range. This is a fundamental model property — not fixable by output buffer dtype or accumulation fixes.
+~~Original diagnosis: "Eagle backbone dynamic range overflows FP16's 5-bit exponent."~~
+
+**Corrected diagnosis (from `profile_fp16_rootcause.py`):** All 399 layer outputs are within FP16 range (max ~5160 ≪ 65504). PyTorch FP16 SDPA achieves cos_sim=0.999. The quality destruction is **100% TRT-specific**: TRT's fused Multi-Head Attention kernel computes intermediate attention scores (Q@K^T) in FP16, and Qwen2 layers 14-15 have worst-case scores of ~73K-121K that overflow FP16. PyTorch's SDPA computes softmax in FP32 internally; TRT's fused FP16 MHA does not.
 
 ### Why TRT FP16/INT8 Aren't Much Faster Than PyTorch Flash
 
@@ -133,7 +137,9 @@ python gr00t/eval/open_loop_eval.py \
     --trt-engine-path groot_n1d6_onnx/dit_fp16.trt \
     --compile-backbone \
     --compile-backbone-mode default \
-    --traj-ids 0 --action-horizon 16 --denoising-steps 4 \
+    --traj-ids 0 \
+    --action-horizon 16 \
+    --denoising-steps 2 \
     --save-plot-path ./episode000_optimized.png
 ```
 
@@ -240,13 +246,125 @@ Same dynamic range problem regardless of where the FP16 cast happens. Model wasn
 
 **Note:** Pipeline adds 1-frame latency (frame N's actions are computed using frame N-1's backbone features for the DiT). First frame still runs sequentially.
 
-### 7. Model Distillation / Pruning
+### ~~7. SmoothQuant Backbone via NVIDIA Model Optimizer~~ INVESTIGATED — WILL NOT HELP
+
+**Status:** Thoroughly investigated. SmoothQuant cannot fix the TRT FP16 quality issue because the root cause was misidentified — it's NOT activation overflow.
+
+**Original hypothesis:** Eagle backbone activations exceed FP16's ±65504 range, causing TRT FP16 quality destruction (cos_sim=0.354). SmoothQuant could compress activation dynamic range into FP16 territory.
+
+**Investigation results (3 key experiments):**
+
+#### Experiment 1: Activation Range Profiling
+Profiled all 399 layers' output activations across 10 calibration samples:
+- **Zero FP16 overflows detected.** Maximum activation value: ~5160, well below FP16's 65504 limit.
+- All Linear, LayerNorm, and RMSNorm outputs are safely within FP16 range.
+- SmoothQuant targets activation overflow → no overflow to smooth.
+
+#### Experiment 2: PyTorch FP16 vs BF16 (no TRT)
+Ran the backbone in pure PyTorch with various dtype/attention combos:
+
+| Config | cos_sim vs BF16 flash | MSE |
+|--------|----------------------|-----|
+| BF16 flash (reference) | 1.000 | baseline |
+| **FP16 flash (PyTorch)** | **0.999** | 0.060 |
+| **FP16 SDPA (PyTorch)** | **0.999** | 0.059 |
+| BF16 SDPA (PyTorch) | 0.999 | 0.062 |
+| FP32 SDPA (PyTorch) | 0.999 | 0.057 |
+| TRT FP32 (from ONNX) | 0.999 | 0.093 |
+| **TRT FP16 (from ONNX)** | **0.354** | 27.4 |
+
+**PyTorch FP16 works perfectly.** FP16 flash AND FP16 SDPA both achieve cos_sim=0.999. The quality destruction is 100% TRT-specific.
+
+#### Experiment 3: Attention Score Range Analysis
+Estimated worst-case Q@K^T attention scores per layer:
+- SigLIP2 vision layers: max ~1000 (safely within FP16)
+- Qwen2 language layers 14-15: max ~73,000–121,000 (**exceeds FP16's 65504**)
+
+These overflow in TRT's fused MHA kernel but NOT in PyTorch's SDPA (which computes softmax in FP32 internally). This is likely the smoking gun for TRT FP16 quality destruction.
+
+#### Root Cause (corrected)
+
+The original diagnosis — "Eagle backbone dynamic range overflows FP16's 5-bit exponent" — was **partially correct but misleading**. The overflow occurs specifically in:
+
+1. **TRT's fused Multi-Head Attention (MHA) kernel**: When TRT fuses `MatMul(Q, K^T) → Div(sqrt_d) → Softmax → MatMul(attn, V)` into a single kernel in FP16 mode, the intermediate attention scores in Qwen2 layers 14-15 exceed FP16 range (~73K-121K > 65504). Unlike PyTorch's SDPA which computes softmax in FP32 internally, TRT's fused FP16 MHA kernel does not.
+
+2. **NOT in layer input/output activations**: All 399 layer outputs are within FP16 range (max ~5160). The overflow is in INTERMEDIATE values within TRT's fused kernels that are invisible to PyTorch hooks.
+
+#### Why SmoothQuant cannot help
+
+- SmoothQuant operates on layer inputs/outputs (Norm → Linear weight scaling)
+- The overflow is in **intermediate attention scores** inside TRT's fused MHA kernel
+- SmoothQuant cannot modify the attention score computation (Q@K^T is not a Linear layer)
+- Even if it could, the mathematical transformation Y = (X/s) @ (s*W) doesn't change the attention scores
+
+#### What would actually fix TRT FP16
+
+The fix requires TRT to compute softmax (and its inputs) in FP32 within the fused MHA kernel. This is not controllable via the ONNX graph or mixed-precision layer flags. Options:
+- **TRT plugin**: Custom attention plugin with FP32 softmax accumulation
+- **TRT-LLM**: NVIDIA's specialized LLM inference library has attention kernels with configurable accumulation precision
+- **Wait for TRT update**: Future TRT versions may add FP32 softmax accumulation to the fused MHA kernel on SM87
+- **Accept PyTorch flash**: The current config (PyTorch BF16 flash @ 157ms) is nearly as fast as TRT FP16 (149ms) anyway
+
+**Verdict: Backbone TRT FP16 acceleration remains NOT viable on SM87. The best path is PyTorch BF16 flash + TRT FP16 DiT.**
+
+**Scripts created:**
+- `scripts/deployment/smoothquant_backbone.py` — SmoothQuant implementation (retained for reference)
+- `scripts/deployment/profile_fp16_rootcause.py` — Root cause analysis that proved the issue is TRT-specific
+
+---
+
+### 8. FP32 Layer Audit — Squeeze Remaining Non-BF16 Operations
+
+**Status:** AUDITED — one minor optimization candidate found
+
+Audited the full inference pipeline for any FP32 operations that could be converted to BF16 for marginal latency gains.
+
+#### FP32 Operations Found
+
+| Location | Operation | Verdict |
+|----------|-----------|---------|
+| `gr00t_n1d6.py:329` | Euler denoising loop (`actions = torch.randn(..., dtype=torch.float32)`) | **KEEP FP32** — prevents error compounding across 4 Euler steps. Documented and intentional. |
+| `gr00t_n1d6.py:385` | `pred_velocity.float()` before Euler accumulation | **KEEP FP32** — same reason; DiT outputs (FP16/INT8) upcast to FP32 for stable integration. |
+| `modeling_siglip2.py:776` | `softmax(..., dtype=torch.float32).to(query.dtype)` | **KEEP FP32** — standard softmax stability practice. Upcasts to FP32, computes, casts back to BF16. |
+| `modeling_siglip2.py:618-619` | Positional embedding interpolation (`to(torch.float32)`) | **N/A** — conditional on CPU only. Never executes on Orin CUDA. |
+| `embodiment_conditioned_mlp.py:24` | `timesteps.float()` | **KEEP** — converts integer timesteps to float. Negligible overhead (~1 scalar). |
+| `flowmatching_modules.py:23` | `timesteps.float()` | **KEEP** — same as above. |
+| `embodiment_conditioned_mlp.py:31-32` | Sinusoidal frequency computation in FP32 | **KEEP** — one-time computation, negligible overhead. |
+
+#### RoPE (Rotary Position Embeddings) — Candidate for BF16
+
+The only non-trivial FP32 operation in the hot path:
+
+```python
+# modeling_siglip2.py:726-734 — Frequency cache computation (once per model init)
+flat_pos = torch.arange(0, N).float().to(device)           # FP32
+dim_range = torch.arange(0, self.dim, 4)[...].float().to(device)  # FP32
+x_freqs = torch.outer(x_pos, freqs).float()                # FP32
+y_freqs = torch.outer(y_pos, freqs).float()                # FP32
+
+# modeling_siglip2.py:809-810 — Per-forward complex rotation (every inference)
+xq_ = torch.view_as_complex(xq.float().view(...))  # BF16→FP32 upcast
+xk_ = torch.view_as_complex(xk.float().view(...))  # BF16→FP32 upcast
+# Line 813: .type_as(xq) casts result back to BF16
+```
+
+The frequency cache (lines 726-734) runs once at init — no perf impact. The complex rotation (lines 809-810) runs on **every forward pass, every attention layer**. It upcasts Q/K from BF16→FP32, does complex multiply with `freqs_cis` (complex64), then casts back.
+
+**Potential gain:** Eliminating the BF16→FP32→BF16 round-trip in RoPE could save ~2-5ms on backbone (~1-3%). However, `torch.view_as_complex` requires FP32 input (complex64 = two float32), so this would need a different RoPE implementation (e.g., real-valued sin/cos rotation instead of complex multiply).
+
+**Risk:** Modifying upstream Eagle model code. The RoPE FP32 path is standard practice in vision transformers and the gains are marginal.
+
+**Verdict:** Not worth pursuing. The pipeline is already well-optimized for dtype. FP32 usage is limited to numerically-critical paths. The backbone is memory-bandwidth-bound, so saving a few ms on RoPE compute doesn't materially change the 157ms bottleneck.
+
+---
+
+### 9. Model Distillation / Pruning
 
 **Rationale:** A smaller backbone = less memory to load from DRAM = proportionally faster. A 50% smaller model could run in ~80ms.
 
 **Effort:** High. Requires retraining.
 
-### 8. Next Wave: Async Prefetch + Action Horizon + Denoising Steps
+### 10. Next Wave: Async Prefetch + Action Horizon + Denoising Steps
 
 The 4.7 Hz ceiling can be pushed further with inference-level optimizations (no model changes):
 
@@ -287,7 +405,7 @@ For fixed input shapes (eval always uses same image resolution), `torch.backends
 3. **Runtime action horizon override: REJECTED.** No timing benefit (DiT is memory-bound, sa_embs size doesn't matter), quality destroyed (47x/28x worse MSE). Model must be retrained with smaller AH for this to work.
 4. **Async CPU prefetch:** fully hidden (0.1ms wait time), always-on in new code
 
-### 9. Fine-Tuning with Smaller Action Horizon (RTX 5090)
+### 11. Fine-Tuning with Smaller Action Horizon (RTX 5090)
 
 The model was trained with `action_horizon=16` (16 delta_indices for action). At ~4 Hz inference and 15 fps training, 16 steps = 1.07s lookahead but only 3-4 steps (~0.27s) are used before re-inferring. Training with a matched horizon eliminates wasted computation.
 
@@ -310,6 +428,160 @@ data:
 **Approach:** Resume from checkpoint-10000, train 2000-5000 steps (~15-30 min on RTX 5090). Sweep `action_horizon ∈ {4, 8, 16}` to find the quality/speed sweet spot.
 
 **Post-training:** Rebuild TRT engine with `--opt-sa-seq 5` for the new sa_embs shape.
+
+### 12. Custom TRT MHA Plugin with FP32 Softmax Accumulation
+
+**Status:** NOT YET STARTED
+
+**Goal:** Write a TensorRT plugin that implements Multi-Head Attention with FP16 matmuls but FP32 softmax, fixing the backbone TRT FP16 quality issue (cos_sim=0.354 → target >0.99). This also unlocks INT8 backbone TRT (since INT8 quantization itself is lossless — see section 2 finding: INT8 vs FP16 incremental cos_sim=0.999).
+
+**Why this is the right fix:** The SmoothQuant investigation (section 7) proved the root cause is NOT activation overflow but TRT's fused MHA kernel computing attention scores in FP16. Qwen2 layers 14-15 produce Q@K^T scores of ~73K-121K, exceeding FP16's 65504 limit. PyTorch's SDPA handles this by computing softmax in FP32 internally; TRT's fused FP16 MHA does not.
+
+**Projected performance impact:**
+
+| Config | Backbone ms | DiT ms (2-step) | E2E ms | Hz |
+|--------|------------|-----------------|--------|-----|
+| Current best (PyTorch flash + TRT DiT) | 157 | ~36 | ~186 | 5.4 |
+| TRT FP16 backbone (plugin fix) + TRT DiT | ~149 | ~36 | ~178 | 5.6 |
+| TRT INT8 backbone (plugin fix) + TRT DiT | ~141 | ~36 | ~170 | 5.9 |
+| + pipeline parallelism | ~141 | ~36 | ~141 | **7.1** |
+
+The 157→141ms backbone improvement is modest standalone (~10%), but with pipeline parallelism (backbone overlaps with DiT), E2E becomes `max(backbone, dit_total)`. With 2-step denoising (DiT ~36ms), **backbone latency IS the E2E latency**, so every ms saved on backbone directly translates to Hz gained.
+
+**The INT8 bonus:** We already proved INT8 quantization is essentially lossless on the backbone (INT8 vs FP16: MSE=0.014, cos_sim=0.999). The only reason INT8 TRT failed was the underlying FP16 overflow in MHA. Fix the MHA, and INT8 works for free.
+
+**Implementation approaches (ordered by effort):**
+
+#### 12a. ONNX Graph Surgery: Insert FP32 Cast Around Attention Scores (Low effort)
+
+Before building TRT, modify the ONNX graph to insert explicit `Cast(float32)` nodes around the `MatMul(Q, K^T) → Softmax` chain, and `Cast(float16)` after softmax. If TRT respects these cast nodes (doesn't optimize them away), the attention scores and softmax would compute in FP32.
+
+```python
+# Pseudocode using onnx-graphsurgeon
+import onnx_graphsurgeon as gs
+
+graph = gs.import_onnx(onnx.load("backbone_model.onnx"))
+for node in graph.nodes:
+    if node.op == "Softmax":
+        # Insert Cast(FP32) before softmax input
+        # Insert Cast(FP16) after softmax output
+        ...
+graph.cleanup().toposort()
+onnx.save(gs.export_onnx(graph), "backbone_fp32_softmax.onnx")
+```
+
+**Risk:** TRT may optimize away the cast nodes during graph optimization. Test with `OBEY_PRECISION_CONSTRAINTS` flag.
+
+#### 12b. TRT-LLM Attention Kernels (Medium effort)
+
+NVIDIA's TRT-LLM has production-quality attention kernels (`tensorrt_llm.functional.attention`) that support:
+- FP16 inputs with FP32 softmax accumulation
+- Flash-attention-like tiled computation (O(N) memory)
+- SM87 (Orin) support
+
+This would avoid writing a custom CUDA kernel. The challenge is integrating TRT-LLM's attention into a standalone TRT engine (TRT-LLM is designed for full LLM pipelines, not individual layers).
+
+```python
+# Concept: Replace ONNX attention pattern with TRT-LLM plugin
+# 1. Build backbone ONNX WITHOUT attention (use placeholder ops)
+# 2. Register TRT-LLM's attention plugin
+# 3. Build TRT engine — plugin handles attention with FP32 softmax
+```
+
+**Prerequisite:** Check if `tensorrt_llm` ships aarch64 wheels for Jetson or must be built from source.
+
+#### 12c. Custom CUDA TRT Plugin (High effort, full control)
+
+Write a TRT plugin implementing `ScaledDotProductAttention` with:
+- FP16 input/output tensors
+- FP16 tensor core matmuls (Q@K^T and attn@V)
+- FP32 accumulation for attention scores and softmax
+- Support for causal/non-causal masks
+
+```cpp
+// Plugin interface
+class FP32SoftmaxMHAPlugin : public IPluginV2DynamicExt {
+    // Inputs: Q[B,H,N,D], K[B,H,N,D], V[B,H,N,D], mask[B,1,N,N]
+    // Output: attn_output[B,H,N,D]
+    //
+    // Computation:
+    //   scores = FP16_MatMul(Q, K^T) / sqrt(D)  // FP16 tensor cores, FP32 accum
+    //   scores_fp32 = Cast(scores, FP32)
+    //   attn_weights = Softmax(scores_fp32 + mask, dim=-1)
+    //   attn_weights_fp16 = Cast(attn_weights, FP16)
+    //   output = FP16_MatMul(attn_weights_fp16, V)
+};
+```
+
+**Key consideration for SigLIP2:** The vision encoder uses windowed attention with variable window sizes and 2D RoPE. The plugin must handle SigLIP2's attention pattern or we'd need separate plugins for vision vs language attention.
+
+**Build/deploy:** Compile plugin `.so` on Orin, register with TRT, modify ONNX to reference the plugin op.
+
+#### 12d. Hybrid Approach: TRT Backbone + PyTorch Attention (Medium effort)
+
+Split the backbone into three ONNX subgraphs:
+1. **Pre-attention** (embeddings, norms, Q/K/V projections) → TRT FP16
+2. **Attention** (Q@K^T, softmax, attn@V) → PyTorch SDPA (FP16 with FP32 softmax)
+3. **Post-attention** (output projection, MLP, residuals) → TRT FP16
+
+This gives TRT's speed for the compute-heavy parts while using PyTorch's correct attention implementation. The overhead is two TRT↔PyTorch boundary crossings per layer.
+
+**Risk:** Boundary overhead (~0.5ms per crossing × 2 × 59 layers = ~59ms) likely negates TRT savings. Only viable if we can batch the TRT segments.
+
+#### Recommended order
+
+1. **Try 12a first** (ONNX graph surgery) — 1-2 hours, may just work
+2. **If 12a fails**, try 12b (TRT-LLM kernels) — 1-2 days, check aarch64 availability
+3. **If 12b unavailable**, try 12c (custom plugin) — 3-5 days, guaranteed to work
+
+**Go/No-Go:**
+- **Go:** cos_sim > 0.99 with FP16 TRT backbone → enables full-TRT pipeline at ~141ms
+- **Stretch:** INT8 TRT backbone at ~141ms + pipeline = ~141ms E2E → 7.1 Hz
+- **No-Go:** Plugin overhead negates speed gain (unlikely for 12a/12b/12c)
+
+---
+
+### 13. RoPE Real-Valued Implementation — Eliminate BF16→FP32→BF16 Round-Trip
+
+**Status:** COMPLETED
+
+**Goal:** Replace the complex-number RoPE implementation in SigLIP2 with a real-valued sin/cos rotation, eliminating the FP32 upcast on every forward pass of every attention layer.
+
+**Background (from section 8 audit):** SigLIP2's `Rope2DPosEmb` (in `modeling_siglip2.py:809-810`) upcasted Q and K from BF16→FP32, performed complex64 multiplication with `freqs_cis`, then cast back to BF16 on **every forward pass, every attention layer** (27 layers × every inference step). The FP32 upcast existed because `torch.view_as_complex` requires FP32 input.
+
+**Implementation:** Replaced complex-number rotation with real-valued sin/cos rotation:
+
+```python
+# Before — complex rotation, requires FP32 upcast
+xq_ = torch.view_as_complex(xq.float().view(*xq.shape[:-1], -1, 2))  # BF16→FP32
+xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)
+xq_out = xq_out.type_as(xq)  # FP32→BF16
+
+# After — real-valued rotation, stays in input dtype (BF16)
+xq_even, xq_odd = xq[..., 0::2], xq[..., 1::2]
+xq_out = torch.stack([
+    xq_even * rope_cos - xq_odd * rope_sin,
+    xq_odd * rope_cos + xq_even * rope_sin,
+], dim=-1).flatten(-2)
+```
+
+**Validation results:**
+
+| Test | Result |
+|------|--------|
+| Precompute: cos/sin vs complex real/imag | **Bitwise identical** |
+| FP32 apply_rope: old vs new | max_err=4.8e-7, cos_sim=0.9999999 |
+| BF16 apply_rope: old vs new | cos_sim=0.9999973 (stays in BF16, no FP32 round-trip) |
+| ONNX export ops | `[Add, Concat, Mul, Reshape, Slice, Sub, Unsqueeze]` — no complex ops |
+| E2E vision encoder (27 layers) | Runs correctly, output shape/stats normal |
+
+**ONNX improvement:** The old complex RoPE traced to `view_as_complex` / `view_as_real` ONNX ops. The new version traces to simple `Slice + Mul + Sub + Add + Stack + Reshape` — TRT-friendly ops with well-optimized kernels.
+
+**Files modified:**
+- `gr00t/model/modules/nvidia/Eagle-Block2A-2B-v2/modeling_siglip2.py` — `Rope2DPosEmb` (cos/sin caches instead of complex freqs_cis), `apply_rope()` (real-valued rotation)
+- `scripts/deployment/standalone_inference_script.py` — CUDA graph pre-compute updated for new attribute names
+
+**Test script:** `scripts/deployment/test_rope_real_valued.py` — validates precompute equivalence, unit-level numerical comparison, ONNX export, and E2E backbone forward pass.
 
 ## Commands
 

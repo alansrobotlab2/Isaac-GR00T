@@ -540,7 +540,7 @@ class CUDAGraphBackboneWrapper(torch.nn.Module):
             return getattr(self._backbone, name)
 
     def _pre_compute_cached_tensors(self):
-        """Pre-compute lazily-cached tensors (e.g. SigLIP2 freqs_cis) before graph capture.
+        """Pre-compute lazily-cached tensors (e.g. SigLIP2 RoPE cos/sin) before graph capture.
 
         CUDA graphs require all operations to be deterministic on replay.
         Lazy caching (compute-once-then-reuse) inside the forward pass causes
@@ -550,11 +550,11 @@ class CUDAGraphBackboneWrapper(torch.nn.Module):
         """
         device = next(self._backbone.parameters()).device
         for module in self._backbone.modules():
-            # SigLIP2's Rope2DPosEmb caches freqs_cis lazily via _precompute_freqs_cis
-            if hasattr(module, '_precompute_freqs_cis') and hasattr(module, 'freqs_cis'):
-                if module.freqs_cis is None:
-                    module.freqs_cis = module._precompute_freqs_cis(device)
-                    logging.info(f"  Pre-computed freqs_cis for {type(module).__name__}")
+            # SigLIP2's Rope2DPosEmb caches rope_cos/rope_sin lazily
+            if hasattr(module, '_precompute_freqs_cis') and hasattr(module, 'rope_cos'):
+                if module.rope_cos is None:
+                    module.rope_cos, module.rope_sin = module._precompute_freqs_cis(device)
+                    logging.info(f"  Pre-computed RoPE cos/sin for {type(module).__name__}")
 
     def _capture_graph(self, sample_input):
         """Capture the backbone forward pass as a CUDA graph."""

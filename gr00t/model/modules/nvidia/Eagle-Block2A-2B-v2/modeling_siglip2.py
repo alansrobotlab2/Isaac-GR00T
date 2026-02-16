@@ -710,17 +710,18 @@ class Rope2DPosEmb(nn.Module):
         self.theta_base = theta_base
         self.window_size = window_size
 
-        self.freqs_cis = None
+        self.rope_cos = None
+        self.rope_sin = None
 
     def extra_repr(self):
         return f"dim={self.dim}, max_height={self.max_height}, max_width={self.max_width}, theta_base={self.theta_base}"
 
-    def _precompute_freqs_cis(self, device: torch.device) -> torch.Tensor:
-        """Calculate the cis(freqs) for each position in the 2D grid.
-        Return: complex tensor of shape (max_height, max_width, dim//2) and value:
-            height axis: ret[h, w, 2*i] = cis(h * theta_base**(-4*i/dim))
-            weight axis: ret[h, w, 2*i+1] = cis(w * theta_base**(-4*i/dim))   with (i in [0, dim//4))
-            note: `cis` is a mathematical notation defined by cis x = cos x + i sin x,
+    def _precompute_freqs_cis(self, device: torch.device):
+        """Precompute cos/sin caches for 2D rotary position embeddings.
+
+        Returns (cos_cache, sin_cache), each of shape (max_height, max_width, dim//2).
+        Layout: [x_freq_0, y_freq_0, x_freq_1, y_freq_1, ...] matching the
+        original complex interleaving so apply_rope stays numerically identical.
         """
         N = self.max_height * self.max_width
         flat_pos = torch.arange(0, N).float().to(device)
@@ -732,31 +733,37 @@ class Rope2DPosEmb(nn.Module):
         freqs = 1.0 / (self.theta_base ** (dim_range / self.dim))
         x_freqs = torch.outer(x_pos, freqs).float()  # N, C/4
         y_freqs = torch.outer(y_pos, freqs).float()  # N, C/4
-        x_cis = torch.polar(torch.ones_like(x_freqs), x_freqs)  # N, C/4
-        y_cis = torch.polar(torch.ones_like(y_freqs), y_freqs)  # N, C/4
-        # N, C/4, 2
-        freqs_cis = torch.cat(
-            [x_cis.unsqueeze(dim=-1), y_cis.unsqueeze(dim=-1)], dim=-1
-        )
+        # Interleave x/y: [x0, y0, x1, y1, ...] → (N, C/2)
+        cos_cache = torch.stack([torch.cos(x_freqs), torch.cos(y_freqs)], dim=-1).reshape(N, -1)
+        sin_cache = torch.stack([torch.sin(x_freqs), torch.sin(y_freqs)], dim=-1).reshape(N, -1)
         # max_height, max_width, C/2
-        freqs_cis = freqs_cis.reshape(self.max_height, self.max_width, -1)
-        return freqs_cis
+        cos_cache = cos_cache.reshape(self.max_height, self.max_width, -1)
+        sin_cache = sin_cache.reshape(self.max_height, self.max_width, -1)
+        return cos_cache, sin_cache
 
-    def get_freqs_cis(self, win_meta_list: List[Dict], device: torch.device) -> torch.Tensor:
+    def get_freqs_cis(self, win_meta_list: List[Dict], device: torch.device):
         """
         Args:
             win_meta_list (List[Dict]): window meta list
         Returns:
-            freqs_cis: tensor of shape (sum(t * height * width), dim//2)
+            (rope_cos, rope_sin): each of shape (1, total_tokens, dim//2)
         """
-        if self.freqs_cis is None:
-            self.freqs_cis = self._precompute_freqs_cis(device)
-        
+        if self.rope_cos is None:
+            self.rope_cos, self.rope_sin = self._precompute_freqs_cis(device)
+
         # assert all xy <512
         assert all(win_meta['win_xy'][0] + win_meta['win_hw'][0] < 512 and win_meta['win_xy'][1] + win_meta['win_hw'][1] < 512 for win_meta in win_meta_list)
-        freqs_cis = torch.cat([self.freqs_cis[win_meta['win_xy'][0]:win_meta['win_xy'][0] + win_meta['win_hw'][0], win_meta['win_xy'][1]: win_meta['win_xy'][1] + win_meta['win_hw'][1]].reshape(-1, self.dim // 2) for win_meta in win_meta_list], dim=0)
-        freqs_cis = freqs_cis.unsqueeze(0)
-        return freqs_cis
+        half = self.dim // 2
+        cos_parts = []
+        sin_parts = []
+        for win_meta in win_meta_list:
+            h0, w0 = win_meta['win_xy']
+            h_eff, w_eff = win_meta['win_hw']
+            cos_parts.append(self.rope_cos[h0:h0 + h_eff, w0:w0 + w_eff].reshape(-1, half))
+            sin_parts.append(self.rope_sin[h0:h0 + h_eff, w0:w0 + w_eff].reshape(-1, half))
+        rope_cos = torch.cat(cos_parts, dim=0).unsqueeze(0)
+        rope_sin = torch.cat(sin_parts, dim=0).unsqueeze(0)
+        return (rope_cos, rope_sin)
     
 
 def eager_attention_forward(
@@ -783,34 +790,37 @@ def eager_attention_forward(
 
 
 
-def _apply_rope_input_validation(x, freqs_cis):
-    assert x.ndim == freqs_cis.ndim + 1, (x.shape, freqs_cis.shape)
-    assert x.shape[:-2] == freqs_cis.shape[:-1], (x.shape, freqs_cis.shape)
-    assert x.shape[-1] == 2 * freqs_cis.shape[-1], (x.shape, freqs_cis.shape)
-    assert freqs_cis.dtype == torch.complex64, freqs_cis.dtype
-
-
 def apply_rope(
-    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: tuple
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Args: (The leading dimensions of all inputs should be the same)
-        xq: query, tensor of shape (..., num_heads, head_dim)
-        xk: key, tensor of shape (..., num_heads, head_dim)
-        freqs_cis: tensor of shape (..., head_dim/2), dtype=torch.complex64. It contains the precomputed cis(freqs) for each position in the 2D grid.
-    Returns:
-        xq_out, xk_out: tensors of shape (..., num_heads, head_dim)
-    """
-    _apply_rope_input_validation(xq, freqs_cis)
-    _apply_rope_input_validation(xk, freqs_cis)
+    """Real-valued 2D rotary position embedding (no complex numbers, no FP32 upcast).
 
-    freqs_cis = freqs_cis.unsqueeze(-2)  # ..., 1, head_dim/2
-    # ..., num_heads, head_dim/2
-    xq_ = torch.view_as_complex(xq.float().view(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().view(*xq.shape[:-1], -1, 2))
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    Args:
+        xq: query, shape (..., num_heads, head_dim)
+        xk: key, shape (..., num_heads, head_dim)
+        freqs_cis: tuple (rope_cos, rope_sin), each shape (..., head_dim/2)
+    Returns:
+        xq_out, xk_out: same shape/dtype as inputs
+    """
+    rope_cos, rope_sin = freqs_cis
+    # Broadcast over heads: (..., 1, head_dim/2), cast to input dtype
+    rope_cos = rope_cos.unsqueeze(-2).to(xq.dtype)
+    rope_sin = rope_sin.unsqueeze(-2).to(xq.dtype)
+
+    # Split into even/odd pairs — equivalent to view_as_complex grouping
+    xq_even, xq_odd = xq[..., 0::2], xq[..., 1::2]
+    xq_out = torch.stack([
+        xq_even * rope_cos - xq_odd * rope_sin,
+        xq_odd * rope_cos + xq_even * rope_sin,
+    ], dim=-1).flatten(-2)
+
+    xk_even, xk_odd = xk[..., 0::2], xk[..., 1::2]
+    xk_out = torch.stack([
+        xk_even * rope_cos - xk_odd * rope_sin,
+        xk_odd * rope_cos + xk_even * rope_sin,
+    ], dim=-1).flatten(-2)
+
+    return xq_out, xk_out
 
 
 class Siglip2Attention(nn.Module):
