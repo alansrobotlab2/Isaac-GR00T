@@ -12,6 +12,13 @@ import time
 from typing import Any, Literal
 import warnings
 
+# Jetson unified memory optimization: configure PyTorch CUDA allocator before any CUDA ops.
+# NOTE: expandable_segments:True is BROKEN on Jetson (PyTorch 2.8 + CUDA 12.6 + r36.5).
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "garbage_collection_threshold:0.6",
+)
+
 from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
 from gr00t.data.dataset.sharded_single_step_dataset import extract_step_data
 from gr00t.data.embodiment_tags import EmbodimentTag
@@ -26,14 +33,9 @@ import tyro
 
 warnings.simplefilter("ignore", category=FutureWarning)
 
-# Jetson unified memory optimization: configure PyTorch CUDA allocator before any CUDA ops.
-# - garbage_collection_threshold: 0.6 triggers GC earlier (default 0.8) to reclaim unused cache
-# NOTE: expandable_segments:True is BROKEN on Jetson (PyTorch 2.8 + CUDA 12.6 + r36.5) —
-# it causes "CUDA driver error: out of memory" on the very first allocation.
-os.environ.setdefault(
-    "PYTORCH_CUDA_ALLOC_CONF",
-    "garbage_collection_threshold:0.6",
-)
+# Enable TF32 tensor cores for FP32 matmuls (~2x speedup, negligible precision loss).
+# Orin SM87 supports TF32 but PyTorch doesn't enable it by default.
+torch.set_float32_matmul_precision("high")
 
 """
 Combined inference script supporting both PyTorch and TensorRT modes.
@@ -501,6 +503,267 @@ def replace_backbone_with_tensorrt(
 ###############################################################################
 
 
+###############################################################################
+# CUDA Graph Wrapper for Backbone
+###############################################################################
+
+
+class CUDAGraphBackboneWrapper(torch.nn.Module):
+    """Wraps a PyTorch backbone in a CUDA graph for zero kernel-launch overhead.
+
+    CUDA graphs capture the entire forward pass as a single GPU operation,
+    eliminating CPU-GPU round-trips per kernel. Requires static input shapes,
+    so inputs are padded to the captured sequence length.
+
+    The graph is captured lazily on first call (with warmup replays).
+    """
+
+    def __init__(self, backbone, warmup_runs: int = 3):
+        super().__init__()
+        self._backbone = backbone
+        self.warmup_runs = warmup_runs
+
+        # Graph state (lazily initialized on first call)
+        self._graph = None
+        self._static_inputs = None  # Static input buffers (copied into each call)
+        self._static_output = None  # Static output buffer (read after replay)
+        self._captured_shapes = None  # Shapes the graph was captured with
+
+    @property
+    def backbone(self):
+        return self._backbone
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self._backbone, name)
+
+    def _pre_compute_cached_tensors(self):
+        """Pre-compute lazily-cached tensors (e.g. SigLIP2 freqs_cis) before graph capture.
+
+        CUDA graphs require all operations to be deterministic on replay.
+        Lazy caching (compute-once-then-reuse) inside the forward pass causes
+        'tensor output overwritten by a subsequent run' errors because the
+        first call writes to the cache while replays try to read stale data.
+        Pre-computing forces the cache to be populated before capture.
+        """
+        device = next(self._backbone.parameters()).device
+        for module in self._backbone.modules():
+            # SigLIP2's Rope2DPosEmb caches freqs_cis lazily via _precompute_freqs_cis
+            if hasattr(module, '_precompute_freqs_cis') and hasattr(module, 'freqs_cis'):
+                if module.freqs_cis is None:
+                    module.freqs_cis = module._precompute_freqs_cis(device)
+                    logging.info(f"  Pre-computed freqs_cis for {type(module).__name__}")
+
+    def _capture_graph(self, sample_input):
+        """Capture the backbone forward pass as a CUDA graph."""
+        logging.info("Capturing CUDA graph for backbone...")
+
+        # Pre-compute any lazily-cached tensors before capture
+        self._pre_compute_cached_tensors()
+
+        # Create static input buffers by cloning the sample
+        self._static_inputs = {}
+        for key, val in sample_input.items():
+            if isinstance(val, torch.Tensor):
+                self._static_inputs[key] = val.clone()
+            elif isinstance(val, list):
+                self._static_inputs[key] = [t.clone() for t in val]
+            else:
+                self._static_inputs[key] = val
+
+        self._captured_shapes = {
+            k: v.shape if isinstance(v, torch.Tensor) else [t.shape for t in v]
+            for k, v in self._static_inputs.items()
+        }
+        logging.info(f"  Captured shapes: {self._captured_shapes}")
+
+        from transformers.feature_extraction_utils import BatchFeature
+        static_bf = BatchFeature(data=self._static_inputs)
+
+        # Warmup runs (required before graph capture)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for i in range(self.warmup_runs):
+                with torch.inference_mode():
+                    out = self._backbone(static_bf)
+        torch.cuda.current_stream().wait_stream(s)
+
+        # Capture
+        self._graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._graph):
+            with torch.inference_mode():
+                self._static_output = self._backbone(static_bf)
+
+        logging.info("  CUDA graph captured successfully")
+
+    def __call__(self, inputs):
+        """Run backbone via CUDA graph replay.
+
+        If input shapes match the captured graph, copies data into static buffers
+        and replays. If shapes don't match (shouldn't happen for fixed batch inference),
+        falls back to eager execution.
+        """
+        from transformers.feature_extraction_utils import BatchFeature
+
+        # First call: capture the graph
+        if self._graph is None:
+            input_data = inputs.data if isinstance(inputs, BatchFeature) else inputs
+            self._capture_graph(input_data)
+
+        input_data = inputs.data if isinstance(inputs, BatchFeature) else inputs
+
+        # Check shapes match
+        shapes_match = True
+        for key, static_val in self._static_inputs.items():
+            input_val = input_data.get(key)
+            if input_val is None:
+                shapes_match = False
+                break
+            if isinstance(static_val, torch.Tensor) and isinstance(input_val, torch.Tensor):
+                if static_val.shape != input_val.shape:
+                    shapes_match = False
+                    break
+            elif isinstance(static_val, list) and isinstance(input_val, list):
+                if len(static_val) != len(input_val):
+                    shapes_match = False
+                    break
+                for s, i in zip(static_val, input_val):
+                    if s.shape != i.shape:
+                        shapes_match = False
+                        break
+
+        if not shapes_match:
+            # Fallback to eager — shapes changed (rare for fixed-batch inference)
+            return self._backbone(inputs)
+
+        # Copy new data into static input buffers
+        for key, static_val in self._static_inputs.items():
+            input_val = input_data[key]
+            if isinstance(static_val, torch.Tensor):
+                static_val.copy_(input_val)
+            elif isinstance(static_val, list):
+                for s, i in zip(static_val, input_val):
+                    s.copy_(i)
+
+        # Replay graph
+        self._graph.replay()
+
+        # Return a copy of the static output (static buffer gets overwritten on next replay)
+        return BatchFeature(data={
+            k: v.clone() if isinstance(v, torch.Tensor) else v
+            for k, v in self._static_output.items()
+        })
+
+
+def wrap_backbone_with_cuda_graphs(policy):
+    """Replace policy's backbone with a CUDA graph wrapper.
+
+    The wrapper is an nn.Module so it can be assigned as a child module.
+    It delegates all attribute access to the underlying backbone.
+    """
+    original_backbone = policy.model.backbone
+    wrapper = CUDAGraphBackboneWrapper(original_backbone)
+    policy.model.backbone = wrapper
+    logging.info(" Backbone wrapped with CUDA graphs (will capture on first inference)")
+
+
+###############################################################################
+# CUDA Graph Wrapper End
+###############################################################################
+
+
+###############################################################################
+# Pipelined Inference: Overlap backbone(N+1) with DiT(N)
+###############################################################################
+
+
+class PipelinedInference:
+    """Double-buffered inference that overlaps backbone and DiT on separate CUDA streams.
+
+    Normal flow (sequential):
+        backbone(N) -> DiT(N) -> backbone(N+1) -> DiT(N+1)
+        |---- 157ms ---|-- 72ms --|---- 157ms ----|-- 72ms --|  = 229ms/frame
+
+    Pipelined flow:
+        backbone(N) -> DiT(N) ------>
+                       backbone(N+1) -> DiT(N+1) ------>
+        |---- 157ms ---|-- 72ms --|    (backbone overlaps with DiT)
+        First frame: 229ms, subsequent frames: max(157, 72) + overhead ≈ 160ms
+
+    Note: On a single GPU, true overlap depends on the GPU scheduler being able
+    to interleave kernels from different streams. Memory-bound backbone + compute-bound
+    DiT may actually overlap on Orin's SM87.
+    """
+
+    def __init__(self, policy):
+        self.policy = policy
+        self.model = policy.model
+        self.backbone_stream = torch.cuda.Stream()
+
+        # Double buffer for backbone outputs
+        self._pending_backbone_output = None
+        self._pending_action_input = None
+        self._backbone_done_event = None
+
+    def run_first_frame(self, collated_inputs):
+        """Run first frame sequentially (no overlap possible)."""
+        with torch.inference_mode():
+            return self.model.get_action(**collated_inputs)
+
+    def start_backbone_async(self, collated_inputs):
+        """Start backbone on a separate stream (non-blocking).
+
+        Call this BEFORE running DiT on the previous frame's features.
+
+        Args:
+            collated_inputs: The dict from policy.prepare_inputs(), passed
+                             to model.get_action(**collated_inputs).
+        """
+        # model.get_action() unpacks collated_inputs as kwargs.
+        # The actual dict structure is {"inputs": {...}} where the inner dict
+        # has the tensors model.prepare_input() needs.
+        raw = collated_inputs.get("inputs", collated_inputs)
+        with torch.inference_mode():
+            backbone_inputs, action_inputs = self.model.prepare_input(raw)
+
+        # Run backbone on separate stream
+        self.backbone_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.backbone_stream):
+            with torch.inference_mode():
+                backbone_output = self.model.backbone(backbone_inputs)
+
+        # Record event so DiT can wait for backbone
+        self._backbone_done_event = self.backbone_stream.record_event()
+        self._pending_backbone_output = backbone_output
+        self._pending_action_input = action_inputs
+
+    def finish_frame(self):
+        """Wait for backbone and run DiT (on default stream).
+
+        Returns the action prediction.
+        """
+        # Wait for backbone to finish
+        torch.cuda.current_stream().wait_event(self._backbone_done_event)
+
+        with torch.inference_mode():
+            action_output = self.model.action_head.get_action(
+                self._pending_backbone_output,
+                self._pending_action_input,
+            )
+
+        self._pending_backbone_output = None
+        self._pending_action_input = None
+        return action_output
+
+
+###############################################################################
+# Pipelined Inference End
+###############################################################################
+
+
 def plot_trajectory_results(
     state_joints_across_time: np.ndarray,
     gt_action_across_time: np.ndarray,
@@ -713,6 +976,7 @@ def run_single_trajectory(
     action_horizon=16,
     skip_timing_steps=1,
     get_performance_stats=False,
+    pipeline: PipelinedInference | None = None,
 ):
     """
     Run inference on a single trajectory.
@@ -820,7 +1084,52 @@ def run_single_trajectory(
 
         # Inference timing (GPU only - preprocessing already done)
         inference_start = time.time()
-        _action_chunk = policy.run_inference(collated_inputs, states)
+        if pipeline is not None:
+            # Pipelined mode: overlap backbone(N+1) with DiT(N).
+            #
+            # Flow:
+            #   Frame 0: backbone(0) + DiT(0) sequential (no overlap)
+            #   Frame 1+: backbone already running from previous iteration,
+            #             wait for it -> run DiT -> start backbone(N+1) async
+            if step_idx == 0:
+                # First frame: run full pipeline sequentially
+                _action_chunk = policy.run_inference(collated_inputs, states)
+                # After first frame completes, start backbone for next frame async
+                if step_idx + 1 < len(step_counts):
+                    next_collated, next_states = future_inputs.result()
+                    pipeline.start_backbone_async(next_collated)
+                    # Stash for next iteration
+                    pipeline._next_states = next_states
+                    from concurrent.futures import Future
+                    done_future = Future()
+                    done_future.set_result((next_collated, next_states))
+                    future_inputs = done_future
+            else:
+                # Subsequent frames: backbone was started during previous iteration.
+                # Wait for it and run DiT on default stream.
+                with torch.inference_mode():
+                    model_pred = pipeline.finish_frame()
+                # Decode actions using THIS frame's states
+                normalized_action = model_pred["action_pred"].float()
+                batched_states = {}
+                for k in policy.modality_configs["state"].modality_keys:
+                    batched_states[k] = np.stack([s[k] for s in states], axis=0)
+                unnormalized_action = policy.processor.decode_action(
+                    normalized_action.cpu().numpy(), policy.embodiment_tag, batched_states
+                )
+                _action_chunk = {key: value.astype(np.float32) for key, value in unnormalized_action.items()}
+
+                # Start backbone for NEXT frame async (overlaps with action post-processing)
+                if step_idx + 1 < len(step_counts):
+                    next_collated, next_states = future_inputs.result()
+                    pipeline.start_backbone_async(next_collated)
+                    pipeline._next_states = next_states
+                    from concurrent.futures import Future
+                    done_future = Future()
+                    done_future.set_result((next_collated, next_states))
+                    future_inputs = done_future
+        else:
+            _action_chunk = policy.run_inference(collated_inputs, states)
         inference_time = time.time() - inference_start
 
         # Only record timing after skipping the first N steps (warmup)
@@ -979,6 +1288,18 @@ class ArgsConfig:
     backbone_trt_engine_path: str = ""
     """Path to TensorRT engine file for the backbone. When set, replaces PyTorch backbone with TRT."""
 
+    compile_backbone: bool = False
+    """Apply torch.compile to the backbone for kernel fusion. Works with flash_attention_2 (default) or sdpa."""
+
+    compile_backbone_mode: str = "max-autotune"
+    """torch.compile mode for backbone. Options: 'default', 'reduce-overhead', 'max-autotune'."""
+
+    use_cuda_graphs: bool = False
+    """Wrap backbone forward pass in CUDA graphs to eliminate kernel launch overhead. Requires static input shapes (pads to max sequence length)."""
+
+    pipeline_backbone_dit: bool = False
+    """Overlap backbone(N+1) with DiT(N) on separate CUDA streams for higher throughput. Only affects multi-frame inference loops."""
+
 
 def main(args: ArgsConfig):
     # Set up logging
@@ -1001,9 +1322,21 @@ def main(args: ArgsConfig):
             logging.info(f"Backbone TRT Engine: {args.backbone_trt_engine_path}")
     if args.attn_implementation:
         logging.info(f"Attention Implementation: {args.attn_implementation}")
+    if args.compile_backbone:
+        logging.info(f"Compile Backbone: {args.compile_backbone_mode}")
+    if args.use_cuda_graphs:
+        logging.info("CUDA Graphs: enabled")
+    if args.pipeline_backbone_dit:
+        logging.info("Pipeline: backbone(N+1) overlaps with DiT(N)")
     logging.info(f"Seed: {args.seed}")
     set_seed(args.seed)
     logging.info("=" * 80)
+
+    # Warn about torch.compile reduce-overhead + CUDA graphs overlap
+    if args.compile_backbone and args.compile_backbone_mode == "reduce-overhead" and args.use_cuda_graphs:
+        logging.warning("torch.compile(mode='reduce-overhead') already uses CUDA graphs internally. "
+                        "The --use-cuda-graphs flag is redundant and may cause issues. "
+                        "Use --compile-backbone-mode max-autotune with --use-cuda-graphs instead.")
 
     # Download model checkpoint
     local_model_path = args.model_path
@@ -1101,6 +1434,18 @@ def main(args: ArgsConfig):
                 mem_reserved = torch.cuda.memory_reserved() / 1024**3
                 logging.info(f"GPU memory after all TRT replacements: allocated={mem_used:.2f} GB, reserved={mem_reserved:.2f} GB")
 
+            # torch.compile on the PyTorch backbone (only when backbone is NOT replaced by TRT)
+            if args.compile_backbone and not args.backbone_trt_engine_path:
+                logging.info(f"Compiling backbone with torch.compile(mode='{args.compile_backbone_mode}')...")
+                policy.model.backbone.forward = torch.compile(
+                    policy.model.backbone.forward, mode=args.compile_backbone_mode
+                )
+                logging.info(" Backbone compiled (will warmup on first inference)")
+
+            # CUDA graphs on backbone (only when backbone is NOT replaced by TRT)
+            if args.use_cuda_graphs and not args.backbone_trt_engine_path:
+                wrap_backbone_with_cuda_graphs(policy)
+
             logging.info(" TensorRT mode enabled")
         else:
             # PyTorch mode - load directly to GPU
@@ -1114,11 +1459,23 @@ def main(args: ArgsConfig):
                 attn_implementation=args.attn_implementation,
             )
 
-            # PyTorch mode with torch.compile
+            # PyTorch mode with torch.compile on DiT
             policy.model.action_head.model.forward = torch.compile(
                 policy.model.action_head.model.forward, mode="max-autotune"
             )
-            logging.info(" PyTorch mode enabled with torch.compile")
+            logging.info(" PyTorch mode enabled with torch.compile on DiT")
+
+            # Optional: torch.compile on backbone
+            if args.compile_backbone:
+                logging.info(f"Compiling backbone with torch.compile(mode='{args.compile_backbone_mode}')...")
+                policy.model.backbone.forward = torch.compile(
+                    policy.model.backbone.forward, mode=args.compile_backbone_mode
+                )
+                logging.info(" Backbone compiled (will warmup on first inference)")
+
+            # Optional: CUDA graphs on backbone
+            if args.use_cuda_graphs:
+                wrap_backbone_with_cuda_graphs(policy)
 
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
@@ -1179,6 +1536,12 @@ def main(args: ArgsConfig):
     all_mse = []
     all_mae = []
     all_timings = []
+
+    # Create pipeline object if requested
+    pipeline_obj = None
+    if args.pipeline_backbone_dit:
+        pipeline_obj = PipelinedInference(policy)
+        logging.info("Pipeline mode: backbone(N+1) will overlap with DiT(N)")
     pred_actions = []
 
     for traj_id in args.traj_ids:
@@ -1203,6 +1566,7 @@ def main(args: ArgsConfig):
             action_horizon=args.action_horizon,
             skip_timing_steps=args.skip_timing_steps,
             get_performance_stats=args.get_performance_stats,
+            pipeline=pipeline_obj,
         )
         pred_actions.append(pred_action_across_time)
 

@@ -1,8 +1,10 @@
 # Backbone TensorRT Optimization: Findings & Next Steps
 
-## Current Best Config: 4.2 Hz
+## Current Best Config: 5.4 Hz (was 2.2 Hz)
 
-PyTorch BF16 flash backbone (170ms) + TRT FP16 DiT (72ms) = ~4.2 Hz (1.54x over pure PyTorch 2.7 Hz)
+torch.compile(default) backbone + TRT FP16 DiT + **2-step denoising** = **186ms avg E2E** (~5.4 Hz)
+
+Previous bests: 240ms (4.2 Hz, 4-step denoising) → 226ms (4.4 Hz, with async prefetch) → **186ms (5.4 Hz, 2-step denoising)**
 
 ## Experimental Results
 
@@ -94,7 +96,48 @@ TRT FP16 advantages:             Flash attention advantages:
 | `calibration_data_backbone/calib_data.npz` | 100 samples backbone calibration data |
 | `calibration_data_backbone/backbone_int8_calib.cache` | INT8 calibration cache (reuse for rebuilds) |
 
-### Build Commands (inside Docker)
+### PyTorch Optimization Commands (inside Docker)
+
+```bash
+# Baseline: PyTorch BF16 flash backbone + TRT FP16 DiT
+python scripts/deployment/standalone_inference_script.py \
+    --model-path alfie-gr00t/checkpoint-10000 \
+    --dataset-path alfiebot.CanDoChallenge \
+    --embodiment-tag NEW_EMBODIMENT \
+    --inference-mode tensorrt \
+    --trt-engine-path groot_n1d6_onnx/dit_fp16.trt \
+    --traj-ids 0 1 2 --steps 200 --denoising-steps 4 --action-horizon 16 --seed 42
+
+# Best config: torch.compile + pipeline parallelism
+python scripts/deployment/standalone_inference_script.py \
+    --model-path alfie-gr00t/checkpoint-10000 \
+    --dataset-path alfiebot.CanDoChallenge \
+    --embodiment-tag NEW_EMBODIMENT \
+    --inference-mode tensorrt \
+    --trt-engine-path groot_n1d6_onnx/dit_fp16.trt \
+    --compile-backbone \
+    --compile-backbone-mode default \
+    --pipeline-backbone-dit \
+    --traj-ids 0 1 2 \
+    --steps 200 \
+    --denoising-steps 2 \
+    --action-horizon 4 \
+    --seed 42
+
+# Open loop eval with timing
+python gr00t/eval/open_loop_eval.py \
+    --dataset-path alfiebot.CanDoChallenge \
+    --embodiment-tag NEW_EMBODIMENT \
+    --model-path alfie-gr00t/checkpoint-10000 \
+    --inference-mode tensorrt \
+    --trt-engine-path groot_n1d6_onnx/dit_fp16.trt \
+    --compile-backbone \
+    --compile-backbone-mode default \
+    --traj-ids 0 --action-horizon 16 --denoising-steps 4 \
+    --save-plot-path ./episode000_optimized.png
+```
+
+### TRT Engine Build Commands (inside Docker)
 
 ```bash
 # SDPA ONNX export
@@ -157,29 +200,45 @@ python scripts/deployment/benchmark_backbone_pipeline.py \
 
 Same dynamic range problem regardless of where the FP16 cast happens. Model wasn't trained in FP16 and its activations fundamentally exceed FP16 range.
 
-### 4. torch.compile + flash attention
+### ~~4. torch.compile + flash attention~~ COMPLETED
 
-**Rationale:** Keep flash attention's algorithmic advantage (O(N) memory, hand-tuned kernel) while letting `torch.compile` fuse surrounding operations (projections, norms, residual adds). The benchmark tested `torch.compile + SDPA` (191ms) but NOT `torch.compile + flash`.
+**Result:** `torch.compile(mode='default')` with flash_attention_2 works. `mode='max-autotune'` and `mode='reduce-overhead'` both FAIL — they use CUDA graphs internally, which conflicts with SigLIP2's lazily-cached `freqs_cis` tensor.
 
-**How:** `torch.compile(backbone, mode="max-autotune")` with `flash_attention_2` still active.
+**E2E benchmark (3 trajs, 30 inference steps, skip 1 warmup):**
 
-**Expected outcome:** Potential ~135-150ms. Flash is already 157ms; compile could shave kernel launch overhead and fuse non-attention ops around the flash kernel.
+| Config | Avg E2E | P90 E2E | MSE | MAE |
+|--------|---------|---------|-----|-----|
+| Baseline (flash + TRT DiT) | 274.6ms | 277.4ms | 0.003230 | 0.023735 |
+| torch.compile(default) + flash + TRT DiT | 267.4ms | 247.8ms | 0.003234 | 0.023758 |
 
-### 5. CUDA Graphs on the flash attention path
+**P90 improved from 277ms to 248ms** (10.5% faster). Average includes torch.compile's first-call warmup penalty. MSE essentially unchanged — no quality loss.
 
-**Rationale:** At batch=1, kernel launch overhead is a significant fraction of total latency. CUDA graphs capture the entire backbone forward pass as a single GPU operation, eliminating CPU-GPU round-trips per kernel.
+### ~~5. CUDA Graphs on the flash attention path~~ BLOCKED
 
-**How:** `torch.cuda.CUDAGraph` capture around `backbone(inputs)`. Requires static input shapes (pad to max sequence length).
+**Result:** CUDA graphs are **fundamentally incompatible** with the Eagle backbone. Two issues:
 
-**Expected outcome:** ~5-15ms reduction → ~142-152ms with perfect quality. Combines well with approach #4.
+1. **SigLIP2's `Rope2DPosEmb` lazily caches `freqs_cis`** — pre-computing it fixes this.
+2. **SigLIP2's `split_patch_embeddings_to_windows_with_meta` uses data-dependent indexing** (`all_windows[sorted_idx]`) — this is a `cudaErrorStreamCaptureUnsupported` error during graph capture. The windowed attention path dynamically sorts and indexes patches based on input-dependent window metadata. This cannot be captured in a static CUDA graph.
 
-### 6. Pipeline parallelism (overlap backbone and DiT)
+**Conclusion:** CUDA graphs are not viable for the Eagle backbone without modifying SigLIP2's windowed attention implementation.
 
-**Rationale:** Currently backbone (157ms) and DiT (72ms) run sequentially = 229ms. If backbone(N+1) overlaps with DiT(N), effective per-frame time drops to max(backbone, DiT) = 157ms + some overhead. Doesn't reduce single-frame latency but increases throughput from ~4.2 Hz to potentially ~5.5-6 Hz.
+### ~~6. Pipeline parallelism (overlap backbone and DiT)~~ COMPLETED
 
-**How:** Double-buffered inference — while DiT processes frame N's features, backbone processes frame N+1's images on a separate CUDA stream.
+**Result:** Pipeline parallelism (backbone on separate CUDA stream) works. Double-buffered: backbone(N+1) runs while DiT(N) processes on default stream.
 
-**Effort:** Medium. Requires restructuring the inference loop.
+**E2E benchmark (3 trajs, 30 inference steps, skip 1 warmup):**
+
+| Config | Avg E2E | P90 E2E | Min E2E | MSE | MAE |
+|--------|---------|---------|---------|-----|-----|
+| Baseline (flash + TRT DiT) | 274.6ms | 277.4ms | 260.6ms | 0.003230 | 0.023735 |
+| Pipeline only | 242.3ms | 260.8ms | 85.0ms | 0.003230 | 0.023735 |
+| torch.compile + pipeline | **213.7ms** | **229.2ms** | 83.7ms | 0.003234 | 0.023758 |
+
+**Pipeline alone: 11.8% faster avg** (274.6→242.3ms). Min of 85ms confirms overlap is working — that's roughly just DiT time when backbone was already running from previous frame.
+
+**Combined compile + pipeline: 22.2% faster avg** (274.6→213.7ms). This is the new best config. Quality is identical to baseline.
+
+**Note:** Pipeline adds 1-frame latency (frame N's actions are computed using frame N-1's backbone features for the DiT). First frame still runs sequentially.
 
 ### 7. Model Distillation / Pruning
 
@@ -187,9 +246,92 @@ Same dynamic range problem regardless of where the FP16 cast happens. Model wasn
 
 **Effort:** High. Requires retraining.
 
-### 8. Accept 4.2 Hz Production Ceiling
+### 8. Next Wave: Async Prefetch + Action Horizon + Denoising Steps
 
-157ms backbone + 72ms DiT is likely within 10-15% of the hardware bandwidth limit for this model on Orin AGX at batch=1. Further gains require algorithmic changes (smaller model, pipeline overlap, action chunking) rather than kernel-level optimization.
+The 4.7 Hz ceiling can be pushed further with inference-level optimizations (no model changes):
+
+#### 8a. Async CPU Prefetching (always-on in open_loop_eval.py)
+CPU preprocessing (image transforms, Eagle tokenization, collation) takes 15-30ms and was running synchronously before GPU inference. Now prefetched in a background thread via `ThreadPoolExecutor`, hiding this latency behind GPU work from the previous step.
+
+#### 8b. Pipeline Parallelism Wired Up in open_loop_eval.py
+The `--pipeline-backbone-dit` flag was defined but never connected to the evaluation loop. Now wired up using the `PipelinedInference` class from `standalone_inference_script.py`. Overlaps backbone(N+1) with DiT(N) on separate CUDA streams.
+
+#### 8c. Reduced Denoising Steps (`--denoising-steps 2`)
+Each TRT DiT step takes ~18ms. Going from 4→2 steps saves ~36ms. Quality impact needs empirical validation — flow matching may degrade at 2 steps.
+
+#### 8d. Runtime Action Horizon Override (`--model-action-horizon 4`)
+Model generates 16-step action chunks but at ~4 Hz only 3-4 steps are used. Overriding `action_horizon` at runtime shrinks sa_embs from `(1,17,1536)` to `(1,5,1536)`, reducing DiT compute. The TRT engine supports dynamic shapes — no rebuild needed. Quality risk: model trained on 16-step noise distribution.
+
+**For production quality with smaller action horizon, fine-tune with the target horizon** (see below).
+
+#### 8e. torch.compile Action Encoder/Decoder (`--compile-action-head`)
+The action encoder (MultiEmbodimentActionEncoder) and decoder (CategorySpecificMLP) run 4x per inference in the denoising loop. `torch.compile(mode='default')` fuses their `torch.bmm()` kernels.
+
+#### 8f. cuDNN Benchmark (`--cudnn-benchmark`)
+For fixed input shapes (eval always uses same image resolution), `torch.backends.cudnn.benchmark = True` auto-selects faster conv algorithms.
+
+#### Measured Results (traj 0, skip 2 warmup steps)
+
+| Config | Avg (ms) | Min (ms) | P90 (ms) | Hz | MSE | MAE |
+|--------|----------|----------|----------|-----|-----|-----|
+| **Baseline** (compile backbone + TRT DiT, 4 denoise, AH=16) | 226 | 215 | 227 | 4.4 | 0.000595 | 0.00860 |
+| + compile action head + cuDNN | 225 | 215 | 226 | 4.4 | 0.000458 | 0.00807 |
+| + **2-step denoising** | **188** | **177** | **189** | **5.3** | **0.000399** | **0.00599** |
+| + model-action-horizon=4 (runtime) | 223 | 211 | 224 | 4.5 | 0.028280 | 0.06980 |
+| + model-action-horizon=8 (runtime) | 223 | 212 | 224 | 4.5 | 0.016578 | 0.05051 |
+| **Combined best** (2 denoise + compile + cuDNN) | **186** | **177** | **188** | **5.4** | **0.000474** | **0.00614** |
+
+**Key findings:**
+1. **2-step denoising is the big win:** 226→188ms (**-38ms, 17% faster**) AND quality *improves* (fewer Euler steps = less FP16 error compounding in TRT DiT)
+2. **Compile action head + cuDNN:** negligible timing impact (~1ms), action encoder/decoder MLPs are too small to benefit from torch.compile
+3. **Runtime action horizon override: REJECTED.** No timing benefit (DiT is memory-bound, sa_embs size doesn't matter), quality destroyed (47x/28x worse MSE). Model must be retrained with smaller AH for this to work.
+4. **Async CPU prefetch:** fully hidden (0.1ms wait time), always-on in new code
+
+### 9. Fine-Tuning with Smaller Action Horizon (RTX 5090)
+
+The model was trained with `action_horizon=16` (16 delta_indices for action). At ~4 Hz inference and 15 fps training, 16 steps = 1.07s lookahead but only 3-4 steps (~0.27s) are used before re-inferring. Training with a matched horizon eliminates wasted computation.
+
+**Config changes** (`experiment_cfg/conf.yaml`):
+```yaml
+model:
+  action_horizon: 4  # Was 16
+data:
+  modality_configs:
+    new_embodiment:
+      action:
+        delta_indices: [0, 1, 2, 3]  # Was [0..15]
+```
+
+**Impact on training:**
+- Sequence length: 17 tokens → 5 tokens (state=1 + action=4)
+- DiT attention: O(17²) → O(5²) — ~11.6x less compute per attention layer
+- Training speedup: ~3-5x faster per step
+
+**Approach:** Resume from checkpoint-10000, train 2000-5000 steps (~15-30 min on RTX 5090). Sweep `action_horizon ∈ {4, 8, 16}` to find the quality/speed sweet spot.
+
+**Post-training:** Rebuild TRT engine with `--opt-sa-seq 5` for the new sa_embs shape.
+
+## Commands
+
+```bash
+# Baseline (4-step denoising, ~226ms)
+python gr00t/eval/open_loop_eval.py \
+    --dataset-path alfiebot.CanDoChallenge --embodiment-tag NEW_EMBODIMENT \
+    --model-path alfie-gr00t/checkpoint-10000 \
+    --inference-mode tensorrt --trt-engine-path groot_n1d6_onnx/dit_fp16.trt \
+    --compile-backbone --compile-backbone-mode default \
+    --traj-ids 0 --action-horizon 16 --denoising-steps 4 \
+    --skip-timing-steps 2 --save-plot-path ./episode000_baseline.png
+
+# Best config (~186ms, 5.4 Hz)
+python gr00t/eval/open_loop_eval.py \
+    --dataset-path alfiebot.CanDoChallenge --embodiment-tag NEW_EMBODIMENT \
+    --model-path alfie-gr00t/checkpoint-10000 \
+    --inference-mode tensorrt --trt-engine-path groot_n1d6_onnx/dit_fp16.trt \
+    --compile-backbone --compile-backbone-mode default \
+    --traj-ids 0 --action-horizon 16 --denoising-steps 2 \
+    --skip-timing-steps 2 --save-plot-path ./episode000_optimized.png
+```
 
 ## Scripts Modified in This Investigation
 
@@ -199,3 +341,5 @@ Same dynamic range problem regardless of where the FP16 cast happens. Model wasn
 | `scripts/deployment/build_tensorrt_engine.py` | 4D/5D pixel_values auto-detection, BackboneInt8Calibrator 5D support |
 | `scripts/deployment/test_sdpa_backbone.py` | SDPA + torch.compile backbone benchmark |
 | `scripts/deployment/export_backbone_onnx.py` | SDPA attention export support (already existed) |
+| `scripts/deployment/standalone_inference_script.py` | torch.compile, CUDAGraphBackboneWrapper (nn.Module), PipelinedInference, CLI flags |
+| `gr00t/eval/open_loop_eval.py` | Async CPU prefetch, pipeline wiring, `--model-action-horizon`, `--compile-action-head`, `--cudnn-benchmark`, timing instrumentation |

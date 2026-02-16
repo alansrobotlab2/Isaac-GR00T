@@ -1,9 +1,11 @@
+from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
 import gc
 import logging
 from pathlib import Path
 import re
+import time
 from typing import Any, Literal
 import warnings
 
@@ -131,6 +133,32 @@ def parse_action_gr00t(action: dict[str, Any]) -> dict[str, Any]:
     return {f"action.{key}": action[key][0] for key in action}
 
 
+def _prepare_model_inputs(
+    policy: Gr00tPolicy,
+    traj: pd.DataFrame,
+    step_count: int,
+    modality_configs: dict[str, Any],
+    embodiment_tag: EmbodimentTag,
+    loader: LeRobotEpisodeLoader,
+) -> tuple[dict, list]:
+    """Full preprocessing pipeline: observation extraction + VLA processor + collation.
+
+    CPU-only operations, safe to run in a background thread while GPU processes
+    the previous step. Returns model-ready inputs for policy.run_inference().
+    """
+    data_point = extract_step_data(traj, step_count, modality_configs, embodiment_tag)
+    obs = {}
+    for k, v in data_point.states.items():
+        obs[f"state.{k}"] = v
+    for k, v in data_point.images.items():
+        obs[f"video.{k}"] = np.array(v)
+    for language_key in loader.modality_configs["language"].modality_keys:
+        obs[language_key] = data_point.text
+    parsed_obs = parse_observation_gr00t(obs, loader.modality_configs)
+    collated_inputs, states = policy.prepare_inputs(parsed_obs)
+    return collated_inputs, states
+
+
 def evaluate_single_trajectory(
     policy: BasePolicy,
     loader: LeRobotEpisodeLoader,
@@ -140,9 +168,20 @@ def evaluate_single_trajectory(
     steps=300,
     action_horizon=16,
     save_plot_path=None,
+    skip_timing_steps=1,
+    pipeline=None,
 ):
+    timing_dict = {
+        "episode_load_time": 0.0,
+        "data_prep_times": [],
+        "inference_times": [],
+    }
+
     # Ensure steps doesn't exceed trajectory length
+    episode_load_start = time.time()
     traj = loader[traj_id]
+    timing_dict["episode_load_time"] = time.time() - episode_load_start
+
     traj_length = len(traj)
     actual_steps = min(steps, traj_length)
     logging.info(
@@ -159,22 +198,79 @@ def evaluate_single_trajectory(
 
     modality_configs = deepcopy(loader.modality_configs)
     modality_configs.pop("action")
-    for step_count in range(0, actual_steps, action_horizon):
-        data_point = extract_step_data(traj, step_count, modality_configs, embodiment_tag)
+    step_counts = list(range(0, actual_steps, action_horizon))
+    num_inference_steps = len(step_counts)
+    use_pipeline = pipeline is not None
+    logging.info(f"Running {num_inference_steps} inference steps (skipping first {skip_timing_steps} for timing)")
+    logging.info(f"Async CPU prefetching: enabled | Pipeline parallelism: {use_pipeline}")
+
+    # Async CPU preprocessing: prefetch next step's data while GPU runs inference
+    executor = ThreadPoolExecutor(max_workers=1)
+    future_inputs = executor.submit(
+        _prepare_model_inputs, policy, traj, step_counts[0],
+        modality_configs, embodiment_tag, loader,
+    )
+
+    for step_idx, step_count in enumerate(step_counts):
         logging.info(f"inferencing at step: {step_count}")
-        obs = {}
-        for k, v in data_point.states.items():
-            obs[f"state.{k}"] = v  # (T, D)
-        for k, v in data_point.images.items():
-            obs[f"video.{k}"] = np.array(v)  # (T, H, W, C)
-        for language_key in loader.modality_configs["language"].modality_keys:
-            obs[language_key] = data_point.text
-        parsed_obs = parse_observation_gr00t(obs, loader.modality_configs)
-        _action_chunk, _ = policy.get_action(parsed_obs)
+
+        # Wait for preprocessing (should already be done from prefetch)
+        data_prep_start = time.time()
+        collated_inputs, states = future_inputs.result()
+        data_prep_time = time.time() - data_prep_start
+
+        # Prefetch NEXT step's preprocessing while GPU runs inference
+        if step_idx + 1 < len(step_counts):
+            future_inputs = executor.submit(
+                _prepare_model_inputs, policy, traj, step_counts[step_idx + 1],
+                modality_configs, embodiment_tag, loader,
+            )
+
+        # Run inference
+        inference_start = time.time()
+        if use_pipeline:
+            import torch
+            if step_idx == 0:
+                # First frame: run full pipeline sequentially
+                _action_chunk = policy.run_inference(collated_inputs, states)
+                # Start backbone for next frame async
+                if step_idx + 1 < len(step_counts):
+                    next_collated, next_states = future_inputs.result()
+                    pipeline.start_backbone_async(next_collated)
+                    pipeline._next_states = next_states
+                    done_future = Future()
+                    done_future.set_result((next_collated, next_states))
+                    future_inputs = done_future
+            else:
+                # Subsequent frames: backbone already running from previous iteration
+                with torch.inference_mode():
+                    model_pred = pipeline.finish_frame()
+                normalized_action = model_pred["action_pred"].float()
+                batched_states = {}
+                for k in policy.modality_configs["state"].modality_keys:
+                    batched_states[k] = np.stack([s[k] for s in states], axis=0)
+                unnormalized_action = policy.processor.decode_action(
+                    normalized_action.cpu().numpy(), policy.embodiment_tag, batched_states
+                )
+                _action_chunk = {key: value.astype(np.float32) for key, value in unnormalized_action.items()}
+                # Start backbone for NEXT frame async
+                if step_idx + 1 < len(step_counts):
+                    next_collated, next_states = future_inputs.result()
+                    pipeline.start_backbone_async(next_collated)
+                    pipeline._next_states = next_states
+                    done_future = Future()
+                    done_future.set_result((next_collated, next_states))
+                    future_inputs = done_future
+        else:
+            _action_chunk = policy.run_inference(collated_inputs, states)
+        inference_time = time.time() - inference_start
+
+        if step_idx >= skip_timing_steps:
+            timing_dict["data_prep_times"].append(data_prep_time)
+            timing_dict["inference_times"].append(inference_time)
+
         action_chunk = parse_action_gr00t(_action_chunk)
         for j in range(action_horizon):
-            # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
-            # the np.atleast_1d is to ensure the action is a 1D array, handle where single value is returned
             concat_pred_action = np.concatenate(
                 [
                     np.atleast_1d(np.atleast_1d(action_chunk[f"action.{key}"])[j])
@@ -183,6 +279,8 @@ def evaluate_single_trajectory(
                 axis=0,
             )
             pred_action_across_time.append(concat_pred_action)
+
+    executor.shutdown(wait=True)
 
     def extract_state_joints(traj: pd.DataFrame, columns: list[str]):
         np_dict = {}
@@ -244,7 +342,7 @@ def evaluate_single_trajectory(
         action_dim_labels=action_dim_labels,
     )
 
-    return mse, mae
+    return mse, mae, timing_dict
 
 
 @dataclass
@@ -296,6 +394,35 @@ class ArgsConfig:
     modality_keys: list[str] | None = None
     """List of modality keys to plot. If None, plot all keys."""
 
+    skip_timing_steps: int = 1
+    """Number of initial inference steps to skip when calculating timing statistics (default: 1 to exclude warmup)."""
+
+    compile_backbone: bool = False
+    """Apply torch.compile to the backbone for kernel fusion."""
+
+    compile_backbone_mode: str = "max-autotune"
+    """torch.compile mode for backbone. Options: 'default', 'reduce-overhead', 'max-autotune'."""
+
+    use_cuda_graphs: bool = False
+    """Wrap backbone forward pass in CUDA graphs to eliminate kernel launch overhead."""
+
+    pipeline_backbone_dit: bool = False
+    """Overlap backbone(N+1) with DiT(N) on separate CUDA streams for higher throughput."""
+
+    compile_action_head: bool = False
+    """Apply torch.compile to action encoder/decoder for kernel fusion in denoising loop."""
+
+    model_action_horizon: int | None = None
+    """Override model's internal action_horizon at inference time. Smaller values (e.g. 4)
+    reduce tensor sizes in the denoising loop for faster inference, but may affect quality
+    if the model was trained on a different horizon."""
+
+    cudnn_benchmark: bool = False
+    """Enable cuDNN benchmark mode for auto-selecting fastest conv algorithms (fixed input shapes)."""
+
+    seed: int = 42
+    """Seed to use for reproducibility."""
+
 
 def main(args: ArgsConfig):
     # Set up logging
@@ -320,6 +447,8 @@ def main(args: ArgsConfig):
         else:
             logging.warning(f"Could not find checkpoint-<step> pattern in path: {local_model_path}")
 
+    model_load_start = time.time()
+
     if local_model_path is not None:
         import torch
 
@@ -333,6 +462,7 @@ def main(args: ArgsConfig):
             TensorRTDiTWrapper = _mod.TensorRTDiTWrapper
             replace_backbone_with_tensorrt = _mod.replace_backbone_with_tensorrt
             replace_dit_with_tensorrt = _mod.replace_dit_with_tensorrt
+            wrap_backbone_with_cuda_graphs = _mod.wrap_backbone_with_cuda_graphs
 
             # TRT needs contiguous GPU memory - load ALL TRT engines FIRST while GPU is empty.
             # Critical on Jetson unified memory where CPU/GPU share 16GB.
@@ -374,6 +504,18 @@ def main(args: ArgsConfig):
             if backbone_trt is not None:
                 replace_backbone_with_tensorrt(policy, args.backbone_trt_engine_path, preloaded_trt=backbone_trt)
 
+            # torch.compile on the PyTorch backbone (only when backbone is NOT replaced by TRT)
+            if args.compile_backbone and not args.backbone_trt_engine_path:
+                logging.info(f"Compiling backbone with torch.compile(mode='{args.compile_backbone_mode}')...")
+                policy.model.backbone.forward = torch.compile(
+                    policy.model.backbone.forward, mode=args.compile_backbone_mode
+                )
+                logging.info("Backbone compiled (will warmup on first inference)")
+
+            # CUDA graphs on backbone (only when backbone is NOT replaced by TRT)
+            if args.use_cuda_graphs and not args.backbone_trt_engine_path:
+                wrap_backbone_with_cuda_graphs(policy)
+
             gc.collect()
             torch.cuda.empty_cache()
             logging.info("TensorRT mode enabled")
@@ -384,26 +526,94 @@ def main(args: ArgsConfig):
                 device="cuda" if torch.cuda.is_available() else "cpu",
                 attn_implementation=args.attn_implementation,
             )
+
+            # Optional: torch.compile on backbone
+            if args.compile_backbone:
+                import torch
+                logging.info(f"Compiling backbone with torch.compile(mode='{args.compile_backbone_mode}')...")
+                policy.model.backbone.forward = torch.compile(
+                    policy.model.backbone.forward, mode=args.compile_backbone_mode
+                )
+                logging.info("Backbone compiled (will warmup on first inference)")
+
+            # Optional: CUDA graphs on backbone
+            if args.use_cuda_graphs:
+                import importlib.util
+                _script_path = str(Path(__file__).resolve().parents[2] / "scripts" / "deployment" / "standalone_inference_script.py")
+                _spec = importlib.util.spec_from_file_location("standalone_inference_script", _script_path)
+                _mod = importlib.util.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                _mod.wrap_backbone_with_cuda_graphs(policy)
     else:
         policy = PolicyClient(host=args.host, port=args.port)
+
+    model_load_time = time.time() - model_load_start
+    logging.info(f"Model loading time: {model_load_time:.4f}s")
+
+    # cuDNN benchmark mode: auto-select fastest conv algorithms for fixed input shapes
+    if args.cudnn_benchmark and local_model_path is not None:
+        import torch
+        torch.backends.cudnn.benchmark = True
+        logging.info("cuDNN benchmark mode enabled (will auto-tune on first inference)")
+
+    # Override denoising steps if needed
+    if hasattr(policy, 'model') and hasattr(policy.model, 'action_head'):
+        model_denoise = policy.model.action_head.num_inference_timesteps
+        if args.denoising_steps != model_denoise:
+            logging.info(f"Overriding num_inference_timesteps: {model_denoise} -> {args.denoising_steps}")
+            policy.model.action_head.num_inference_timesteps = args.denoising_steps
+
+    # Override model action horizon if specified
+    if args.model_action_horizon is not None and hasattr(policy, 'model') and hasattr(policy.model, 'action_head'):
+        original_ah = policy.model.action_head.config.action_horizon
+        policy.model.action_head.config.action_horizon = args.model_action_horizon
+        policy.model.action_head.action_horizon = args.model_action_horizon
+        logging.info(f"Overriding model action_horizon: {original_ah} -> {args.model_action_horizon}")
+
+    # torch.compile action encoder/decoder for kernel fusion in denoising loop
+    if args.compile_action_head and hasattr(policy, 'model') and hasattr(policy.model, 'action_head'):
+        import torch
+        logging.info("Compiling action encoder/decoder with torch.compile(mode='default')...")
+        policy.model.action_head.action_encoder = torch.compile(
+            policy.model.action_head.action_encoder, mode="default"
+        )
+        policy.model.action_head.action_decoder = torch.compile(
+            policy.model.action_head.action_decoder, mode="default"
+        )
+        logging.info("Action encoder/decoder compiled (will warmup on first inference)")
+
+    # Create pipeline for backbone/DiT overlap if requested
+    pipeline = None
+    if args.pipeline_backbone_dit and hasattr(policy, 'model'):
+        import torch
+        import importlib.util
+        _script_path = str(Path(__file__).resolve().parents[2] / "scripts" / "deployment" / "standalone_inference_script.py")
+        _spec = importlib.util.spec_from_file_location("standalone_inference_script", _script_path)
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        pipeline = _mod.PipelinedInference(policy)
+        logging.info("Pipeline parallelism enabled: backbone(N+1) overlaps with DiT(N)")
 
     # Get the supported modalities for the policy
     modality = policy.get_modality_config()
     logging.info(f"Current modality config: \n{modality}")
 
     # Create the dataset
+    dataset_load_start = time.time()
     dataset = LeRobotEpisodeLoader(
         dataset_path=args.dataset_path,
         modality_configs=modality,
         video_backend="torchcodec",
         video_backend_kwargs=None,
     )
+    dataset_load_time = time.time() - dataset_load_start
 
     logging.info(f"Dataset length: {len(dataset)}")
     logging.info(f"Running evaluation on trajectories: {args.traj_ids}")
 
     all_mse = []
     all_mae = []
+    all_timings = []
 
     for traj_id in args.traj_ids:
         if traj_id >= len(dataset):
@@ -411,7 +621,7 @@ def main(args: ArgsConfig):
             continue
 
         logging.info(f"Running trajectory: {traj_id}")
-        mse, mae = evaluate_single_trajectory(
+        mse, mae, timing_dict = evaluate_single_trajectory(
             policy,
             dataset,
             traj_id,
@@ -420,18 +630,77 @@ def main(args: ArgsConfig):
             steps=args.steps,
             action_horizon=args.action_horizon,
             save_plot_path=args.save_plot_path,
+            skip_timing_steps=args.skip_timing_steps,
+            pipeline=pipeline,
         )
         logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
         all_mse.append(mse)
         all_mae.append(mae)
+        all_timings.append(timing_dict)
+
+    # === EVALUATION SUMMARY ===
+    logging.info("\n" + "=" * 80)
+    logging.info("=== EVALUATION SUMMARY ===")
+    logging.info("=" * 80)
 
     if all_mse:
         avg_mse = np.mean(np.array(all_mse))
         avg_mae = np.mean(np.array(all_mae))
-        logging.info(f"Average MSE across all trajs: {avg_mse}")
-        logging.info(f"Average MAE across all trajs: {avg_mae}")
+        logging.info("\nMetrics:")
+        logging.info(f"  Average MSE across all trajs: {avg_mse:.6f}")
+        logging.info(f"  Average MAE across all trajs: {avg_mae:.6f}")
     else:
         logging.info("No valid trajectories were evaluated.")
+
+    # === DETAILED TIMING SUMMARY ===
+    logging.info("\n" + "=" * 80)
+    logging.info("=== DETAILED TIMING SUMMARY ===")
+    logging.info("=" * 80)
+    logging.info("\nInitialization:")
+    logging.info(f"  Model loading time:          {model_load_time:.4f}s")
+    logging.info(f"  Dataset loader creation:     {dataset_load_time:.4f}s")
+
+    if all_timings:
+        total_episode_load = sum(t["episode_load_time"] for t in all_timings)
+        total_inference = sum(sum(t["inference_times"]) for t in all_timings)
+        total_inference_steps = sum(len(t["inference_times"]) for t in all_timings)
+
+        logging.info(f"\nPer-Trajectory Timings ({len(all_timings)} trajectories):")
+        logging.info(
+            f"  Total episode loading:       {total_episode_load:.4f}s  (avg: {total_episode_load / len(all_timings):.4f}s)"
+        )
+        if total_inference_steps > 0:
+            logging.info(
+                f"  Total inference:             {total_inference:.4f}s  (avg: {total_inference / total_inference_steps:.4f}s per step)"
+            )
+
+            logging.info("\nInference Statistics:")
+            logging.info(f"  Total inference steps:       {total_inference_steps}")
+            logging.info(
+                f"  Avg inference time per step: {total_inference / total_inference_steps:.4f}s"
+            )
+
+            all_inf_times = [t for timing in all_timings for t in timing["inference_times"]]
+            logging.info(f"  Min inference time:          {min(all_inf_times):.4f}s")
+            logging.info(f"  Max inference time:          {max(all_inf_times):.4f}s")
+            logging.info(f"  P90 inference time:          {np.percentile(all_inf_times, 90):.4f}s")
+
+            all_prep_times = [t for timing in all_timings for t in timing.get("data_prep_times", [])]
+            if all_prep_times:
+                logging.info(f"\nData Prep (async prefetch wait time):")
+                logging.info(f"  Avg data prep wait:          {np.mean(all_prep_times):.4f}s")
+                logging.info(f"  Max data prep wait:          {max(all_prep_times):.4f}s")
+
+        logging.info(f"\nOptimizations:")
+        logging.info(f"  Async CPU prefetch:          enabled")
+        logging.info(f"  Pipeline parallelism:        {'enabled' if pipeline is not None else 'disabled'}")
+        logging.info(f"  Compile action head:         {args.compile_action_head}")
+        logging.info(f"  cuDNN benchmark:             {args.cudnn_benchmark}")
+        logging.info(f"  Denoising steps:             {args.denoising_steps}")
+        if args.model_action_horizon is not None:
+            logging.info(f"  Model action horizon:        {args.model_action_horizon} (overridden)")
+
+    logging.info("=" * 80)
     logging.info("Done")
 
 

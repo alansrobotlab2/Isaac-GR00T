@@ -49,7 +49,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 uv run \
     --max-steps 2000 \
     --global-batch-size 16 \
     --gradient-accumulation-steps 32 \
-    --dataloader-num-workers 4 \
+    --dataloader-num-workers 8 \
     --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08
 ```
 
@@ -156,19 +156,34 @@ python scripts/deployment/standalone_inference_script.py \
 
 ```bash
 
-MSE 100x worse, MAE 10x worse, basically an unusable model, but why?
+New Baseline bf16 pytorch backbone, fp16 trt dit
+
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python gr00t/eval/open_loop_eval.py \
---dataset-path ../alfiebot_ws/data/alfiebot.CanDoChallenge \
+python scripts/deployment/standalone_inference_script.py \
+  --model-path alfie-gr00t/checkpoint-10000 \
+  --dataset-path alfiebot.CanDoChallenge \
+  --embodiment-tag NEW_EMBODIMENT \
+  --traj-ids 0 \
+  --inference-mode tensorrt \
+  --trt-engine-path groot_n1d6_onnx/dit_fp16.trt \
+  --denoising-steps 4 \
+  --action-horizon 16
+```
+
+```bash
+python gr00t/eval/open_loop_eval.py \
+--dataset-path alfiebot.CanDoChallenge \
 --embodiment-tag NEW_EMBODIMENT \
---model-path ./alfie-gr00t/checkpoint-2000 \
+--model-path alfie-gr00t/checkpoint-10000 \
 --inference-mode tensorrt \
---trt-engine-path ./groot_n1d6_onnx/dit_model_bf16_5090.trt \
+--trt-engine-path groot_n1d6_onnx/dit_fp16.trt \
 --traj-ids 0 \
 --action-horizon 16 \
 --denoising-steps 4 \
 --save-plot-path ./episode000_output_tensorrt.png
----
+```
+
+
 
 ```bash
 python gr00t/eval/open_loop_eval.py \
