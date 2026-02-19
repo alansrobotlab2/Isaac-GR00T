@@ -97,7 +97,7 @@ docker run \
   -v $(pwd)/.:/workspace/gr00t gr00t-dev /bin/bash
 ```
 
-```
+```bash
 cd Isaac-GR00T
 pip install -e .
 pip install
@@ -170,6 +170,36 @@ python scripts/deployment/standalone_inference_script.py \
   --action-horizon 16
 ```
 
+
+Inference Statistics:
+INFO:root:  Total inference steps:       12
+INFO:root:  Avg inference time per step: 0.2668s
+INFO:root:  Min inference time:          0.2539s
+INFO:root:  Max inference time:          0.2702s
+INFO:root:  P90 inference time:          0.2683s
+3.7hz inference rate
+
+```bash
+python gr00t/eval/open_loop_eval.py \
+--dataset-path alfiebot.CanDoChallenge \
+--embodiment-tag NEW_EMBODIMENT \
+--model-path alfie-gr00t/checkpoint-10000 \
+--inference-mode pytorch \
+--traj-ids 0 \
+--action-horizon 16 \
+--denoising-steps 2 \
+--save-plot-path ./episode000_output_tensorrt.png
+```
+
+
+Inference Statistics:
+INFO:root:  Total inference steps:       12
+INFO:root:  Avg inference time per step: 0.2117s
+INFO:root:  Min inference time:          0.1997s
+INFO:root:  Max inference time:          0.2140s
+INFO:root:  P90 inference time:          0.2134s
+4.7hz inference rate
+
 ```bash
 python gr00t/eval/open_loop_eval.py \
 --dataset-path alfiebot.CanDoChallenge \
@@ -179,11 +209,29 @@ python gr00t/eval/open_loop_eval.py \
 --trt-engine-path groot_n1d6_onnx/dit_fp16.trt \
 --traj-ids 0 \
 --action-horizon 16 \
---denoising-steps 4 \
+--denoising-steps 2 \
 --save-plot-path ./episode000_output_tensorrt.png
 ```
 
+Yes — PyTorch has a built-in compilation cache. Set this environment variable before running:
 
+
+TORCHINDUCTOR_CACHE_DIR=./torch_compile_cache python gr00t/eval/open_loop_eval.py ...
+Or for more aggressive caching across runs, use torch.compiler config:
+
+
+TORCHINDUCTOR_FX_GRAPH_CACHE=1 TORCHINDUCTOR_CACHE_DIR=./torch_compile_cache python gr00t/eval/open_loop_eval.py ...
+TORCHINDUCTOR_CACHE_DIR — where compiled kernels are stored (default is a temp dir that may get cleaned up)
+TORCHINDUCTOR_FX_GRAPH_CACHE=1 — enables the FX graph cache, which skips recompilation when the same graph is seen again
+
+
+Inference Statistics:
+INFO:root:  Total inference steps:       12
+INFO:root:  Avg inference time per step: 0.1626s
+INFO:root:  Min inference time:          0.0470s
+INFO:root:  Max inference time:          0.1752s
+INFO:root:  P90 inference time:          0.1733s
+6.1hz inference rate
 
 ```bash
 python gr00t/eval/open_loop_eval.py \
@@ -192,9 +240,14 @@ python gr00t/eval/open_loop_eval.py \
 --model-path ./alfie-gr00t/checkpoint-10000 \
 --inference-mode tensorrt \
 --trt-engine-path ./groot_n1d6_onnx/dit_model_fp16_orin.trt \
+--pipeline-backbone-dit \
+--compile-backbone \
+--compile-backbone-mode default \
+--cudnn-benchmark \
+--compile-action-head \
 --traj-ids 0 \
 --action-horizon 16 \
---denoising-steps 4 \
+--denoising-steps 2 \
 --save-plot-path ./episode000_output_tensorrt.png
 ```
 
