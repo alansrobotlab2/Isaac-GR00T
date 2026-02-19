@@ -111,6 +111,20 @@ python ../alfiebot_ws/src/alfie_gr00t/alfie_gr00t/scripts/groot_inference_server
   --execution-horizon 16 \
   --denoising-steps 2 \
   --port 5555
+
+or for async comms
+
+python ../alfiebot_ws/src/alfie_gr00t/alfie_gr00t/scripts/groot_inference_server.py \
+  --checkpoint ./alfie-gr00t/checkpoint-10000 \
+  --trt-engine-path ./groot_n1d6_onnx/dit_fp16.trt \
+  --compile-backbone \
+  --compile-backbone-mode default \
+  --compile-action-head \
+  --execution-horizon 16 \
+  --denoising-steps 2 \
+  --port 5555 \
+  --async-pull-port 5556 \
+  --async-push-port 5557
 ```
 
 
@@ -232,10 +246,10 @@ TORCHINDUCTOR_FX_GRAPH_CACHE=1 — enables the FX graph cache, which skips recom
 
 Inference Statistics:
 INFO:root:  Total inference steps:       11
-INFO:root:  Avg inference time per step: 0.1628s
+INFO:root:  Avg inference time per step: 0.1616s
 INFO:root:  Min inference time:          0.0470s
-INFO:root:  Max inference time:          0.1754s
-INFO:root:  P90 inference time:          0.1748s
+INFO:root:  Max inference time:          0.1735s
+INFO:root:  P90 inference time:          0.1734s
 6.1hz inference rate
 
 ```bash
