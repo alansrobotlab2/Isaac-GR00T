@@ -104,6 +104,9 @@ pip install
 
 python ../alfiebot_ws/src/alfie_gr00t/alfie_gr00t/scripts/groot_inference_server.py \
   --checkpoint ./alfie-gr00t/checkpoint-10000 \
+  --compile-backbone \
+  --compile-action-head \
+  --execution-horizon 16 \
   --denoising-steps 4 \
   --port 5555
 ```
@@ -226,11 +229,11 @@ TORCHINDUCTOR_FX_GRAPH_CACHE=1 — enables the FX graph cache, which skips recom
 
 
 Inference Statistics:
-INFO:root:  Total inference steps:       12
-INFO:root:  Avg inference time per step: 0.1626s
+INFO:root:  Total inference steps:       11
+INFO:root:  Avg inference time per step: 0.1628s
 INFO:root:  Min inference time:          0.0470s
-INFO:root:  Max inference time:          0.1752s
-INFO:root:  P90 inference time:          0.1733s
+INFO:root:  Max inference time:          0.1754s
+INFO:root:  P90 inference time:          0.1748s
 6.1hz inference rate
 
 ```bash
@@ -248,6 +251,7 @@ python gr00t/eval/open_loop_eval.py \
 --traj-ids 0 \
 --action-horizon 16 \
 --denoising-steps 2 \
+--skip-timing-steps 2 \
 --save-plot-path ./episode000_output_tensorrt.png
 ```
 

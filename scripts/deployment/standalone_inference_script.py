@@ -35,7 +35,8 @@ warnings.simplefilter("ignore", category=FutureWarning)
 
 # Enable TF32 tensor cores for FP32 matmuls (~2x speedup, negligible precision loss).
 # Orin SM87 supports TF32 but PyTorch doesn't enable it by default.
-torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 """
 Combined inference script supporting both PyTorch and TensorRT modes.
@@ -153,6 +154,10 @@ class TensorRTDiTWrapper:
         self._output_buf = None
         self._output_shape = None
 
+        # Cache for TRT context shape setup — shapes are constant at batch=1
+        # with fixed input, so set_input_shape only needs to run once.
+        self._shapes_configured = False
+
 
     def _trt_dtype_to_torch(self, trt_dtype):
         """Convert TensorRT dtype to PyTorch dtype."""
@@ -195,13 +200,17 @@ class TensorRTDiTWrapper:
                 if not backbone_attention_mask.is_contiguous():
                     backbone_attention_mask = backbone_attention_mask.contiguous()
 
-            self.context.set_input_shape("sa_embs", sa_embs.shape)
-            self.context.set_input_shape("vl_embs", vl_embs.shape)
-            self.context.set_input_shape("timestep", timestep.shape)
-            if image_mask is not None:
-                self.context.set_input_shape("image_mask", image_mask.shape)
-            if backbone_attention_mask is not None:
-                self.context.set_input_shape("backbone_attention_mask", backbone_attention_mask.shape)
+            # Set input shapes only once — constant at batch=1 with fixed inputs.
+            # Tensor addresses must be set every call (different tensor pointers).
+            if not self._shapes_configured:
+                self.context.set_input_shape("sa_embs", sa_embs.shape)
+                self.context.set_input_shape("vl_embs", vl_embs.shape)
+                self.context.set_input_shape("timestep", timestep.shape)
+                if image_mask is not None:
+                    self.context.set_input_shape("image_mask", image_mask.shape)
+                if backbone_attention_mask is not None:
+                    self.context.set_input_shape("backbone_attention_mask", backbone_attention_mask.shape)
+                self._shapes_configured = True
 
             self.context.set_tensor_address("sa_embs", sa_embs.data_ptr())
             self.context.set_tensor_address("vl_embs", vl_embs.data_ptr())
@@ -214,8 +223,8 @@ class TensorRTDiTWrapper:
                 )
 
             # Reuse output buffer across diffusion steps (avoids alloc/free churn)
-            output_shape = tuple(self.context.get_tensor_shape("output"))
-            if self._output_shape != output_shape:
+            if self._output_buf is None:
+                output_shape = tuple(self.context.get_tensor_shape("output"))
                 self._output_buf = torch.empty(
                     output_shape, dtype=self.engine_output_dtype, device=f"cuda:{self.device}"
                 )
@@ -231,7 +240,10 @@ class TensorRTDiTWrapper:
             if self.convert_to_bf16:
                 output = self._output_buf.to(torch.bfloat16)
             else:
-                output = self._output_buf.clone()
+                # Safe to return buffer directly (no clone needed): action_decoder
+                # creates new tensors via torch.bmm before the next TRT call
+                # overwrites _output_buf in the next denoising step.
+                output = self._output_buf
 
         # Record event on TRT stream and make default stream wait for it
         event = self.stream.record_event()
@@ -722,9 +734,6 @@ class PipelinedInference:
             collated_inputs: The dict from policy.prepare_inputs(), passed
                              to model.get_action(**collated_inputs).
         """
-        # model.get_action() unpacks collated_inputs as kwargs.
-        # The actual dict structure is {"inputs": {...}} where the inner dict
-        # has the tensors model.prepare_input() needs.
         raw = collated_inputs.get("inputs", collated_inputs)
         with torch.inference_mode():
             backbone_inputs, action_inputs = self.model.prepare_input(raw)

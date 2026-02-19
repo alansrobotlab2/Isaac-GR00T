@@ -1,12 +1,16 @@
 # Backbone TensorRT Optimization: Findings & Next Steps
 
-## Current Best Config: 5.4 Hz (was 2.2 Hz)
+## Current Best Config: 6.1 Hz (was 2.2 Hz)
 
-torch.compile(default) backbone + TRT FP16 DiT + **2-step denoising** = **186ms avg E2E** (~5.4 Hz)
+torch.compile(default) backbone + TRT FP16 DiT + **2-step denoising** + pipeline parallelism + compiled action head + cuDNN benchmark = **163ms avg E2E** (~6.1 Hz)
 
-Previous bests: 240ms (4.2 Hz, 4-step denoising) → 226ms (4.4 Hz, with async prefetch) → **186ms (5.4 Hz, 2-step denoising)**
+Previous bests: 240ms (4.2 Hz, 4-step denoising) → 226ms (4.4 Hz, with async prefetch) → 186ms (5.4 Hz, 2-step denoising) → **163ms (6.1 Hz, full optimization stack)**
 
-**Backbone TRT path exhausted (section 12):** Decomposed softmax + mixed precision fixes quality (cos_sim=0.998) but is 14% slower than flash (180ms vs 158ms). INT8 adds zero speedup (memory-bandwidth-bound). The 7.1 Hz target via TRT INT8 backbone is NOT achievable with current TRT on SM87. Further speedups require: model distillation, action head optimization, or waiting for future TRT versions with FP32-softmax fused MHA.
+**Backbone TRT path exhausted (section 12):** Decomposed softmax + mixed precision fixes quality (cos_sim=0.998) but is 14% slower than flash (180ms vs 158ms). INT8 adds zero speedup (memory-bandwidth-bound). The 7.1 Hz target via TRT INT8 backbone is NOT achievable with current TRT on SM87.
+
+**Pipeline reordering exhausted (section 14):** Overlapping backbone(N+1) with DiT(N) on separate CUDA streams provides zero benefit on Orin AGX — GPU cannot interleave memory-bandwidth-bound kernels on unified memory. 8ms regression from scheduling overhead.
+
+Further speedups require: model distillation, smaller fine-tuned action horizon, or waiting for future TRT versions with FP32-softmax fused MHA.
 
 ## Experimental Results
 
@@ -564,6 +568,69 @@ xq_out = torch.stack([
 
 **Test script:** `scripts/deployment/test_rope_real_valued.py` — validates precompute equivalence, unit-level numerical comparison, ONNX export, and E2E backbone forward pass.
 
+### 14. Pipeline Reordering: Overlap backbone(N+1) with DiT(N)
+
+**Status:** ATTEMPTED — DEAD END on Orin AGX
+
+**Goal:** Achieve true GPU overlap by starting backbone(N+1) on CUDA stream B BEFORE running DiT(N) on the default stream. In the original pipeline code (section 6), backbone(N+1) starts AFTER DiT(N) finishes, getting only ~5ms of head start during inter-step Python overhead.
+
+**Implementation:**
+1. **2-ahead CPU prefetch:** Submit step N+2's CPU preprocessing while step N runs, so step N+1's inputs are always ready before finish_frame(N).
+2. **Double-buffered backbone:** Added `start_next_backbone_async()` which writes to `_next_*` fields (instead of `_pending_*` which finish_frame still needs), and `promote_next_backbone()` to rotate buffers after finish_frame consumes the current frame.
+3. **Reordered eval loop:** At step N > 0: start backbone(N+1) → finish_frame(N) [wait backbone(N) + DiT(N)] → action decode → promote.
+
+**Expected timeline (theoretical):**
+```
+Step N: [start backbone(N+1) ~5ms] [finish_frame: wait ~20ms + DiT 36ms] [decode 5ms]
+        backbone(N+1) runs during entire finish_frame + decode (~60ms overlap)
+        Next step: backbone wait = max(0, 93 - 60) = 33ms
+        Steady state: ~80-90ms/step (10-11 Hz)
+```
+
+**Actual result:** 170.6ms/step (was 162.6ms) — **8ms regression, zero overlap benefit**
+
+**Root cause: Orin AGX unified memory prevents GPU kernel overlap.**
+
+On Orin AGX (SM87, LPDDR5 unified memory), the GPU cannot interleave kernels from different CUDA streams when each kernel saturates the memory bus:
+
+1. **Memory bandwidth contention:** Both backbone (~93ms, memory-bound at batch=1) and DiT TRT (~36ms) compete for the same LPDDR5 bandwidth (~130 GB/s effective). The GPU hardware scheduler serializes memory-bound kernels even when they're on separate streams.
+
+2. **No idle resources to exploit:** Pipeline parallelism works when one operation uses compute while another uses memory bandwidth. Here, both the backbone (loading ~2B parameters from DRAM) and DiT (loading weights for each denoising step) are memory-bandwidth-bound. There are no idle GPU resources for the second stream to use.
+
+3. **Overhead cost:** The reordering added ~8ms of overhead from:
+   - Running `prepare_input(N+1)` synchronously on the main stream before `finish_frame(N)` could start (~5ms)
+   - Double-buffer bookkeeping and stream synchronization events (~2-3ms)
+
+**Why the original pipeline (section 6) showed improvement:**
+
+Section 6 measured a pipeline benefit (274→242ms avg, 11.8% faster) because backbone(N+1) was started during inter-step Python overhead (action decode, numpy, CPU work) — ~5ms of CPU-GPU overlap, not GPU-GPU overlap. The 85ms min latency occurred when backbone(N+1) happened to complete during the previous step's action decode time. The reordering attempted to extend this overlap window to the full DiT execution time, but the GPU couldn't actually run both concurrently.
+
+**Changes reverted.** Pipeline ordering restored to the original: backbone(N+1) starts AFTER finish_frame(N), overlapping only with CPU action decode work. Double-buffering code (`start_next_backbone_async`, `promote_next_backbone`) removed.
+
+**Key takeaway:** On single-GPU unified-memory systems (Jetson Orin), CUDA stream parallelism only helps for CPU-GPU overlap, not GPU-GPU overlap of memory-bound workloads. True pipeline parallelism requires either (a) a multi-GPU setup, (b) one compute-bound + one memory-bound operation, or (c) very small kernels that don't saturate the memory bus.
+
+---
+
+### 15. TRT Wrapper Micro-Optimizations
+
+**Status:** KEPT — minor overhead reduction in TensorRTDiTWrapper
+
+Three small optimizations to reduce per-step overhead in `TensorRTDiTWrapper`:
+
+| Optimization | Savings | Details |
+|-------------|---------|---------|
+| **Eliminate output buffer clone** | ~1-2ms/step | `_output_buf.clone()` was called 2x per step (once per denoising iteration). Safe to return the buffer directly: `action_decoder` creates new tensors via `torch.bmm` before the next TRT call overwrites `_output_buf`. |
+| **Cache TRT context shapes** | ~0.5ms/step | `set_input_shape()` was called for all 5 inputs on every TRT invocation (10 calls/step). Shapes are constant at batch=1 with fixed inputs — now set once, only tensor addresses updated per call. |
+| **TF32 matmul enable** | ~1-2ms/step | Explicitly enable `torch.backends.cuda.matmul.allow_tf32` and `torch.backends.cudnn.allow_tf32` in `open_loop_eval.py` (was already set in `standalone_inference_script.py` via the deprecated `torch.set_float32_matmul_precision("high")`). Uses SM87 TF32 tensor cores for any FP32 matmuls in action encoder/decoder and state encoder. |
+
+**Note:** `torch.set_float32_matmul_precision("high")` replaced with legacy `allow_tf32` API because the new PyTorch 2.8 API (`torch.backends.cuda.matmul.fp32_precision = "tf32"`) conflicts with `torch.compile`'s inductor backend, which still reads the old `allow_tf32` flag for cache hashing. Mixing old and new APIs causes `RuntimeError: mix of legacy and new APIs`. The deprecation warning from the old API is harmless until PyTorch 2.9.
+
+**Files modified:**
+- `scripts/deployment/standalone_inference_script.py` — TRT clone elimination, shape caching, TF32 API update
+- `gr00t/eval/open_loop_eval.py` — TF32 enable added
+
+---
+
 ## Commands
 
 ```bash
@@ -576,12 +643,13 @@ python gr00t/eval/open_loop_eval.py \
     --traj-ids 0 --action-horizon 16 --denoising-steps 4 \
     --skip-timing-steps 2 --save-plot-path ./episode000_baseline.png
 
-# Best config (~186ms, 5.4 Hz)
+# Best config (~163ms, 6.1 Hz)
 python gr00t/eval/open_loop_eval.py \
     --dataset-path alfiebot.CanDoChallenge --embodiment-tag NEW_EMBODIMENT \
     --model-path alfie-gr00t/checkpoint-10000 \
     --inference-mode tensorrt --trt-engine-path groot_n1d6_onnx/dit_fp16.trt \
     --compile-backbone --compile-backbone-mode default \
+    --pipeline-backbone-dit --compile-action-head --cudnn-benchmark \
     --traj-ids 0 --action-horizon 16 --denoising-steps 2 \
     --skip-timing-steps 2 --save-plot-path ./episode000_optimized.png
 ```
@@ -594,7 +662,7 @@ python gr00t/eval/open_loop_eval.py \
 | `scripts/deployment/build_tensorrt_engine.py` | 4D/5D pixel_values auto-detection, BackboneInt8Calibrator 5D support |
 | `scripts/deployment/test_sdpa_backbone.py` | SDPA + torch.compile backbone benchmark |
 | `scripts/deployment/export_backbone_onnx.py` | SDPA attention export support (already existed) |
-| `scripts/deployment/standalone_inference_script.py` | torch.compile, CUDAGraphBackboneWrapper (nn.Module), PipelinedInference, CLI flags |
+| `scripts/deployment/standalone_inference_script.py` | torch.compile, CUDAGraphBackboneWrapper (nn.Module), PipelinedInference, CLI flags, TRT wrapper micro-opts (clone elim, shape caching, TF32) |
 | `scripts/deployment/onnx_fp32_softmax_surgery.py` | ONNX graph surgery: replace Softmax with FP32 decomposed ops |
 | `scripts/deployment/benchmark_fp32_softmax.py` | Quick benchmark for patched TRT engines vs PyTorch flash |
-| `gr00t/eval/open_loop_eval.py` | Async CPU prefetch, pipeline wiring, `--model-action-horizon`, `--compile-action-head`, `--cudnn-benchmark`, timing instrumentation |
+| `gr00t/eval/open_loop_eval.py` | Async CPU prefetch, pipeline wiring, `--model-action-horizon`, `--compile-action-head`, `--cudnn-benchmark`, TF32 enable, timing instrumentation |

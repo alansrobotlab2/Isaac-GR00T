@@ -428,6 +428,12 @@ def main(args: ArgsConfig):
     # Set up logging
     logging.basicConfig(level=logging.INFO)
 
+    # Enable TF32 for FP32 matmuls (action encoder/decoder, state encoder).
+    # ~2x throughput on SM87 tensor cores with negligible precision loss.
+    import torch
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     # Download model checkpoint if it's an S3 path
     local_model_path = args.model_path
 
