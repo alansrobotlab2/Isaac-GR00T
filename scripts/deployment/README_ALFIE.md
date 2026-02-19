@@ -104,10 +104,12 @@ pip install
 
 python ../alfiebot_ws/src/alfie_gr00t/alfie_gr00t/scripts/groot_inference_server.py \
   --checkpoint ./alfie-gr00t/checkpoint-10000 \
+  --trt-engine-path ./groot_n1d6_onnx/dit_fp16.trt \
   --compile-backbone \
+  --compile-backbone-mode default \
   --compile-action-head \
   --execution-horizon 16 \
-  --denoising-steps 4 \
+  --denoising-steps 2 \
   --port 5555
 ```
 
