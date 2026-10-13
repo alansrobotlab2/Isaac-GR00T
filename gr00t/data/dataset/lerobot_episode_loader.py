@@ -538,7 +538,16 @@ class LeRobotEpisodeLoader:
         self, episode_meta: dict, nframes: int, lang_key: str
     ) -> list[str]:
         if lang_key == "task":
-            meta_language = random.choice(episode_meta["tasks"])
+            if "tasks" in episode_meta:
+                meta_language = random.choice(episode_meta["tasks"])
+            else:
+                # Some datasets omit per-episode task metadata; fall back to an empty prompt.
+                if not getattr(self, "_warned_missing_tasks", False):
+                    logging.warning(
+                        "Episode metadata has no 'tasks' entry; using an empty language prompt"
+                    )
+                    self._warned_missing_tasks = True
+                meta_language = ""
             new_languages = [meta_language] * nframes
         elif lang_key == "sub_task":
             action_delta_indices = self.modality_configs["action"].delta_indices

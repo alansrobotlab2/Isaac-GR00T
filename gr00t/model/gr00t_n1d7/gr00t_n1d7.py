@@ -343,12 +343,16 @@ class Gr00tN1d7ActionHead(nn.Module):
         """
         vl_embeds = backbone_features
 
-        # Set initial actions as the sampled noise.
+        # Set initial actions as the sampled noise. The trajectory is integrated in FP32
+        # so that lower-precision DiT outputs (BF16/FP16, PyTorch or TensorRT) don't
+        # compound rounding error across Euler steps; it is cast to the model dtype only
+        # where it enters the action encoder.
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
+        model_dtype = vl_embeds.dtype
         actions = torch.randn(
             size=(batch_size, self.config.action_horizon, self.action_dim),
-            dtype=vl_embeds.dtype,
+            dtype=torch.float32,
             device=device,
         )
 
@@ -393,20 +397,29 @@ class Gr00tN1d7ActionHead(nn.Module):
                 :,
             ] = ramp[None, :, None].to(device)
 
-        # Run denoising steps.
+        # Timestep tensors are static across denoising steps; build them up front.
+        timestep_tensors = []
         for t in range(self.num_inference_timesteps):
             t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
             t_discretized = int(t_cont * self.num_timestep_buckets)
-
-            # Embed noised action trajectory.
-            timesteps_tensor = torch.full(
-                size=(batch_size,), fill_value=t_discretized, device=device
+            timestep_tensors.append(
+                torch.full(size=(batch_size,), fill_value=t_discretized, device=device)
             )
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+        pos_embs = None  # also static; computed once on the first step
+
+        # Run denoising steps.
+        for timesteps_tensor in timestep_tensors:
+            # Embed noised action trajectory.
+            action_features = self.action_encoder(
+                actions.to(model_dtype), timesteps_tensor, embodiment_id
+            )
             # Add position embedding.
             if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+                if pos_embs is None:
+                    pos_ids = torch.arange(
+                        action_features.shape[1], dtype=torch.long, device=device
+                    )
+                    pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
 
             # Join vision, language, state and action embedding along sequence dimension.
@@ -427,16 +440,19 @@ class Gr00tN1d7ActionHead(nn.Module):
                     encoder_hidden_states=vl_embeds,
                     timestep=timesteps_tensor,
                 )
+            # A TensorRT DiT may return a different dtype than the PyTorch decoder weights.
+            if model_output.dtype != self.dtype:
+                model_output = model_output.to(self.dtype)
             pred = self.action_decoder(model_output, embodiment_id)
 
             pred_velocity = pred[:, -self.action_horizon :]
 
-            # Update actions using euler integration.
-            actions = actions + dt * pred_velocity * vel_strength
+            # Update actions using euler integration, accumulating in FP32.
+            actions = actions + dt * pred_velocity.float() * vel_strength
 
         return BatchFeature(
             data={
-                "action_pred": actions,
+                "action_pred": actions.to(model_dtype),
                 "backbone_features": vl_embeds,
                 "state_features": state_features,
             }

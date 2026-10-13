@@ -34,6 +34,13 @@ from gr00t.data.utils import parse_observation_gr00t
 from gr00t.deployment.modes import InferenceMode
 from gr00t.eval._horizon_contract import migrate_deprecated_action_horizon_argv
 from gr00t.policy.gr00t_policy import Gr00tPolicy
+from gr00t.policy.inference_optimizations import (
+    CompileMode,
+    Frame,
+    PipelinedInference,
+    apply_inference_optimizations,
+    run_frames,
+)
 from gr00t.policy.policy import BasePolicy
 from matplotlib import pyplot as plt
 import numpy as np
@@ -352,6 +359,32 @@ def prepare_observation_data(
     return parsed_obs
 
 
+def prepare_model_inputs(
+    policy: BasePolicy,
+    traj: pd.DataFrame,
+    step_count: int,
+    modality_configs: dict[str, Any],
+    embodiment_tag: EmbodimentTag,
+    loader: LeRobotEpisodeLoader,
+) -> Frame:
+    """
+    Full CPU preprocessing for one step: observation extraction + VLA processor + collation.
+
+    Designed to run in a background thread so the whole CPU side overlaps with GPU
+    inference on the previous step. For a remote policy only the observation is prepared.
+
+    Returns:
+        (collated_inputs, states, parsed_obs); the first two are None for a remote policy.
+    """
+    parsed_obs = prepare_observation_data(
+        traj, step_count, modality_configs, embodiment_tag, loader
+    )
+    if not isinstance(policy, Gr00tPolicy):
+        return None, None, parsed_obs
+    collated_inputs, states = policy.prepare_inputs(parsed_obs)
+    return collated_inputs, states, parsed_obs
+
+
 def run_single_trajectory(
     policy: BasePolicy,
     loader: LeRobotEpisodeLoader,
@@ -360,12 +393,14 @@ def run_single_trajectory(
     steps=300,
     execution_horizon=16,
     skip_timing_steps=1,
+    pipeline: PipelinedInference | None = None,
 ):
     """
     Run inference on a single trajectory.
 
     Args:
         skip_timing_steps: Number of initial inference steps to skip when calculating timing statistics
+        pipeline: If given, overlap backbone(i+1) with step i's CPU-side action decoding
 
     Returns: tuple: (
         state_keys,
@@ -407,11 +442,15 @@ def run_single_trajectory(
     modality_configs = deepcopy(loader.modality_configs)
     modality_configs.pop("action")
 
-    # Inference loop with async prefetching
+    # Inference loop with async prefetching: the full CPU preprocessing chain for step
+    # i+1 (observation extraction + VLA processor + collation) runs in a background
+    # thread while the GPU works on step i.
     num_inference_steps = len(range(0, actual_steps, execution_horizon))
     logging.info(f"\nRunning {num_inference_steps} inference steps...")
     logging.info(f"(Skipping first {skip_timing_steps} step(s) for timing statistics)")
-    logging.info("Using async prefetching: preparing step i+1 while GPU processes step i")
+    logging.info("Using async prefetching: preprocessing step i+1 while GPU processes step i")
+    if pipeline is not None:
+        logging.info("Pipelined: backbone(i+1) is launched before step i's actions are decoded")
     logging.info("-" * 80)
 
     # Create thread pool for async data preparation (single worker is sufficient)
@@ -420,42 +459,28 @@ def run_single_trajectory(
     # List of step counts to process
     step_counts = list(range(0, actual_steps, execution_horizon))
 
-    # Prefetch first observation
-    future_obs = executor.submit(
-        prepare_observation_data,
-        traj,
-        step_counts[0],
-        modality_configs,
-        embodiment_tag,
-        loader,
+    # Each future is submitted when run_frames pulls it, i.e. one step ahead of the GPU.
+    frame_futures = (
+        executor.submit(
+            prepare_model_inputs,
+            policy,
+            traj,
+            step_count,
+            modality_configs,
+            embodiment_tag,
+            loader,
+        )
+        for step_count in step_counts
     )
 
-    for step_idx, step_count in enumerate(step_counts):
+    parsed_obs = None
+    frames = run_frames(policy, frame_futures, pipeline=pipeline)
+    for step_idx, (_action_chunk, parsed_obs, data_prep_time, inference_time) in enumerate(frames):
         logging.info(
-            f"\n[Step {step_idx + 1}/{num_inference_steps}] Processing timestep {step_count}"
+            f"\n[Step {step_idx + 1}/{num_inference_steps}] Processed timestep "
+            f"{step_counts[step_idx]} (data prep wait {data_prep_time * 1000:.1f} ms, "
+            f"inference {inference_time * 1000:.1f} ms)"
         )
-
-        # Wait for data preparation to complete (should be ready from prefetch)
-        data_prep_start = time.time()
-        parsed_obs = future_obs.result()  # Blocks until ready
-        data_prep_time = time.time() - data_prep_start
-
-        # Prefetch NEXT observation while GPU runs inference on current one
-        if step_idx + 1 < len(step_counts):
-            next_step_count = step_counts[step_idx + 1]
-            future_obs = executor.submit(
-                prepare_observation_data,
-                traj,
-                next_step_count,
-                modality_configs,
-                embodiment_tag,
-                loader,
-            )
-
-        # Inference timing (GPU processing - CPU prepares next step in parallel)
-        inference_start = time.time()
-        _action_chunk, _ = policy.get_action(parsed_obs)
-        inference_time = time.time() - inference_start
 
         # Only record timing after skipping the first N steps (warmup)
         if step_idx >= skip_timing_steps:
@@ -611,6 +636,32 @@ class ArgsConfig:
     seed: int = 42
     """Seed to use for reproducibility."""
 
+    use_fp16: bool = False
+    """Load the model in FP16 instead of BF16 (faster tensor-core path on Jetson Orin)."""
+
+    attn_implementation: Literal["flash_attention_2", "sdpa"] | None = None
+    """Override the backbone attention implementation. None keeps the checkpoint's setting."""
+
+    compile_backbone: bool = False
+    """torch.compile the backbone (skipped when the backbone runs in TensorRT)."""
+
+    compile_dit: bool = False
+    """torch.compile the DiT (skipped when the DiT runs in TensorRT)."""
+
+    compile_action_head: bool = False
+    """torch.compile the action encoder/decoder used inside the denoising loop."""
+
+    compile_mode: CompileMode = "default"
+    """torch.compile mode for --compile-backbone / --compile-dit. 'reduce-overhead' and
+    'max-autotune' use CUDA graphs internally and need a much longer warmup."""
+
+    tf32: bool = True
+    """Enable TF32 tensor cores for the FP32 matmuls left in the pipeline."""
+
+    pipeline_backbone_dit: bool = False
+    """Launch backbone(i+1) on a side CUDA stream before decoding step i's actions
+    (overlaps GPU work with the CPU-side action decode)."""
+
 
 def main(args: ArgsConfig):
     # Set up logging
@@ -623,10 +674,21 @@ def main(args: ArgsConfig):
     logging.info(f"Trajectories: {args.traj_ids}")
     logging.info(f"Steps per trajectory: {args.steps}")
     logging.info(f"Execution Horizon: {args.execution_horizon}")
+    logging.info(f"Denoising Steps: {args.denoising_steps}")
     logging.info(f"Skip Timing Steps: {args.skip_timing_steps}")
     logging.info(f"Inference Mode: {args.inference_mode}")
     if args.inference_mode == "tensorrt":
         logging.info(f"TensorRT Engine: {args.trt_engine_path}")
+    logging.info(f"Model dtype: {'fp16' if args.use_fp16 else 'bf16'}")
+    if args.attn_implementation:
+        logging.info(f"Attention Implementation: {args.attn_implementation}")
+    if args.compile_backbone or args.compile_dit or args.compile_action_head:
+        logging.info(
+            f"torch.compile: backbone={args.compile_backbone} dit={args.compile_dit} "
+            f"action_head={args.compile_action_head} (mode={args.compile_mode})"
+        )
+    if args.pipeline_backbone_dit:
+        logging.info("Pipeline: backbone(i+1) overlaps with step i's action decode")
     logging.info(f"Seed: {args.seed}")
     set_seed(args.seed)
     logging.info("=" * 80)
@@ -664,6 +726,8 @@ def main(args: ArgsConfig):
         embodiment_tag=args.embodiment_tag,
         model_path=local_model_path,
         device="cuda" if torch.cuda.is_available() else "cpu",
+        use_fp16=args.use_fp16,
+        attn_implementation=args.attn_implementation,
     )
     # Apply --denoising-steps: the action head reads num_inference_timesteps at
     # sampling time (honored by the PyTorch and TensorRT denoising loops alike).
@@ -692,8 +756,17 @@ def main(args: ArgsConfig):
     else:
         logging.info("  PyTorch mode enabled")
 
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
+    # Must come after the TRT setup so components already replaced by engines are skipped.
+    apply_inference_optimizations(
+        policy,
+        compile_backbone=args.compile_backbone,
+        compile_dit=args.compile_dit,
+        compile_action_head=args.compile_action_head,
+        compile_mode=args.compile_mode,
+        cudnn_benchmark=True,
+        tf32=args.tf32,
+    )
+    pipeline = PipelinedInference(policy) if args.pipeline_backbone_dit else None
     model_load_time = time.time() - model_load_start
     logging.info(f"Model loading time: {model_load_time:.4f} seconds")
 
@@ -760,6 +833,7 @@ def main(args: ArgsConfig):
             steps=args.steps,
             execution_horizon=args.execution_horizon,
             skip_timing_steps=args.skip_timing_steps,
+            pipeline=pipeline,
         )
         pred_actions.append(pred_action_across_time)
 

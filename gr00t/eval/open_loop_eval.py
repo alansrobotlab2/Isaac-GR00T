@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
 import logging
 from pathlib import Path
+import random
 import re
-from typing import Any
+import time
+from typing import Any, Literal
 import warnings
 
 from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
@@ -28,10 +31,17 @@ from gr00t.data.utils import parse_observation_gr00t
 from gr00t.eval._horizon_contract import PolicyHorizonSpec, migrate_deprecated_action_horizon_argv
 from gr00t.policy import BasePolicy
 from gr00t.policy.gr00t_policy import Gr00tPolicy
+from gr00t.policy.inference_optimizations import (
+    CompileMode,
+    PipelinedInference,
+    apply_inference_optimizations,
+    run_frames,
+)
 from gr00t.policy.server_client import PolicyClient
 from matplotlib import pyplot as plt
 import numpy as np
 import pandas as pd
+import torch
 import tyro
 
 
@@ -142,9 +152,25 @@ def evaluate_single_trajectory(
     steps=300,
     execution_horizon=16,
     save_plot_path=None,
+    skip_timing_steps: int = 1,
+    pipeline: PipelinedInference | None = None,
+    timing_dict: dict[str, Any] | None = None,
 ):
+    """Run open-loop inference over one trajectory and return (mse, mae).
+
+    Args:
+        skip_timing_steps: Initial inference steps excluded from timing statistics (warmup)
+        pipeline: If given, overlap backbone(i+1) with step i's CPU-side action decoding
+        timing_dict: If given, filled with ``episode_load_time`` and per-step
+            ``data_prep_times`` / ``inference_times`` (seconds)
+    """
     # Ensure steps doesn't exceed trajectory length
+    episode_load_start = time.perf_counter()
     traj = loader[traj_id]
+    if timing_dict is not None:
+        timing_dict["episode_load_time"] = time.perf_counter() - episode_load_start
+        timing_dict.setdefault("data_prep_times", [])
+        timing_dict.setdefault("inference_times", [])
     traj_length = len(traj)
     actual_steps = min(steps, traj_length)
     logging.info(
@@ -168,9 +194,11 @@ def evaluate_single_trajectory(
 
     modality_configs = deepcopy(loader.modality_configs)
     modality_configs.pop("action")
-    for step_count in range(0, actual_steps, execution_horizon):
+    step_counts = list(range(0, actual_steps, execution_horizon))
+
+    def prepare_model_inputs(step_count: int):
+        """Full CPU preprocessing for one step (observation -> VLA processor -> collation)."""
         data_point = extract_step_data(traj, step_count, modality_configs, embodiment_tag)
-        logging.info(f"inferencing at step: {step_count}")
         obs = {}
         for k, v in data_point.states.items():
             obs[f"state.{k}"] = v  # (T, D)
@@ -179,19 +207,36 @@ def evaluate_single_trajectory(
         for language_key in loader.modality_configs["language"].modality_keys:
             obs[language_key] = data_point.text
         parsed_obs = parse_observation_gr00t(obs, loader.modality_configs)
-        _action_chunk, _ = policy.get_action(parsed_obs)
-        action_chunk = parse_action_gr00t(_action_chunk)
-        for j in range(execution_horizon):
-            # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
-            # the np.atleast_1d is to ensure the action is a 1D array, handle where single value is returned
-            concat_pred_action = np.concatenate(
-                [
-                    np.atleast_1d(np.atleast_1d(action_chunk[f"action.{key}"])[j])
-                    for key in action_keys
-                ],
-                axis=0,
+        if not isinstance(policy, Gr00tPolicy):
+            return None, None, parsed_obs  # remote policy: preprocessing is server-side
+        collated_inputs, states = policy.prepare_inputs(parsed_obs)
+        return collated_inputs, states, parsed_obs
+
+    # CPU preprocessing for step i+1 runs in a background thread while the GPU works on
+    # step i; each future is submitted when run_frames pulls it (one step of lookahead).
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        frame_futures = (executor.submit(prepare_model_inputs, sc) for sc in step_counts)
+        frames = run_frames(policy, frame_futures, pipeline=pipeline)
+        for step_idx, (_action_chunk, _, data_prep_time, inference_time) in enumerate(frames):
+            logging.info(
+                f"inferenced step {step_counts[step_idx]}: data prep wait "
+                f"{data_prep_time * 1000:.1f} ms, inference {inference_time * 1000:.1f} ms"
             )
-            pred_action_across_time.append(concat_pred_action)
+            if timing_dict is not None and step_idx >= skip_timing_steps:
+                timing_dict["data_prep_times"].append(data_prep_time)
+                timing_dict["inference_times"].append(inference_time)
+            action_chunk = parse_action_gr00t(_action_chunk)
+            for j in range(execution_horizon):
+                # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
+                # the np.atleast_1d is to ensure the action is a 1D array, handle where single value is returned
+                concat_pred_action = np.concatenate(
+                    [
+                        np.atleast_1d(np.atleast_1d(action_chunk[f"action.{key}"])[j])
+                        for key in action_keys
+                    ],
+                    axis=0,
+                )
+                pred_action_across_time.append(concat_pred_action)
 
     def extract_state_joints(traj: pd.DataFrame, columns: list[str]):
         np_dict = {}
@@ -272,11 +317,58 @@ class ArgsConfig:
     modality_keys: list[str] | None = None
     """List of modality keys to plot. If None, plot all keys."""
 
+    skip_timing_steps: int = 1
+    """Number of initial inference steps to skip when calculating timing statistics (warmup)."""
+
+    seed: int = 42
+    """Seed for the RNGs (noise sampling). Does not force deterministic kernels."""
+
+    use_fp16: bool = False
+    """Load the model in FP16 instead of BF16 (faster tensor-core path on Jetson Orin)."""
+
+    attn_implementation: Literal["flash_attention_2", "sdpa"] | None = None
+    """Override the backbone attention implementation. None keeps the checkpoint's setting."""
+
+    compile_backbone: bool = False
+    """torch.compile the backbone."""
+
+    compile_dit: bool = False
+    """torch.compile the DiT."""
+
+    compile_action_head: bool = False
+    """torch.compile the action encoder/decoder used inside the denoising loop."""
+
+    compile_mode: CompileMode = "default"
+    """torch.compile mode for --compile-backbone / --compile-dit. 'reduce-overhead' and
+    'max-autotune' use CUDA graphs internally and need a much longer warmup."""
+
+    cudnn_benchmark: bool = False
+    """Let cuDNN autotune conv algorithms for the fixed inference input shapes."""
+
+    tf32: bool = True
+    """Enable TF32 tensor cores for the FP32 matmuls left in the pipeline."""
+
+    model_action_horizon: int | None = None
+    """Override the action head's action_horizon at inference time. Smaller values shrink
+    the denoising-loop tensors but hurt quality if the model was trained on a longer horizon."""
+
+    pipeline_backbone_dit: bool = False
+    """Launch backbone(i+1) on a side CUDA stream before decoding step i's actions
+    (overlaps GPU work with the CPU-side action decode)."""
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
 
 def main(args: ArgsConfig):
     args.embodiment_tag = EmbodimentTag.resolve(args.embodiment_tag)
     # Set up logging
     logging.basicConfig(level=logging.INFO)
+    _seed_everything(args.seed)
 
     # Download model checkpoint if it's an S3 path
     local_model_path = args.model_path
@@ -297,13 +389,14 @@ def main(args: ArgsConfig):
         else:
             logging.warning(f"Could not find checkpoint-<step> pattern in path: {local_model_path}")
 
+    model_load_start = time.perf_counter()
     if local_model_path is not None:
-        import torch
-
         policy = Gr00tPolicy(
             embodiment_tag=args.embodiment_tag,
             model_path=local_model_path,
             device="cuda" if torch.cuda.is_available() else "cpu",
+            use_fp16=args.use_fp16,
+            attn_implementation=args.attn_implementation,
         )
         # Apply --denoising-steps: the action head reads num_inference_timesteps
         # at sampling time.
@@ -319,21 +412,43 @@ def main(args: ArgsConfig):
                 args.denoising_steps,
             )
 
+    # No-op (with a warning) for a remote policy.
+    apply_inference_optimizations(
+        policy,
+        compile_backbone=args.compile_backbone,
+        compile_dit=args.compile_dit,
+        compile_action_head=args.compile_action_head,
+        compile_mode=args.compile_mode,
+        cudnn_benchmark=args.cudnn_benchmark,
+        tf32=args.tf32,
+        model_action_horizon=args.model_action_horizon,
+    )
+    pipeline = None
+    if args.pipeline_backbone_dit:
+        if isinstance(policy, Gr00tPolicy):
+            pipeline = PipelinedInference(policy)
+        else:
+            logging.warning("--pipeline-backbone-dit is ignored for a remote policy.")
+    model_load_time = time.perf_counter() - model_load_start
+
     # Get the supported modalities for the policy
     modality = policy.get_modality_config()
     logging.info(f"Current modality config: \n{modality}")
 
     # Create the dataset
+    dataset_load_start = time.perf_counter()
     dataset = LeRobotEpisodeLoader(
         dataset_path=args.dataset_path,
         modality_configs=modality,
     )
+    dataset_load_time = time.perf_counter() - dataset_load_start
 
     logging.info(f"Dataset length: {len(dataset)}")
     logging.info(f"Running evaluation on trajectories: {args.traj_ids}")
 
     all_mse = []
     all_mae = []
+    all_timings = []
 
     for traj_id in args.traj_ids:
         if traj_id >= len(dataset):
@@ -341,6 +456,7 @@ def main(args: ArgsConfig):
             continue
 
         logging.info(f"Running trajectory: {traj_id}")
+        timing_dict: dict[str, Any] = {}
         mse, mae = evaluate_single_trajectory(
             policy,
             dataset,
@@ -350,11 +466,18 @@ def main(args: ArgsConfig):
             steps=args.steps,
             execution_horizon=args.execution_horizon,
             save_plot_path=args.save_plot_path,
+            skip_timing_steps=args.skip_timing_steps,
+            pipeline=pipeline,
+            timing_dict=timing_dict,
         )
         logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
         all_mse.append(mse)
         all_mae.append(mae)
+        all_timings.append(timing_dict)
 
+    logging.info("\n" + "=" * 80)
+    logging.info("=== EVALUATION SUMMARY ===")
+    logging.info("=" * 80)
     if all_mse:
         avg_mse = np.mean(np.array(all_mse))
         avg_mae = np.mean(np.array(all_mae))
@@ -362,6 +485,31 @@ def main(args: ArgsConfig):
         logging.info(f"Average MAE across all trajs: {avg_mae}")
     else:
         logging.info("No valid trajectories were evaluated.")
+
+    logging.info("\n=== TIMING SUMMARY ===")
+    logging.info(f"  Model loading time:          {model_load_time:.4f}s")
+    logging.info(f"  Dataset loader creation:     {dataset_load_time:.4f}s")
+    inference_times = [t for timing in all_timings for t in timing.get("inference_times", [])]
+    if inference_times:
+        episode_load = sum(t.get("episode_load_time", 0.0) for t in all_timings)
+        prep_waits = [t for timing in all_timings for t in timing.get("data_prep_times", [])]
+        logging.info(
+            f"  Episode loading:             {episode_load:.4f}s total over {len(all_timings)} trajs"
+        )
+        logging.info(f"  Timed inference steps:       {len(inference_times)}")
+        logging.info(f"  Avg inference time per step: {np.mean(inference_times):.4f}s")
+        logging.info(
+            f"  Min / Max inference time:    {min(inference_times):.4f}s / {max(inference_times):.4f}s"
+        )
+        logging.info(f"  P90 inference time:          {np.percentile(inference_times, 90):.4f}s")
+        logging.info(f"  Avg data prep wait:          {np.mean(prep_waits):.4f}s (async prefetch)")
+        logging.info(
+            f"  Optimizations: compile backbone={args.compile_backbone} dit={args.compile_dit} "
+            f"action_head={args.compile_action_head} (mode={args.compile_mode}), "
+            f"pipeline={pipeline is not None}, cudnn_benchmark={args.cudnn_benchmark}, "
+            f"tf32={args.tf32}, denoising_steps={args.denoising_steps}, "
+            f"model_action_horizon={args.model_action_horizon}, fp16={args.use_fp16}"
+        )
     logging.info("Done")
 
 

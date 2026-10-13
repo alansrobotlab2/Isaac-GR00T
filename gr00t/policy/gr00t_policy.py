@@ -21,7 +21,7 @@ This module provides the core policy classes for running Gr00t models:
 """
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -87,6 +87,8 @@ class Gr00tPolicy(BasePolicy):
         *,
         device: int | str,
         strict: bool = True,
+        use_fp16: bool = False,
+        attn_implementation: Literal["flash_attention_2", "sdpa"] | None = None,
     ):
         """Initialize the Gr00t Policy.
 
@@ -96,6 +98,10 @@ class Gr00tPolicy(BasePolicy):
             model_path: Path to the pretrained model checkpoint directory
             device: Device to run the model on (e.g., 'cuda:0', 0, 'cpu')
             strict: Whether to enforce strict input validation (default: True)
+            use_fp16: Load the model in float16 instead of bfloat16. FP16 measured faster
+                than BF16 on Jetson Orin in the N1.6 optimization work (default: False)
+            attn_implementation: Override the backbone attention implementation
+                ("flash_attention_2" or "sdpa"). None keeps the checkpoint's setting.
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -105,10 +111,17 @@ class Gr00tPolicy(BasePolicy):
             embodiment_tag = EmbodimentTag.resolve(embodiment_tag)
         model_dir = Path(model_path)
 
-        # Load the pretrained model and move to target device with bfloat16 precision
-        model = AutoModel.from_pretrained(model_dir)
+        # Load the weights directly in the inference dtype: this avoids materializing
+        # FP32 weights first (halves peak host memory on unified-memory devices) and
+        # skips the FP32 upcast of trainable backbone params, which only matters for
+        # training.
+        self.model_dtype = torch.float16 if use_fp16 else torch.bfloat16
+        config_overrides: dict[str, Any] = {"backbone_trainable_params_fp32": False}
+        if attn_implementation is not None:
+            config_overrides["use_flash_attention"] = attn_implementation == "flash_attention_2"
+        model = AutoModel.from_pretrained(model_dir, dtype=self.model_dtype, **config_overrides)
         model.eval()  # Set model to evaluation mode
-        model.to(device=device, dtype=torch.bfloat16)
+        model.to(device=device, dtype=self.model_dtype)
         self.model = model
 
         # Load the processor for input/output transformation.
@@ -377,6 +390,78 @@ class Gr00tPolicy(BasePolicy):
                     f"Language batch item must be a string. Got {type(batch_item[0])}"
                 )
 
+    def _prepare_inputs(
+        self, observation: dict[str, Any]
+    ) -> tuple[dict[str, Any], list[dict[str, np.ndarray]]]:
+        # Step 1: Split batched observation into individual observations
+        unbatched_observations = self._unbatch_observation(observation)
+        processed_inputs = []
+
+        # Step 2: Process each observation through the VLA processor
+        states = []
+        for obs in unbatched_observations:
+            vla_step_data = self._to_vla_step_data(obs)
+            states.append(vla_step_data.states)  # dict[str, np.ndarray[np.float32, (T, D)]]
+            messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
+            processed_inputs.append(self.processor(messages))
+
+        # Step 3: Collate processed inputs into a single batch for model
+        collated_inputs = self.collate_fn(processed_inputs)
+        collated_inputs = _rec_to_dtype(collated_inputs, dtype=self.model_dtype)
+        return collated_inputs, states
+
+    def _decode_model_output(
+        self, model_pred: Any, states: list[dict[str, np.ndarray]]
+    ) -> dict[str, np.ndarray]:
+        normalized_action = model_pred["action_pred"].float()
+
+        # Decode actions from normalized space back to physical units
+        batched_states = {}
+        for k in self.modality_configs["state"].modality_keys:
+            batched_states[k] = np.stack([s[k] for s in states], axis=0)  # (B, T, D)
+        unnormalized_action = self.processor.decode_action(
+            normalized_action.cpu().numpy(), self.embodiment_tag, batched_states
+        )
+
+        # Cast all actions to float32 for consistency
+        return {key: value.astype(np.float32) for key, value in unnormalized_action.items()}
+
+    def prepare_inputs(
+        self, observation: dict[str, Any]
+    ) -> tuple[dict[str, Any], list[dict[str, np.ndarray]]]:
+        """Preprocess a batched observation into model-ready inputs (CPU only).
+
+        Runs validation, the VLA processor, collation and dtype conversion. The result
+        feeds ``run_model``. Safe to call from a background thread to overlap with GPU
+        inference on the previous step.
+
+        Returns:
+            Tuple of (collated_inputs, states); ``states`` is needed by ``decode_model_output``.
+        """
+        if self.strict:
+            self.check_observation(observation)
+        return self._prepare_inputs(observation)
+
+    def run_model(self, collated_inputs: dict[str, Any]) -> Any:
+        """Run model inference on inputs from ``prepare_inputs`` (GPU side)."""
+        with torch.inference_mode():
+            return self.model.get_action(**collated_inputs)
+
+    def decode_model_output(
+        self, model_pred: Any, states: list[dict[str, np.ndarray]]
+    ) -> dict[str, np.ndarray]:
+        """Decode a ``run_model`` result into validated float32 actions in physical units."""
+        action = self._decode_model_output(model_pred, states)
+        if self.strict:
+            self.check_action(action)
+        return action
+
+    def run_inference(
+        self, collated_inputs: dict[str, Any], states: list[dict[str, np.ndarray]]
+    ) -> dict[str, np.ndarray]:
+        """``run_model`` followed by ``decode_model_output``."""
+        return self.decode_model_output(self.run_model(collated_inputs), states)
+
     def _get_action(
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -396,39 +481,9 @@ class Gr00tPolicy(BasePolicy):
         Returns:
             Tuple of (actions_dict, info_dict)
         """
-        # Step 1: Split batched observation into individual observations
-        unbatched_observations = self._unbatch_observation(observation)
-        processed_inputs = []
-
-        # Step 2: Process each observation through the VLA processor
-        states = []
-        for obs in unbatched_observations:
-            vla_step_data = self._to_vla_step_data(obs)
-            states.append(vla_step_data.states)  # dict[str, np.ndarray[np.float32, (T, D)]]
-            messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
-            processed_inputs.append(self.processor(messages))
-
-        # Step 3: Collate processed inputs into a single batch for model
-        collated_inputs = self.collate_fn(processed_inputs)
-        collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
-
-        # Step 4: Run model inference to predict actions
-        with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
-        normalized_action = model_pred["action_pred"].float()
-
-        # Step 5: Decode actions from normalized space back to physical units
-        batched_states = {}
-        for k in self.modality_configs["state"].modality_keys:
-            batched_states[k] = np.stack([s[k] for s in states], axis=0)  # (B, T, D)
-        unnormalized_action = self.processor.decode_action(
-            normalized_action.cpu().numpy(), self.embodiment_tag, batched_states
-        )
-
-        # Cast all actions to float32 for consistency
-        casted_action = {
-            key: value.astype(np.float32) for key, value in unnormalized_action.items()
-        }
+        collated_inputs, states = self._prepare_inputs(observation)
+        model_pred = self.run_model(collated_inputs)
+        casted_action = self._decode_model_output(model_pred, states)
         return casted_action, {}
 
     def check_action(self, action: dict[str, Any]) -> None:
