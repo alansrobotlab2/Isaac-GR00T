@@ -605,7 +605,9 @@ _MANDATORY_ENGINES = {
 }
 
 
-def setup_tensorrt_engines(policy, trt_engine_path, mode=InferenceMode.n17_full_pipeline):
+def setup_tensorrt_engines(
+    policy, trt_engine_path, mode=InferenceMode.n17_full_pipeline, use_vit_engine=True
+):
     """Load TRT engines, delete PyTorch modules, and monkey-patch forward methods.
 
     Args:
@@ -613,6 +615,10 @@ def setup_tensorrt_engines(policy, trt_engine_path, mode=InferenceMode.n17_full_
         trt_engine_path: Path to directory containing TRT engine files
         mode: an :class:`~gr00t.deployment.modes.InferenceMode` (or its string
             value) selecting which engine subset to swap in. Invalid values raise.
+        use_vit_engine: ``n17_full_pipeline`` only. False keeps the ViT in PyTorch
+            even when a ViT engine is present (LLM + action head still run in TRT).
+            The ViT engine is FP32, which on Jetson Orin is slower than the BF16
+            PyTorch ViT with flash attention.
     """
     mode = InferenceMode(mode)
     required = _MANDATORY_ENGINES.get(mode)
@@ -631,7 +637,10 @@ def setup_tensorrt_engines(policy, trt_engine_path, mode=InferenceMode.n17_full_
     # mismatched image config. None for older bundles (no recorded grid).
     policy.model.backbone._vit_baked_grid_thw = _meta.get("vit_grid_thw") if _meta else None
 
-    _INFERENCE_MODE_DISPATCH[mode](policy, trt_engine_path)
+    if mode == InferenceMode.n17_full_pipeline:
+        _setup_n17_full_pipeline(policy, trt_engine_path, use_vit_engine=use_vit_engine)
+    else:
+        _INFERENCE_MODE_DISPATCH[mode](policy, trt_engine_path)
 
 
 def close_tensorrt_engines(policy):
@@ -674,7 +683,7 @@ def closing_tensorrt_engines(policy):
         close_tensorrt_engines(policy)
 
 
-def _setup_n17_full_pipeline(policy, trt_engine_path):
+def _setup_n17_full_pipeline(policy, trt_engine_path, use_vit_engine=True):
     """Set up TRT engines for N1.7: ViT TRT + LLM TRT + Action Head TRT.
 
     The Qwen3-VL backbone's vision encoder and text model are both replaced
@@ -694,13 +703,16 @@ def _setup_n17_full_pipeline(policy, trt_engine_path):
 
     # Load ViT TRT engine (optional — PyTorch ViT used as fallback for accuracy)
     vit_engine_path = _resolve_vit_engine_path(trt_engine_path)
-    use_vit_trt = os.path.exists(vit_engine_path)
+    use_vit_trt = use_vit_engine and os.path.exists(vit_engine_path)
     if use_vit_trt:
         print(f"Loading ViT engine: {vit_engine_path}")
         backbone.vit_engine = Engine(vit_engine_path)
         del qwen_model.model.visual
         torch.cuda.empty_cache()
         print("  Deleted PyTorch ViT (replaced by TRT engine)")
+    elif not use_vit_engine:
+        backbone.vit_engine = None
+        print("  ViT engine disabled (use_vit_engine=False), keeping PyTorch ViT")
     else:
         backbone.vit_engine = None
         print(f"  ViT engine not found at {vit_engine_path}, keeping PyTorch ViT")

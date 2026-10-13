@@ -621,6 +621,11 @@ class ArgsConfig:
     trt_engine_path: str = "./gr00t_trt_deployment/engines"
     """Path to TensorRT engine file or directory. For 'tensorrt': single .trt file. For 'trt_full_pipeline': engine directory."""
 
+    trt_pytorch_vit: bool = False
+    """With 'trt_full_pipeline': keep the ViT in PyTorch and run only the LLM and action
+    head in TensorRT. Faster on Jetson Orin, where the FP32 ViT engine is slower than the
+    BF16 PyTorch ViT with flash attention."""
+
     denoising_steps: int = 4
     """Number of denoising steps to use."""
 
@@ -743,8 +748,16 @@ def main(args: ArgsConfig):
         # engine was baked for a different static batch instead of hitting a cryptic
         # "Invalid input shape" inside Engine.forward().
         resolve_batch_size(args.trt_engine_path, 1, source="standalone_inference_script")
-        setup_tensorrt_engines(policy, args.trt_engine_path, mode=InferenceMode.n17_full_pipeline)
-        logging.info("  TRT full-pipeline mode enabled")
+        setup_tensorrt_engines(
+            policy,
+            args.trt_engine_path,
+            mode=InferenceMode.n17_full_pipeline,
+            use_vit_engine=not args.trt_pytorch_vit,
+        )
+        logging.info(
+            "  TRT full-pipeline mode enabled"
+            + (" (ViT kept in PyTorch)" if args.trt_pytorch_vit else "")
+        )
     elif args.inference_mode == "tensorrt":
         logging.info(f"Replacing DiT with TensorRT engine: {args.trt_engine_path}")
         dit_engine_path = args.trt_engine_path

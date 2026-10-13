@@ -35,6 +35,7 @@ from gr00t.policy.inference_optimizations import (
     CompileMode,
     PipelinedInference,
     apply_inference_optimizations,
+    load_tensorrt_engines,
     run_frames,
 )
 from gr00t.policy.server_client import PolicyClient
@@ -329,6 +330,13 @@ class ArgsConfig:
     attn_implementation: Literal["flash_attention_2", "sdpa"] | None = None
     """Override the backbone attention implementation. None keeps the checkpoint's setting."""
 
+    trt_engine_path: str | None = None
+    """Directory of full-pipeline TensorRT engines built by
+    scripts/deployment/build_trt_pipeline.py. None runs the model in PyTorch."""
+
+    trt_pytorch_vit: bool = False
+    """With --trt-engine-path: keep the ViT in PyTorch (LLM and action head still in TensorRT)."""
+
     compile_backbone: bool = False
     """torch.compile the backbone."""
 
@@ -402,6 +410,10 @@ def main(args: ArgsConfig):
         # at sampling time.
         policy.model.action_head.num_inference_timesteps = args.denoising_steps
         logging.info(f"Using {args.denoising_steps} denoising steps")
+        if args.trt_engine_path is not None:
+            load_tensorrt_engines(
+                policy, args.trt_engine_path, use_vit_engine=not args.trt_pytorch_vit
+            )
     else:
         policy = PolicyClient(host=args.host, port=args.port)
         if args.denoising_steps != ArgsConfig.denoising_steps:
@@ -412,6 +424,7 @@ def main(args: ArgsConfig):
                 args.denoising_steps,
             )
 
+    # After the TRT setup, so components already replaced by engines are skipped.
     # No-op (with a warning) for a remote policy.
     apply_inference_optimizations(
         policy,

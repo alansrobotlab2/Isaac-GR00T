@@ -19,10 +19,16 @@ import json
 import os
 from pathlib import Path
 import sys
+from typing import Literal
 
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import ModalityConfig
 from gr00t.policy.gr00t_policy import Gr00tPolicy
+from gr00t.policy.inference_optimizations import (
+    CompileMode,
+    apply_inference_optimizations,
+    load_tensorrt_engines,
+)
 from gr00t.policy.replay_policy import ReplayPolicy
 from gr00t.policy.server_client import PolicyServer
 import tyro
@@ -87,6 +93,32 @@ class ServerConfig:
     use_sim_policy_wrapper: bool = False
     """Whether to use the sim policy wrapper"""
 
+    # Inference optimizations (Gr00t policy only; see INFERENCE_OPTIMIZATIONS_N1D7.md)
+    denoising_steps: int | None = None
+    """Number of denoising steps. None keeps the checkpoint's setting."""
+
+    trt_engine_path: str | None = None
+    """Directory of full-pipeline TensorRT engines built by
+    scripts/deployment/build_trt_pipeline.py. None runs the model in PyTorch."""
+
+    trt_pytorch_vit: bool = False
+    """With --trt-engine-path: keep the ViT in PyTorch (LLM and action head still in TensorRT)."""
+
+    attn_implementation: Literal["flash_attention_2", "sdpa"] | None = None
+    """Override the backbone attention implementation. None keeps the checkpoint's setting."""
+
+    compile_backbone: bool = False
+    """torch.compile the backbone (needs --attn-implementation sdpa; skipped under TensorRT)."""
+
+    compile_dit: bool = False
+    """torch.compile the DiT (skipped under TensorRT)."""
+
+    compile_action_head: bool = False
+    """torch.compile the action encoder/decoder (skipped under TensorRT)."""
+
+    compile_mode: CompileMode = "default"
+    """torch.compile mode for --compile-backbone / --compile-dit."""
+
 
 def main(config: ServerConfig):
     config.embodiment_tag = EmbodimentTag.resolve(config.embodiment_tag)
@@ -107,6 +139,24 @@ def main(config: ServerConfig):
             model_path=config.model_path,
             device=config.device,
             strict=config.strict,
+            attn_implementation=config.attn_implementation,
+        )
+        if config.denoising_steps is not None:
+            # The action head reads num_inference_timesteps at sampling time.
+            policy.model.action_head.num_inference_timesteps = config.denoising_steps
+            print(f"  Denoising steps: {config.denoising_steps}")
+        if config.trt_engine_path is not None:
+            load_tensorrt_engines(
+                policy, config.trt_engine_path, use_vit_engine=not config.trt_pytorch_vit
+            )
+            print(f"  TensorRT engines: {config.trt_engine_path}")
+        # After the TRT setup, so components already replaced by engines are skipped.
+        apply_inference_optimizations(
+            policy,
+            compile_backbone=config.compile_backbone,
+            compile_dit=config.compile_dit,
+            compile_action_head=config.compile_action_head,
+            compile_mode=config.compile_mode,
         )
     elif config.dataset_path is not None:
         if config.execution_horizon is None:

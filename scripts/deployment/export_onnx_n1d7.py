@@ -1463,10 +1463,18 @@ def main(args):
         logger.info("\n[Step 4] Exporting full pipeline to ONNX...")
         logger.info("  (ViT TRT + LLM TRT + Action Head TRT)")
 
-        # 4a. ViT — exported in FP32 to avoid TRT BF16 kernel fusion accuracy issues
+        # 4a. ViT — exported in FP32 by default to avoid TRT BF16 kernel fusion accuracy
+        # issues; --vit-precision bf16 trades that margin for a much faster engine.
         # ViT is patch-level: for batch_size > 1, num_patches scales by batch_size
-        logger.info("\n--- [4a] ViT (Qwen3-VL Vision, FP32 for TRT accuracy) ---")
-        export_vit_to_onnx(policy, args.output_dir, vit_capture, use_bf16=False, batch_size=bs)
+        vit_bf16 = args.vit_precision == "bf16"
+        logger.info(f"\n--- [4a] ViT (Qwen3-VL Vision, {args.vit_precision.upper()}) ---")
+        export_vit_to_onnx(policy, args.output_dir, vit_capture, use_bf16=vit_bf16, batch_size=bs)
+        # The engine builder prefers vit_fp32.onnx when both variants exist, so drop a
+        # stale export of the other precision left over from a previous run.
+        stale_vit = os.path.join(args.output_dir, "vit_fp32.onnx" if vit_bf16 else "vit_bf16.onnx")
+        if os.path.exists(stale_vit):
+            os.remove(stale_vit)
+            logger.info(f"  Removed stale {os.path.basename(stale_vit)}")
 
         # 4b. LLM
         logger.info("\n--- [4b] LLM (Qwen3-VL Text Model) ---")
@@ -1542,6 +1550,11 @@ class ExportConfig:
     requires plumbing this field into each exporter first; until then
     the Literal is narrowed so the CLI cannot accept a value the export
     will ignore."""
+
+    vit_precision: Literal["fp32", "bf16"] = "fp32"
+    """Precision of the ViT ONNX graph ('full_pipeline' only). 'fp32' (default) keeps the
+    largest accuracy margin. 'bf16' roughly halves ViT latency on Jetson Orin, where the
+    FP32 engine is memory-bandwidth-bound; check it with verify_n1d7_trt.py."""
 
     batch_size: int = 1
     """Batch size baked into the exported ONNX models (default: 1)."""

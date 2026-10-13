@@ -13,19 +13,24 @@
 > - `--compile-backbone`, `--compile-dit`, `--compile-action-head`, `--compile-mode`,
 >   `--tf32`, `--cudnn-benchmark`, `--model-action-horizon`, `--pipeline-backbone-dit`, `--seed`
 >
+> **Measured N1.7 results and the recommended configuration are in
+> [`INFERENCE_OPTIMIZATIONS_N1D7.md`](../../INFERENCE_OPTIMIZATIONS_N1D7.md)**: 480 ms → 304 ms per step
+> with TensorRT and a BF16 ViT engine (`build_trt_pipeline.py --vit-precision bf16`), 250 ms with
+> 2-step denoising. Use `scripts/deployment/orin/install_deps.sh`, not a plain `uv sync`.
+>
 > Dropped as N1.6/Eagle-specific or superseded by upstream N1.7: SDPA/RoPE patches to the
 > Eagle backbone, `--use-cuda-graphs`, `--backbone-trt-engine-path`, INT8 calibration,
 > `export_onnx_n1d6.py --use_fp32`, the JetPack 6 `pyproject` extra and `docker/orin.Dockerfile`
 > (use `scripts/deployment/orin/`). Upstream now provides full-pipeline TensorRT
 > (`--inference-mode trt_full_pipeline`, ViT in FP32 / rest BF16) and `--execution-horizon`
 > replaces `--action-horizon`. The commands below are the historical N1.6 ones; the
-> N1.7 equivalent of the best config is:
+> N1.7 open-loop eval (PyTorch + torch.compile) is:
 >
 > ```bash
 > python gr00t/eval/open_loop_eval.py \
 >     --model-path <checkpoint> --dataset-path <dataset> --embodiment-tag NEW_EMBODIMENT \
->     --compile-backbone --compile-action-head --cudnn-benchmark --pipeline-backbone-dit \
->     --denoising-steps 2 --execution-horizon 4 --traj-ids 0 --save-plot-path ./episode000.png
+>     --compile-dit --compile-action-head --cudnn-benchmark \
+>     --denoising-steps 2 --execution-horizon 8 --traj-ids 0 --save-plot-path ./episode000.png
 > ```
 
 Run inference with PyTorch or TensorRT acceleration for the GR00T policy.

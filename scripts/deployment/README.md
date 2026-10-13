@@ -452,6 +452,7 @@ If you later run `uv sync`, rerun the Orin installer to restore the locally buil
 | `--precision` | `bf16` | Precision for ONNX export and TRT engine build (`bf16` only) |
 | `--batch-size` | `1` | Batch size baked into exported ONNX/TRT models (static — see note below) |
 | `--export-mode` | `full_pipeline` | Export mode: `dit_only`, `action_head`, or `full_pipeline` |
+| `--vit-precision` | `fp32` | ViT engine precision (`full_pipeline` only): `fp32` or `bf16`. `bf16` roughly halves ViT latency on Jetson Orin; the verify step reports the resulting accuracy |
 | `--workspace` | `8192` | TRT builder workspace size in MB |
 | `--num-iterations` | `20` | Number of benchmark iterations |
 | `--warmup` | `5` | Number of warmup iterations |
@@ -471,7 +472,15 @@ If you later run `uv sync`, rerun the Orin installer to restore the locally buil
 | `--execution-horizon` | `16` | Steps of each predicted chunk to execute per inference (old `--action-horizon` deprecated) |
 | `--inference-mode` | `pytorch` | `pytorch`, `tensorrt` (DiT-only TRT), or `trt_full_pipeline` (all engines) |
 | `--trt-engine-path` | `./gr00t_trt_deployment/engines` | Directory containing pre-built TRT engines (matches `build_trt_pipeline.py` output) |
+| `--trt-pytorch-vit` | `false` | With `trt_full_pipeline`: keep the ViT in PyTorch, run only the LLM and action head in TRT |
 | `--denoising-steps` | `4` | Diffusion denoising iterations |
+| `--use-fp16` | `false` | Load the model in FP16 instead of BF16 |
+| `--attn-implementation` | checkpoint setting | Override backbone attention: `flash_attention_2` or `sdpa` |
+| `--compile-backbone` | `false` | `torch.compile` the backbone (requires `--attn-implementation sdpa`; skipped with flash attention or TRT) |
+| `--compile-dit` / `--compile-action-head` | `false` | `torch.compile` the DiT / the action encoder+decoder (skipped when replaced by TRT) |
+| `--compile-mode` | `default` | `torch.compile` mode: `default`, `reduce-overhead`, or `max-autotune` |
+| `--pipeline-backbone-dit` | `false` | Launch the next step's backbone on a side CUDA stream before decoding the current step's actions |
+| `--tf32` | `true` | TF32 for the remaining FP32 matmuls |
 | `--save-plot-path` | `None` | Save per-trajectory GT-vs-predicted comparison plots |
 | `--skip-timing-steps` | `1` | Initial steps excluded from timing stats (warmup) |
 | `--host` / `--port` | `127.0.0.1` / `5555` | Server address (when using client mode without `--model-path`) |

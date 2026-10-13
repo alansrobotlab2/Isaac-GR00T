@@ -243,6 +243,11 @@ class PipelineConfig:
     export_mode: ExportMode = ExportMode.full_pipeline
     """Export mode: 'dit_only', 'action_head', or 'full_pipeline' (recommended)."""
 
+    vit_precision: Literal["fp32", "bf16"] = "fp32"
+    """Precision of the ViT engine ('full_pipeline' only). 'fp32' (default) keeps the
+    largest accuracy margin; 'bf16' roughly halves ViT latency on Jetson Orin. The
+    verify step reports the resulting accuracy either way."""
+
     # -- Build options ------------------------------------------------------
     workspace: int = 8192
     """TRT builder workspace size in MB."""
@@ -280,6 +285,7 @@ def _run_export(cfg: PipelineConfig, onnx_dir: str, embodiment_tag, log_fp) -> N
         output_dir=onnx_dir,
         export_mode=cfg.export_mode,
         precision=cfg.precision,
+        vit_precision=cfg.vit_precision,
         batch_size=cfg.batch_size,
     )
     with _redirect_to_log(log_fp):

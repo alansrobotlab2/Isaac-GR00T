@@ -6,6 +6,7 @@ Ported from the N1.6 Orin AGX optimization work (see ``INFERENCE_OPTIMIZATIONS.m
   action encoder+decoder, cuDNN benchmark, TF32, and a runtime action-horizon override.
 * :class:`PipelinedInference` -- enqueue backbone(N+1) on a side CUDA stream right after
   DiT(N) so it overlaps with frame N's CPU-side action decoding.
+* :func:`load_tensorrt_engines` -- install full-pipeline TensorRT engines on a policy.
 * :func:`run_frames` -- drives a one-frame-lookahead prefetching inference loop
   (optionally pipelined) and reports per-frame timings.
 """
@@ -16,6 +17,8 @@ from collections.abc import Iterator
 from concurrent.futures import Future
 from dataclasses import dataclass
 import logging
+from pathlib import Path
+import sys
 import time
 from typing import Any, Literal
 
@@ -36,6 +39,15 @@ Frame = tuple[dict[str, Any] | None, list[dict[str, Any]] | None, Any]
 def _forward_is_patched(module: torch.nn.Module) -> bool:
     """True if ``module.forward`` was replaced on the instance (TensorRT engine or torch.compile)."""
     return "forward" in vars(module)
+
+
+def _uses_flash_attention(backbone: torch.nn.Module) -> bool:
+    """True if any submodule of the backbone is configured for flash attention."""
+    for module in backbone.modules():
+        config = getattr(module, "config", None)
+        if getattr(config, "_attn_implementation", None) == "flash_attention_2":
+            return True
+    return False
 
 
 def apply_inference_optimizations(
@@ -98,6 +110,15 @@ def apply_inference_optimizations(
         backbone = model.backbone
         if _forward_is_patched(backbone):
             logging.info("Backbone forward is already replaced (TensorRT); skipping torch.compile")
+        elif _uses_flash_attention(backbone):
+            # Dynamo cannot trace flash_attn's varlen kernel in the Qwen3-VL backbone
+            # (it is handed a tensor where the op schema wants an int) and the failure
+            # only surfaces on the first inference. SDPA traces fine.
+            logging.warning(
+                "--compile-backbone is skipped: torch.compile cannot trace the flash-attention "
+                "backbone. Load the policy with attn_implementation='sdpa' "
+                "(--attn-implementation sdpa) to compile it."
+            )
         else:
             backbone.forward = torch.compile(backbone.forward, mode=compile_mode)
             logging.info(
@@ -238,3 +259,39 @@ def run_frames(
 
         yield actions, payload, data_prep_wait, inference_time
         current = upcoming
+
+
+def load_tensorrt_engines(
+    policy: Gr00tPolicy, engine_dir: str, *, use_vit_engine: bool = True, batch_size: int = 1
+) -> None:
+    """Swap a local ``Gr00tPolicy``'s backbone and action head for full-pipeline TRT engines.
+
+    ``engine_dir`` is the ``engines/`` directory written by
+    ``scripts/deployment/build_trt_pipeline.py``. The TRT runtime glue lives in
+    ``scripts/deployment`` (not an importable package), so this needs a source checkout.
+    Call it before :func:`apply_inference_optimizations`.
+    """
+    deploy_dir = Path(__file__).resolve().parents[2] / "scripts" / "deployment"
+    if not (deploy_dir / "trt_model_forward.py").is_file():
+        raise FileNotFoundError(
+            f"TensorRT runtime glue not found at {deploy_dir}; loading TRT engines "
+            "requires running from a source checkout of this repository."
+        )
+    if str(deploy_dir) not in sys.path:
+        sys.path.insert(0, str(deploy_dir))
+    from _trt_contract import resolve_batch_size
+    from trt_model_forward import setup_tensorrt_engines
+
+    from gr00t.deployment.modes import InferenceMode
+
+    # Engines bake a static batch size; fail fast on a mismatch instead of a cryptic
+    # "Invalid input shape" inside the first inference.
+    resolve_batch_size(engine_dir, batch_size, source="load_tensorrt_engines")
+    setup_tensorrt_engines(
+        policy, engine_dir, mode=InferenceMode.n17_full_pipeline, use_vit_engine=use_vit_engine
+    )
+    logging.info(
+        "TensorRT full-pipeline engines loaded from %s%s",
+        engine_dir,
+        "" if use_vit_engine else " (ViT kept in PyTorch)",
+    )

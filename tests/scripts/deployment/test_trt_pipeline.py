@@ -195,3 +195,24 @@ def test_build_trt_pipeline_missing_model_path() -> None:
     assert "Please provide --model-path" in combined, (
         f"Expected error 'Please provide --model-path' in output:\n{combined}"
     )
+
+
+@pytest.mark.parametrize("vit_precision", ["fp32", "bf16"])
+def test_run_export_forwards_vit_precision(vit_precision: str, tmp_path) -> None:
+    """--vit-precision reaches the exporter; the default stays FP32."""
+    assert PipelineConfig().vit_precision == "fp32"
+
+    cfg = PipelineConfig(
+        model_path="unused",
+        output_dir=str(tmp_path),
+        export_mode="full_pipeline",
+        vit_precision=vit_precision,
+    )
+    seen = {}
+    with (
+        patch("export_onnx_n1d7.main", side_effect=lambda export_cfg: seen.update(cfg=export_cfg)),
+        open(tmp_path / "pipeline.log", "w") as log_fp,
+    ):
+        _run_export(cfg, str(tmp_path / "onnx"), None, log_fp)
+
+    assert seen["cfg"].vit_precision == vit_precision
