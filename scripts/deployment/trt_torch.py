@@ -30,13 +30,29 @@
 
 Loads serialized TRT engines, manages input/output tensor bindings, and
 executes inference. Supports dynamic shapes and BF16/FP16/FP32 dtypes.
+
+Two opt-in runtime modes cut host overhead on devices with a slow CPU (Jetson):
+
+* ``sync=False`` drops the ``stream.synchronize()`` after every engine call. Outputs
+  are ordinary CUDA tensors on the caller's stream, so later torch ops (or a final
+  ``.cpu()``) are ordered after the engine without blocking the host in between.
+* ``cuda_graph=True`` captures the engine's kernel launches into a CUDA graph on first
+  use and replays it afterwards, which replaces hundreds of per-layer launches with one.
 """
 
 import ctypes
+import logging
 import os
 
 import tensorrt as trt
 import torch
+
+
+logger = logging.getLogger(__name__)
+
+# A CUDA graph is re-captured when an engine's input shapes change (e.g. a prompt with a
+# different token count). Past this many captures the engine stops using graphs.
+_MAX_GRAPH_CAPTURES = 16
 
 
 def torch_type(trt_type):
@@ -60,14 +76,36 @@ def torch_type(trt_type):
 
 
 class Engine(object):
-    """TensorRT engine wrapper for loading and executing inference."""
+    """TensorRT engine wrapper for loading and executing inference.
 
-    def __init__(self, file, plugins=[]):
+    Args:
+        file: Serialized engine path.
+        plugins: Optional plugin libraries to load first.
+        sync: Block on the CUDA stream after every call (the conservative default).
+            ``False`` returns as soon as the work is enqueued; the engine keeps its
+            inputs alive until the next call, and outputs stay stream-ordered.
+        cuda_graph: Replay the engine through a captured CUDA graph. Inputs are copied
+            into fixed buffers and **outputs are fixed buffers that the next call
+            overwrites** -- consume or clone them before calling the engine again. The
+            graph is re-captured when input shapes change. Engines that cannot be
+            captured (for example ones with data-dependent shapes) fall back to plain
+            execution with a warning.
+    """
+
+    def __init__(self, file, plugins=[], sync=True, cuda_graph=False):
         super().__init__()
 
         self._closed = False
         self.execution_context = None
         self.handle = None
+        self.sync = sync
+        self.cuda_graph = cuda_graph
+        self._graph = None  # _CapturedGraph for the input shapes in _graph_key
+        self._graph_key = None
+        self._graph_captures = 0
+        self._graph_failed = False
+        self._shapes = {}  # last shape set per input, to skip redundant TRT calls
+        self._held = None  # tensors of the last sync=False call, kept alive until the next
 
         self.logger = trt.Logger(trt.Logger.ERROR)
         trt.init_libnvinfer_plugins(self.logger, "")
@@ -87,6 +125,9 @@ class Engine(object):
         if self._closed:
             return
         self._closed = True
+        # Graphs hold kernels that reference the context's memory; drop them first.
+        self._graph, self._graph_key = None, None
+        self._held = None
         self.execution_context = None
         self.handle = None
 
@@ -153,8 +194,114 @@ class Engine(object):
         raise KeyError(f"Input tensor '{tensor_name}' not found in engine.")
 
     def set_runtime_tensor_shape(self, name, shape):
-        """Set runtime input shape for dynamic dimensions."""
+        """Set runtime input shape for dynamic dimensions (no-op if unchanged)."""
+        shape = tuple(shape)
+        if self._shapes.get(name) == shape:
+            return
         self.execution_context.set_input_shape(name, shape)
+        self._shapes[name] = shape
+
+    def _bind_inputs(self, args, kwargs):
+        """Validate the call's tensors and return them as ``[(name, tensor)]`` in engine order."""
+        bound = []
+        for iarg, x in enumerate(args):
+            bound.append((self.in_meta[iarg], x))
+        for meta in self.in_meta[len(args) :]:
+            if meta[0] in kwargs:
+                bound.append((meta, kwargs[meta[0]]))
+        assert len(bound) == len(self.in_meta), (
+            f"Invalid input tensors. The engine expects {len(self.in_meta)} inputs "
+            f"({[m[0] for m in self.in_meta]}), but got {len(bound)}"
+        )
+
+        inputs = []
+        for (name, static_shape, dtype), x in bound:
+            assert isinstance(x, torch.Tensor), f"Unsupported tensor[{name}] type: {type(x)}"
+            expected = self._shapes.get(name)
+            if expected is None:
+                expected = tuple(static_shape)
+                if -1 in expected:
+                    expected = tuple(self.execution_context.get_tensor_shape(name))
+            assert expected == tuple(x.shape), (
+                f"Invalid input[{name}] shape: {tuple(x.shape)}, but the expected shape is: {expected}"
+            )
+            assert dtype == x.dtype, (
+                f"Invalid tensor[{name}] dtype, expected dtype is {dtype}, but got {x.dtype}"
+            )
+            assert x.is_cuda, (
+                f"Invalid tensor[{name}] device, expected device is cuda, but got {x.device}"
+            )
+            inputs.append((name, x.contiguous()))
+        return inputs
+
+    def _capture_graph(self, inputs):
+        """Capture one execution into a CUDA graph with fixed I/O buffers.
+
+        Returns ``None`` (and disables graphs for this engine) if capture fails.
+        """
+        context = self.execution_context
+        device = inputs[0][1].device
+        in_bufs = [(name, x.clone()) for name, x in inputs]
+        out_bufs = {}
+        for name, _shape, dtype in self.out_meta:
+            out_bufs[name] = torch.empty(
+                tuple(context.get_tensor_shape(name)), dtype=dtype, device=device
+            )
+        for name, buf in in_bufs:
+            context.set_tensor_address(name, buf.data_ptr())
+        for name, buf in out_bufs.items():
+            context.set_tensor_address(name, buf.data_ptr())
+
+        # TensorRT must run once at these shapes before capture so that it does not
+        # record its lazy shape-dependent initialisation into the graph.
+        stream = torch.cuda.current_stream()
+        context.execute_async_v3(stream.cuda_stream)
+        stream.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                # torch captures on its own stream, which is current inside this block.
+                ok = context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
+            if not ok:
+                raise RuntimeError("execute_async_v3 failed during CUDA graph capture")
+        except Exception as e:  # noqa: BLE001 - any capture failure means "run eagerly"
+            self._graph_failed = True
+            logger.warning(
+                "CUDA graph capture failed for %s (%s); running it without a graph. Engines "
+                "with data-dependent shapes cannot be captured.",
+                os.path.basename(self.file),
+                str(e).splitlines()[0],
+            )
+            return None
+        return _CapturedGraph(graph, in_bufs, out_bufs)
+
+    def _forward_graph(self, inputs):
+        key = tuple(tuple(x.shape) for _, x in inputs)
+        # Graph buffers are created and written under inference mode whatever the caller uses.
+        with torch.inference_mode():
+            if self._graph_key != key:
+                # One graph at a time: a graph bakes in addresses of the context's
+                # scratch memory, which TensorRT may lay out differently per shape.
+                self._graph, self._graph_key = None, None
+                if self._graph_captures >= _MAX_GRAPH_CAPTURES:
+                    self._graph_failed = True
+                    logger.warning(
+                        "%s: input shapes changed %d times; CUDA graph disabled for this "
+                        "engine to avoid re-capturing on every call.",
+                        os.path.basename(self.file),
+                        self._graph_captures,
+                    )
+                    return None
+                self._graph_captures += 1
+                self._graph = self._capture_graph(inputs)
+                if self._graph is None:
+                    return None
+                self._graph_key = key
+            for (_, x), (_, buf) in zip(inputs, self._graph.inputs):
+                buf.copy_(x)
+            self._graph.graph.replay()
+            return self._graph.outputs
 
     def forward(self, *args, **kwargs):
         """Execute TRT inference with the given input tensors.
@@ -163,68 +310,42 @@ class Engine(object):
         Returns a dict of output tensors by default, or a list if return_list=True.
         """
         return_list = kwargs.pop("return_list", False)
-        reference_tensors = []
+        inputs = self._bind_inputs(args, kwargs)
         stream = torch.cuda.current_stream()
 
-        # Process positional arguments
-        for iarg, x in enumerate(args):
-            name, shape, dtype = self.in_meta[iarg]
-            runtime_shape = self.execution_context.get_tensor_shape(name)
-            assert isinstance(x, torch.Tensor), f"Unsupported tensor type: {type(x)}"
-            assert runtime_shape == x.shape, f"Invalid input shape: {runtime_shape} != {x.shape}"
-            assert dtype == x.dtype, (
-                f"Invalid tensor dtype, expected dtype is {dtype}, but got {x.dtype}"
-            )
-            assert x.is_cuda, f"Invalid tensor device, expected device is cuda, but got {x.device}"
-            x = x.cuda().contiguous()
-            self.execution_context.set_tensor_address(name, x.data_ptr())
-            reference_tensors.append(x)
+        outputs = None
+        if self.cuda_graph and not self._graph_failed:
+            outputs = self._forward_graph(inputs)
 
-        # Process keyword arguments
-        for name, shape, dtype in self.in_meta:
-            if name not in kwargs:
-                continue
+        if outputs is None:
+            context = self.execution_context
+            for name, x in inputs:
+                context.set_tensor_address(name, x.data_ptr())
+            outputs = {}
+            for name, _shape, dtype in self.out_meta:
+                out = torch.empty(
+                    tuple(context.get_tensor_shape(name)), dtype=dtype, device=inputs[0][1].device
+                )
+                context.set_tensor_address(name, out.data_ptr())
+                outputs[name] = out
+            context.execute_async_v3(stream.cuda_stream)
+            # Without a sync the kernels may still be reading the inputs after we return.
+            self._held = None if self.sync else [x for _, x in inputs]
 
-            runtime_shape = self.execution_context.get_tensor_shape(name)
-            x = kwargs[name]
-            assert isinstance(x, torch.Tensor), f"Unsupported tensor[{name}] type: {type(x)}"
-            assert runtime_shape == x.shape, (
-                f"Invalid input[{name}] shape: {x.shape}, but the expected shape is: {runtime_shape}"
-            )
-            assert dtype == x.dtype, (
-                f"Invalid tensor[{name}] dtype, expected dtype is {dtype}, but got {x.dtype}"
-            )
-            assert x.is_cuda, (
-                f"Invalid tensor[{name}] device, expected device is cuda, but got {x.device}"
-            )
-            x = x.cuda().contiguous()
-            self.execution_context.set_tensor_address(name, x.data_ptr())
-            reference_tensors.append(x)
-
-        # Allocate output tensors
-        for item in self.out_meta:
-            name = item[0]
-            runtime_shape = self.execution_context.get_tensor_shape(name)
-            output_tensor = torch.zeros(
-                *runtime_shape, dtype=item[2], device=reference_tensors[0].device
-            )
-            self.execution_context.set_tensor_address(name, output_tensor.data_ptr())
-            reference_tensors.append(output_tensor)
-
-        # Execute
-        self.execution_context.execute_async_v3(stream.cuda_stream)
-        stream.synchronize()
-        assert len(reference_tensors) == len(self.in_meta) + len(self.out_meta), (
-            f"Invalid input tensors. The expected I/O tensors are "
-            f"{len(self.in_meta) + len(self.out_meta)}, but got {len(reference_tensors)}"
-        )
+        if self.sync:
+            stream.synchronize()
 
         if return_list:
-            return [
-                reference_tensors[len(self.in_meta) + i] for i, item in enumerate(self.out_meta)
-            ]
-        else:
-            return {
-                item[0]: reference_tensors[len(self.in_meta) + i]
-                for i, item in enumerate(self.out_meta)
-            }
+            return [outputs[item[0]] for item in self.out_meta]
+        return dict(outputs)
+
+
+class _CapturedGraph:
+    """A captured CUDA graph plus the fixed I/O buffers its kernels read and write."""
+
+    __slots__ = ("graph", "inputs", "outputs")
+
+    def __init__(self, graph, inputs, outputs):
+        self.graph = graph
+        self.inputs = inputs
+        self.outputs = outputs

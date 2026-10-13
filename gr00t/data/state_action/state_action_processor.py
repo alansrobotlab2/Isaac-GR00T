@@ -44,6 +44,7 @@ from gr00t.data.utils import (
     unnormalize_values_minmax,
 )
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 
 logger = logging.getLogger(__name__)
@@ -670,13 +671,44 @@ class StateActionProcessor:
         action_type: ActionType,
         action_format: ActionFormat,
     ) -> np.ndarray:
-        """Convert relative action to absolute action using reference state."""
+        """Convert relative action to absolute action using reference state.
+
+        Runs on whole (T, D) arrays. :meth:`_convert_to_absolute_action_objects` is the
+        per-pose formulation of the same math; it builds a few ``Pose`` objects per
+        timestep, which costs tens of milliseconds per action chunk on an embedded CPU.
+        """
         assert action.ndim == 2, f"Expected action shape (T, D), got {action.shape}"
         assert reference_state.ndim == 1, f"Expected state shape (D,), got {reference_state.shape}"
         assert reference_state.shape[0] == action.shape[1], (
             f"State dim {reference_state.shape[0]} != action dim {action.shape[1]}"
         )
+        if action.shape[0] == 0:
+            return self._convert_to_absolute_action_objects(
+                action, reference_state, action_type, action_format
+            )
 
+        if action_type == ActionType.EEF:
+            # T_absolute = T_reference @ T_relative for every timestep at once.
+            t_relative = _eef_to_homogeneous(action, action_format)
+            t_reference = _eef_to_homogeneous(reference_state[None, :], action_format)[0]
+            return _homogeneous_to_eef(t_reference @ t_relative, action_format)
+
+        elif action_type == ActionType.NON_EEF:
+            return np.asarray(reference_state, dtype=np.float64)[None, :] + np.asarray(
+                action, dtype=np.float64
+            )
+
+        else:
+            raise ValueError(f"Unknown ActionType: {action_type}")
+
+    def _convert_to_absolute_action_objects(
+        self,
+        action: np.ndarray,
+        reference_state: np.ndarray,
+        action_type: ActionType,
+        action_format: ActionFormat,
+    ) -> np.ndarray:
+        """Per-pose reference implementation of :meth:`_convert_to_absolute_action`."""
         if action_type == ActionType.EEF:
             rel_action = EndEffectorActionChunk.from_array(action, action_format)
             reference_frame = EndEffectorPose.from_action_format(reference_state, action_format)
@@ -693,3 +725,54 @@ class StateActionProcessor:
 
     def __str__(self) -> str:
         return f"StateActionProcessor(modality_configs={self.modality_configs}, statistics={self.statistics}, use_percentiles={self.use_percentiles}, clip_outliers={self.clip_outliers}, apply_sincos_state_encoding={self.apply_sincos_state_encoding}, use_relative_action={self.use_relative_action})"
+
+
+def _eef_to_homogeneous(poses: np.ndarray, action_format: ActionFormat) -> np.ndarray:
+    """(N, D) end-effector poses in ``action_format`` -> (N, 4, 4) homogeneous matrices.
+
+    Batched equivalent of ``EndEffectorPose.from_action_format(row, fmt).homogeneous``.
+    """
+    n = poses.shape[0]
+    if action_format == ActionFormat.XYZ_ROT6D:
+        translation = poses[:, :3]
+        rows = poses[:, 3:].reshape(n, 2, 3)
+        # Gram-Schmidt on the two stored rows; the third row is their cross product.
+        row1 = rows[:, 0] / np.linalg.norm(rows[:, 0], axis=1, keepdims=True)
+        row2 = rows[:, 1] - np.sum(row1 * rows[:, 1], axis=1, keepdims=True) * row1
+        row2 = row2 / np.linalg.norm(row2, axis=1, keepdims=True)
+        rotation = Rotation.from_matrix(np.stack([row1, row2, np.cross(row1, row2)], axis=1))
+    elif action_format == ActionFormat.XYZ_ROTVEC:
+        translation = poses[:, :3]
+        rotation = Rotation.from_rotvec(poses[:, 3:])
+    elif action_format == ActionFormat.DEFAULT:
+        matrices = poses.reshape(n, 4, 4)
+        translation = matrices[:, :3, 3]
+        rotation = Rotation.from_matrix(matrices[:, :3, :3])
+    else:
+        raise ValueError(f"Unsupported ActionFormat: {action_format}")
+
+    homogeneous = np.tile(np.eye(4), (n, 1, 1))
+    homogeneous[:, :3, :3] = rotation.as_matrix()
+    homogeneous[:, :3, 3] = translation
+    return homogeneous
+
+
+def _homogeneous_to_eef(homogeneous: np.ndarray, action_format: ActionFormat) -> np.ndarray:
+    """(N, 4, 4) homogeneous matrices -> end-effector poses in ``action_format``.
+
+    Batched equivalent of ``EndEffectorActionChunk([EndEffectorPose(homogeneous=h), ...]).to(fmt)``.
+    """
+    translation = homogeneous[:, :3, 3]
+    rotation = Rotation.from_matrix(homogeneous[:, :3, :3])
+    if action_format == ActionFormat.XYZ_ROT6D:
+        rot6d = rotation.as_matrix()[:, :2, :].reshape(len(homogeneous), 6)
+        return np.concatenate([translation, rot6d], axis=1)
+    elif action_format == ActionFormat.XYZ_ROTVEC:
+        return np.concatenate([translation, rotation.as_rotvec()], axis=1)
+    elif action_format == ActionFormat.DEFAULT:
+        out = np.tile(np.eye(4), (len(homogeneous), 1, 1))
+        out[:, :3, :3] = rotation.as_matrix()
+        out[:, :3, 3] = translation
+        return out
+    else:
+        raise ValueError(f"Unsupported ActionFormat: {action_format}")

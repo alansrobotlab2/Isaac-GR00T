@@ -104,6 +104,10 @@ class ServerConfig:
     trt_pytorch_vit: bool = False
     """With --trt-engine-path: keep the ViT in PyTorch (LLM and action head still in TensorRT)."""
 
+    trt_cuda_graph: bool = True
+    """With TensorRT engines: replay each engine from a captured CUDA graph (less host
+    overhead, identical actions). The first inference is slower while graphs are captured."""
+
     attn_implementation: Literal["flash_attention_2", "sdpa"] | None = None
     """Override the backbone attention implementation. None keeps the checkpoint's setting."""
 
@@ -147,7 +151,10 @@ def main(config: ServerConfig):
             print(f"  Denoising steps: {config.denoising_steps}")
         if config.trt_engine_path is not None:
             load_tensorrt_engines(
-                policy, config.trt_engine_path, use_vit_engine=not config.trt_pytorch_vit
+                policy,
+                config.trt_engine_path,
+                use_vit_engine=not config.trt_pytorch_vit,
+                cuda_graph=config.trt_cuda_graph,
             )
             print(f"  TensorRT engines: {config.trt_engine_path}")
         # After the TRT setup, so components already replaced by engines are skipped.

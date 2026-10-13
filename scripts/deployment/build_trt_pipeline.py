@@ -248,9 +248,20 @@ class PipelineConfig:
     largest accuracy margin; 'bf16' roughly halves ViT latency on Jetson Orin. The
     verify step reports the resulting accuracy either way."""
 
+    fused_denoising_steps: tuple[int, ...] = ()
+    """'full_pipeline' only: also export and build the action head as a single engine with
+    this many denoising steps unrolled (e.g. ``--fused-denoising-steps 2``; give several
+    values for several step counts). The runtime picks the fused engine whenever the
+    policy runs that many steps; it is faster than the per-component engines, which are
+    always built as the fallback. Adds about 3 GB and a few minutes per step count."""
+
     # -- Build options ------------------------------------------------------
     workspace: int = 8192
     """TRT builder workspace size in MB."""
+
+    builder_optimization_level: int | None = None
+    """TensorRT builder optimization level (0-5). None keeps TensorRT's default (3).
+    Level 5 is a few percent faster on Jetson Orin for roughly 2.5x the build time."""
 
     # -- Benchmark options --------------------------------------------------
     num_iterations: int = 20
@@ -287,6 +298,7 @@ def _run_export(cfg: PipelineConfig, onnx_dir: str, embodiment_tag, log_fp) -> N
         precision=cfg.precision,
         vit_precision=cfg.vit_precision,
         batch_size=cfg.batch_size,
+        fused_denoising_steps=cfg.fused_denoising_steps,
     )
     with _redirect_to_log(log_fp):
         export_main(export_cfg)
@@ -308,6 +320,7 @@ def _run_build(
             engine=os.path.join(engine_dir, "dit_bf16.engine"),
             precision=cfg.precision,
             workspace=cfg.workspace,
+            optimization_level=cfg.builder_optimization_level,
         )
         with _redirect_to_log(log_fp):
             build_main(build_cfg, trt_severity=trt_severity)
@@ -326,6 +339,7 @@ def _run_build(
             workspace_mb=cfg.workspace,
             trt_severity=trt_severity,
             only=None if only == full else only,
+            optimization_level=cfg.builder_optimization_level,
         )
 
 

@@ -687,7 +687,8 @@ def export_llm_to_onnx(policy, captured_llm, output_dir, use_bf16=True, batch_si
         Key adaptations from the original Qwen3VLTextModel:
         1. Eager attention (no flash) — avoids ONNX-incompatible flash attention
         2. Simple causal mask — avoids COMPLEX128 ops from HuggingFace's mask
-        3. Deepstack injection via torch.where — avoids boolean indexing
+        3. Deepstack injection via CumSum + Gather + Where — no boolean indexing and
+           no NonZero (static shapes, so TensorRT needs no host sync mid-engine)
         4. Position IDs as explicit input — get_rope_index() stays in PyTorch
         5. Deepstack features as separate tensor inputs (not a Python list)
         """
@@ -727,31 +728,33 @@ def export_llm_to_onnx(policy, captured_llm, output_dir, use_bf16=True, batch_si
 
             return causal_mask
 
-        def _deepstack_add(self, hidden_states, visual_pos_masks, visual_embeds):
-            """ONNX-friendly deepstack injection using torch.where.
+        def _deepstack_index(self, visual_pos_masks):
+            """Row of ``visual_embeds`` that lands on each sequence position.
 
-            Original uses boolean indexing:
-                hidden_states[visual_pos_masks, :] += visual_embeds
-            This is not ONNX-friendly. Instead we:
-            1. Build a full-size delta tensor (zeros except at visual positions)
-            2. Add it to hidden_states
+            ``masked_scatter`` fills masked positions in row-major order, so position
+            ``p`` receives visual token ``cumsum(mask)[p] - 1``. Computing that index
+            with CumSum keeps every shape static. ``masked_scatter`` itself exports as
+            ``NonZero``, whose data-dependent output shape forces TensorRT to
+            synchronise with the host in the middle of the engine (about 9 ms per
+            inference on a Jetson AGX Orin) and prevents CUDA-graph capture.
             """
-            # visual_pos_masks: [B, seq_len] bool
-            # visual_embeds: [num_vis_tokens, hidden_size]
-            # hidden_states: [B, seq_len, hidden_size]
-            B, S, H = hidden_states.shape
+            flat = visual_pos_masks.reshape(-1).to(torch.int64)
+            return (torch.cumsum(flat, dim=0) - 1).clamp(min=0)
 
-            # Scatter visual_embeds into a full [B, S, H] tensor at masked positions
-            mask_expanded = visual_pos_masks.unsqueeze(-1)  # [B, S, 1]
+        def _deepstack_add(self, hidden_states, visual_pos_masks, visual_embeds, vis_index):
+            """Deepstack injection, equivalent to
+            ``hidden_states[visual_pos_masks, :] += visual_embeds`` with static shapes.
 
-            # Build cumulative index for visual tokens per batch
-            # For single batch (B=1), this is straightforward
-            delta = torch.zeros_like(hidden_states)
-            # Use masked_scatter to place visual_embeds at the right positions
-            delta = delta.masked_scatter(mask_expanded.expand_as(delta), visual_embeds)
-
-            hidden_states = hidden_states + delta
-            return hidden_states
+            visual_pos_masks: [B, seq_len] bool
+            visual_embeds:    [B * num_vis_tokens, hidden_size]
+            hidden_states:    [B, seq_len, hidden_size]
+            vis_index:        [B * seq_len] from :meth:`_deepstack_index`
+            """
+            gathered = visual_embeds.index_select(0, vis_index).reshape(hidden_states.shape)
+            delta = torch.where(
+                visual_pos_masks.unsqueeze(-1), gathered, torch.zeros_like(gathered)
+            )
+            return hidden_states + delta
 
         def forward(
             self,
@@ -790,6 +793,10 @@ def export_llm_to_onnx(policy, captured_llm, output_dir, use_bf16=True, batch_si
             if deepstack_2 is not None:
                 deepstack_list.append(deepstack_2)
 
+            vis_index = None
+            if visual_pos_masks is not None and deepstack_list:
+                vis_index = self._deepstack_index(visual_pos_masks)
+
             # Decoder layers
             for layer_idx, decoder_layer in enumerate(self.layers):
                 layer_outputs = decoder_layer(
@@ -805,7 +812,7 @@ def export_llm_to_onnx(policy, captured_llm, output_dir, use_bf16=True, batch_si
                 # Deepstack injection at first N layers
                 if visual_pos_masks is not None and layer_idx < len(deepstack_list):
                     hidden_states = self._deepstack_add(
-                        hidden_states, visual_pos_masks, deepstack_list[layer_idx]
+                        hidden_states, visual_pos_masks, deepstack_list[layer_idx], vis_index
                     )
 
             # Return pre-norm hidden states (matching Qwen3Backbone.forward
@@ -853,7 +860,7 @@ def export_llm_to_onnx(policy, captured_llm, output_dir, use_bf16=True, batch_si
     }
 
     if num_deepstack > 0 and captured_llm.visual_pos_masks is not None:
-        # Use actual captured mask so masked_scatter sizes match deepstack
+        # Use the actual captured mask so the visual token count matches deepstack
         vis_mask = captured_llm.visual_pos_masks.to(device="cuda")
         if vis_mask.shape[0] == 1 and batch_size > 1:
             vis_mask = vis_mask.expand(batch_size, -1)
@@ -1282,6 +1289,241 @@ def export_action_decoder_to_onnx(policy, output_dir, use_bf16=True, batch_size=
 
 
 # ============================================================
+# Export Functions: Fused Action Head
+# ============================================================
+
+
+FUSED_ACTION_HEAD_ONNX = "action_head_fused_{steps}step.onnx"
+
+
+class _SharedKVCrossAttnProcessor:
+    """Cross-attention processor that projects the conditioning tokens once per graph.
+
+    A DiT cross-attention block projects the vision-language tokens to keys and values on
+    every denoising step, although neither the tokens nor the weights change between
+    steps. With the denoising loop unrolled into one graph, the first step computes them
+    and later steps reuse the same tensors. The math is that of diffusers'
+    ``AttnProcessor2_0`` for an ``Attention`` without the optional norms.
+    """
+
+    def __init__(self):
+        self.cache = None
+
+    def __call__(
+        self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, **kwargs
+    ):
+        batch_size = hidden_states.shape[0]
+        query = attn.to_q(hidden_states)
+        head_dim = query.shape[-1] // attn.heads
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        if self.cache is None:
+            mask = attention_mask
+            if mask is not None:
+                mask = attn.prepare_attention_mask(mask, encoder_hidden_states.shape[1], batch_size)
+                mask = mask.view(batch_size, attn.heads, -1, mask.shape[-1])
+            key = attn.to_k(encoder_hidden_states)
+            value = attn.to_v(encoder_hidden_states)
+            key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+            value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+            self.cache = (key, value, mask)
+        key, value, mask = self.cache
+
+        out = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=mask, dropout_p=0.0, is_causal=False
+        )
+        out = out.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim).to(query.dtype)
+        out = attn.to_out[0](out)
+        return attn.to_out[1](out)
+
+
+def _supports_shared_kv(attn) -> bool:
+    return (
+        attn.is_cross_attention
+        and attn.spatial_norm is None
+        and attn.group_norm is None
+        and not attn.norm_cross
+        and getattr(attn, "norm_q", None) is None
+        and getattr(attn, "norm_k", None) is None
+        and not attn.residual_connection
+        and attn.rescale_output_factor == 1.0
+    )
+
+
+class _FusedActionHead(nn.Module):
+    """The action head's whole sampling path as one module: VLLN, VL self-attention, state
+    encoder, and ``num_steps`` unrolled Euler steps of action encoder -> DiT -> decoder.
+
+    Mirrors ``Gr00tN1d7ActionHead.get_action``: the trajectory is integrated in FP32.
+    """
+
+    def __init__(self, action_head, num_steps: int):
+        super().__init__()
+        self.head = action_head
+        self.num_steps = num_steps
+        self.use_masks = bool(action_head.config.use_alternate_vl_dit)
+        self.shared_kv = []
+
+    def install_shared_kv(self):
+        """Swap in the shared-K/V processors; returns the originals for restoring."""
+        originals = []
+        for block in self.head.model.transformer_blocks:
+            if _supports_shared_kv(block.attn1):
+                originals.append((block.attn1, block.attn1.processor))
+                processor = _SharedKVCrossAttnProcessor()
+                block.attn1.set_processor(processor)
+                self.shared_kv.append(processor)
+        return originals
+
+    def forward(
+        self,
+        backbone_features,
+        state,
+        embodiment_id,
+        init_actions,
+        image_mask,
+        backbone_attention_mask,
+    ):
+        head = self.head
+        for processor in self.shared_kv:
+            processor.cache = None
+        dtype = backbone_features.dtype
+        device = backbone_features.device
+        batch_size = backbone_features.shape[0]
+
+        vl_embs = head.vl_self_attention(head.vlln(backbone_features))
+        state_features = head.state_encoder(state, embodiment_id)
+
+        pos_embs = None
+        if head.config.add_pos_embed:
+            pos_ids = torch.arange(head.config.action_horizon, dtype=torch.long, device=device)
+            pos_embs = head.position_embedding(pos_ids).unsqueeze(0)
+
+        mask_kwargs = {}
+        if self.use_masks:
+            mask_kwargs = {
+                "image_mask": image_mask,
+                "backbone_attention_mask": backbone_attention_mask,
+            }
+
+        actions = init_actions.float()
+        dt = 1.0 / self.num_steps
+        for step in range(self.num_steps):
+            t_discretized = int(step / float(self.num_steps) * head.num_timestep_buckets)
+            timesteps = torch.full((batch_size,), t_discretized, dtype=torch.long, device=device)
+            action_features = head.action_encoder(actions.to(dtype), timesteps, embodiment_id)
+            if pos_embs is not None:
+                action_features = action_features + pos_embs
+            sa_embs = torch.cat((state_features, action_features), dim=1)
+            model_output = head.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embs,
+                timestep=timesteps,
+                **mask_kwargs,
+            )
+            pred = head.action_decoder(model_output, embodiment_id)
+            actions = actions + dt * pred[:, -head.action_horizon :].float()
+        return actions
+
+
+def export_fused_action_head_to_onnx(
+    policy, output_dir, vl_seq_len, num_steps, use_bf16=True, batch_size=1
+):
+    """Export the action head with ``num_steps`` denoising steps unrolled into one graph.
+
+    Replaces seven engine calls per inference (VL self-attention, state encoder, and
+    per step: action encoder, DiT, action decoder) with one, and shares the DiT's
+    cross-attention key/value projections of the vision-language tokens between steps.
+    The step count is baked in; export one graph per count you intend to run.
+
+    Inputs:  backbone_features [B, vl_seq_len, backbone_embedding_dim] (pre-VLLN),
+             state [B, 1, max_state_dim * state_history_length], embodiment_id [B],
+             init_actions [B, action_horizon, max_action_dim] (sampled noise),
+             image_mask [B, vl_seq_len], backbone_attention_mask [B, vl_seq_len]
+    Output:  actions [B, action_horizon, max_action_dim] (FP32, normalized)
+    """
+    logger.info("\n" + "=" * 80)
+    logger.info(f"Exporting fused action head ({num_steps} denoising steps) to ONNX")
+    logger.info("=" * 80)
+
+    action_head = policy.model.action_head
+    config = action_head.config
+    dtype = torch.bfloat16 if use_bf16 else torch.float32
+    action_head = action_head.to(dtype).eval().cuda()
+
+    backbone_features = torch.randn(
+        batch_size, vl_seq_len, config.backbone_embedding_dim, dtype=dtype, device="cuda"
+    )
+    state = torch.randn(
+        batch_size,
+        1,
+        config.max_state_dim * config.state_history_length,
+        dtype=dtype,
+        device="cuda",
+    )
+    embodiment_id = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
+    init_actions = torch.randn(
+        batch_size, config.action_horizon, config.max_action_dim, dtype=dtype, device="cuda"
+    )
+    image_mask = torch.ones(batch_size, vl_seq_len, dtype=torch.bool, device="cuda")
+    backbone_attention_mask = torch.ones(batch_size, vl_seq_len, dtype=torch.bool, device="cuda")
+
+    export_inputs = (
+        backbone_features,
+        state,
+        embodiment_id,
+        init_actions,
+        image_mask,
+        backbone_attention_mask,
+    )
+    input_names = [
+        "backbone_features",
+        "state",
+        "embodiment_id",
+        "init_actions",
+        "image_mask",
+        "backbone_attention_mask",
+    ]
+    logger.info("  Export input shapes:")
+    for name, tensor in zip(input_names, export_inputs):
+        logger.info(f"    {name}: {tensor.shape} ({tensor.dtype})")
+
+    output_path = os.path.join(output_dir, FUSED_ACTION_HEAD_ONNX.format(steps=num_steps))
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    wrapper = _FusedActionHead(action_head, num_steps).eval()
+    originals = wrapper.install_shared_kv()
+    logger.info(f"  Sharing key/value projections in {len(originals)} cross-attention blocks")
+    try:
+        logger.info(f"  Exporting to {output_path}...")
+        with torch.inference_mode():
+            torch.onnx.export(
+                wrapper,
+                export_inputs,
+                output_path,
+                input_names=input_names,
+                output_names=["actions"],
+                opset_version=19,
+                do_constant_folding=True,
+                export_params=True,
+                dynamic_axes={
+                    "backbone_features": {1: "vl_seq_len"},
+                    "image_mask": {1: "vl_seq_len"},
+                    "backbone_attention_mask": {1: "vl_seq_len"},
+                },
+                dynamo=False,  # same reason as the DiT: dynamo specializes vl_seq_len
+            )
+    finally:
+        for attn, processor in originals:
+            attn.set_processor(processor)
+
+    logger.info("  Fused action head exported successfully!")
+    _consolidate_external_data(output_path)
+    verify_onnx_export(output_path)
+    return output_path
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -1509,6 +1751,28 @@ def main(args):
         logger.info("\n--- [4g] Action Decoder ---")
         export_action_decoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
 
+        # 4h. Fused action head (optional), one graph per requested step count.
+        # Drop fused graphs left by an earlier export first: the builder builds every
+        # one it finds, and a stale one would carry another checkpoint's weights.
+        wanted = {FUSED_ACTION_HEAD_ONNX.format(steps=n) for n in args.fused_denoising_steps}
+        for stale in sorted(os.listdir(args.output_dir)):
+            if (
+                stale.startswith("action_head_fused_")
+                and stale.split(".onnx")[0] + ".onnx" not in wanted
+            ):
+                os.remove(os.path.join(args.output_dir, stale))
+                logger.info(f"  Removed stale {stale}")
+        for num_steps in args.fused_denoising_steps:
+            logger.info(f"\n--- [4h] Fused action head ({num_steps} steps) ---")
+            export_fused_action_head_to_onnx(
+                policy,
+                args.output_dir,
+                vl_seq_len=vl_seq_len,
+                num_steps=num_steps,
+                use_bf16=True,
+                batch_size=bs,
+            )
+
     # Summary
     logger.info("\n" + "=" * 80)
     logger.info("EXPORT COMPLETE!")
@@ -1558,6 +1822,12 @@ class ExportConfig:
 
     batch_size: int = 1
     """Batch size baked into the exported ONNX models (default: 1)."""
+
+    fused_denoising_steps: tuple[int, ...] = ()
+    """'full_pipeline' only: also export the action head as a single graph with this many
+    denoising steps unrolled (repeat the value for several step counts, e.g. ``2 4``).
+    The runtime uses the fused engine whenever the policy runs that many steps; it is
+    faster than the per-component engines, which are still exported as the fallback."""
 
 
 if __name__ == "__main__":

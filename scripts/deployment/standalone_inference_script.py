@@ -626,6 +626,10 @@ class ArgsConfig:
     head in TensorRT. Faster on Jetson Orin, where the FP32 ViT engine is slower than the
     BF16 PyTorch ViT with flash attention."""
 
+    trt_cuda_graph: bool = True
+    """With TensorRT engines: replay each engine from a captured CUDA graph (less host
+    overhead, identical actions). The first inference is slower while graphs are captured."""
+
     denoising_steps: int = 4
     """Number of denoising steps to use."""
 
@@ -753,6 +757,8 @@ def main(args: ArgsConfig):
             args.trt_engine_path,
             mode=InferenceMode.n17_full_pipeline,
             use_vit_engine=not args.trt_pytorch_vit,
+            sync=False,
+            cuda_graph=args.trt_cuda_graph,
         )
         logging.info(
             "  TRT full-pipeline mode enabled"

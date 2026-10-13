@@ -262,7 +262,12 @@ def run_frames(
 
 
 def load_tensorrt_engines(
-    policy: Gr00tPolicy, engine_dir: str, *, use_vit_engine: bool = True, batch_size: int = 1
+    policy: Gr00tPolicy,
+    engine_dir: str,
+    *,
+    use_vit_engine: bool = True,
+    batch_size: int = 1,
+    cuda_graph: bool = True,
 ) -> None:
     """Swap a local ``Gr00tPolicy``'s backbone and action head for full-pipeline TRT engines.
 
@@ -270,6 +275,10 @@ def load_tensorrt_engines(
     ``scripts/deployment/build_trt_pipeline.py``. The TRT runtime glue lives in
     ``scripts/deployment`` (not an importable package), so this needs a source checkout.
     Call it before :func:`apply_inference_optimizations`.
+
+    The engines run without a host sync between them, and with ``cuda_graph`` each one is
+    replayed from a captured CUDA graph. Both only remove host overhead; the actions are
+    unchanged. Graphs are captured during the first inference, which is therefore slower.
     """
     deploy_dir = Path(__file__).resolve().parents[2] / "scripts" / "deployment"
     if not (deploy_dir / "trt_model_forward.py").is_file():
@@ -288,7 +297,12 @@ def load_tensorrt_engines(
     # "Invalid input shape" inside the first inference.
     resolve_batch_size(engine_dir, batch_size, source="load_tensorrt_engines")
     setup_tensorrt_engines(
-        policy, engine_dir, mode=InferenceMode.n17_full_pipeline, use_vit_engine=use_vit_engine
+        policy,
+        engine_dir,
+        mode=InferenceMode.n17_full_pipeline,
+        use_vit_engine=use_vit_engine,
+        sync=False,
+        cuda_graph=cuda_graph,
     )
     logging.info(
         "TensorRT full-pipeline engines loaded from %s%s",

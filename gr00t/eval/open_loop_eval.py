@@ -337,6 +337,10 @@ class ArgsConfig:
     trt_pytorch_vit: bool = False
     """With --trt-engine-path: keep the ViT in PyTorch (LLM and action head still in TensorRT)."""
 
+    trt_cuda_graph: bool = True
+    """With TensorRT engines: replay each engine from a captured CUDA graph (less host
+    overhead, identical actions). The first inference is slower while graphs are captured."""
+
     compile_backbone: bool = False
     """torch.compile the backbone."""
 
@@ -412,7 +416,10 @@ def main(args: ArgsConfig):
         logging.info(f"Using {args.denoising_steps} denoising steps")
         if args.trt_engine_path is not None:
             load_tensorrt_engines(
-                policy, args.trt_engine_path, use_vit_engine=not args.trt_pytorch_vit
+                policy,
+                args.trt_engine_path,
+                use_vit_engine=not args.trt_pytorch_vit,
+                cuda_graph=args.trt_cuda_graph,
             )
     else:
         policy = PolicyClient(host=args.host, port=args.port)

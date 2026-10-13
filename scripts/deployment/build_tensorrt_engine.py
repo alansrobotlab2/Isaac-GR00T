@@ -37,6 +37,8 @@ Usage:
 from dataclasses import dataclass
 import logging
 import os
+import re
+import shutil
 import time
 from typing import Literal
 
@@ -50,6 +52,9 @@ import tyro
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# Optional fused action-head graphs, one per unrolled denoising-step count.
+FUSED_ACTION_HEAD_ONNX_RE = re.compile(r"action_head_fused_(\d+)step\.onnx")
 
 
 # STRONGLY_TYPED precision sanity check: TRT 10+ STRONGLY_TYPED reads
@@ -231,6 +236,7 @@ def build_engine(
     opt_shapes: dict = None,
     max_shapes: dict = None,
     trt_severity=None,
+    optimization_level: int | None = None,
 ):
     """Build TensorRT engine from ONNX model.
 
@@ -242,6 +248,9 @@ def build_engine(
         min_shapes: Minimum input shapes (dict: name -> shape tuple)
         opt_shapes: Optimal input shapes (dict: name -> shape tuple)
         max_shapes: Maximum input shapes (dict: name -> shape tuple)
+        optimization_level: TensorRT builder optimization level (0-5). ``None`` keeps
+            TensorRT's default (3). Level 5 searches more tactics: a few percent
+            faster engines on Jetson Orin for roughly 2.5x the build time.
     """
     logger.info("=" * 80)
     logger.info("TensorRT Engine Builder")
@@ -295,6 +304,10 @@ def build_engine(
     logger.info("Enabled DETAILED profiling verbosity for engine inspection")
 
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_mb * (1024**2))
+
+    if optimization_level is not None:
+        config.builder_optimization_level = optimization_level
+        logger.info(f"Builder optimization level: {optimization_level}")
 
     if use_strongly_typed:
         network_dtype_names: set[str] = set()
@@ -394,6 +407,7 @@ def build_full_pipeline(
     trt_severity=None,
     only: frozenset[str] | None = None,
     allow_default_hints: bool = False,
+    optimization_level: int | None = None,
 ):
     """Build all TRT engines for the full pipeline.
 
@@ -410,6 +424,11 @@ def build_full_pipeline(
             export (e.g. ``action_head``, which keeps ViT/LLM in PyTorch) must
             pass its produced subset so the completeness check requires exactly
             those, not the full pipeline.
+        optimization_level: TensorRT builder optimization level, see ``build_engine``.
+
+    Fused action-head graphs (``action_head_fused_<N>step.onnx``, written by
+    ``export_onnx_n1d7.py --fused-denoising-steps``) are optional extras: every one
+    found in ``onnx_dir`` is built too when the full pipeline is being built.
     """
     os.makedirs(engine_dir, exist_ok=True)
 
@@ -484,6 +503,29 @@ def build_full_pipeline(
         )
         components.append((component.name, onnx_file, component.engine))
 
+    if only is None:
+        # A fused engine without a matching ONNX is left over from an earlier build
+        # (possibly of another checkpoint); the runtime would load it, so remove it.
+        for engine_file in sorted(os.listdir(engine_dir)):
+            stem, ext = os.path.splitext(engine_file)
+            if (
+                ext == ".engine"
+                and FUSED_ACTION_HEAD_ONNX_RE.fullmatch(stem + ".onnx")
+                and not os.path.exists(os.path.join(onnx_dir, stem + ".onnx"))
+            ):
+                os.remove(os.path.join(engine_dir, engine_file))
+                logger.info(f"Removed stale fused engine {engine_file}")
+        for onnx_file in sorted(os.listdir(onnx_dir)):
+            match = FUSED_ACTION_HEAD_ONNX_RE.fullmatch(onnx_file)
+            if match:
+                components.append(
+                    (
+                        f"Fused Action Head ({match.group(1)} steps)",
+                        onnx_file,
+                        os.path.splitext(onnx_file)[0] + ".engine",
+                    )
+                )
+
     results: list[tuple[str, str, str]] = []
     skipped: list[tuple[str, str]] = []  # (name, onnx_path) for components with no ONNX input
 
@@ -533,6 +575,7 @@ def build_full_pipeline(
                 opt_shapes=opt_shapes,
                 max_shapes=max_shapes,
                 trt_severity=trt_severity,
+                optimization_level=optimization_level,
             )
             results.append((name, engine_path, "SUCCESS"))
         except Exception as e:
@@ -563,6 +606,12 @@ def build_full_pipeline(
                 + ", ".join(f"{name} ({path})" for name, path in skipped)
             )
         raise RuntimeError("Pipeline build incomplete — " + " | ".join(parts))
+
+    # The runtime validates the engine bundle against export_metadata.json, so keep a
+    # copy next to the engines (build_trt_pipeline.py does the same after this step).
+    metadata_src = os.path.join(onnx_dir, "export_metadata.json")
+    if os.path.exists(metadata_src):
+        shutil.copy2(metadata_src, os.path.join(engine_dir, "export_metadata.json"))
 
 
 # ============================================================
@@ -595,6 +644,10 @@ class BuildConfig:
     workspace: int = 8192
     """Workspace size in MB (default: 8192)."""
 
+    optimization_level: int | None = None
+    """TensorRT builder optimization level (0-5); None keeps the default (3). Level 5
+    gives slightly faster engines for a much longer build."""
+
     allow_default_hints: bool = False
     """full_pipeline: build with hardcoded GR1 single-view shape hints when
     export_metadata.json is missing/stale/incomplete, instead of failing. The
@@ -613,6 +666,7 @@ def main(args: BuildConfig | None = None, trt_severity=None):
             workspace_mb=args.workspace,
             trt_severity=trt_severity,
             allow_default_hints=args.allow_default_hints,
+            optimization_level=args.optimization_level,
         )
     else:
         if not args.onnx or not args.engine:
@@ -629,6 +683,7 @@ def main(args: BuildConfig | None = None, trt_severity=None):
             opt_shapes=opt_shapes,
             max_shapes=max_shapes,
             trt_severity=trt_severity,
+            optimization_level=args.optimization_level,
         )
 
 
