@@ -133,3 +133,53 @@ def test_rotary_oracle_raises_when_layout_missing():
     vision = torch.nn.Module()  # no rotary_pos_emb attribute at all
     with pytest.raises(RuntimeError, match="not found"):
         export._assert_vision_rotary_matches_analytic(vision, _vision_config())
+
+
+# ---------------------------------------------------------------------------
+# Per-image attention: the batched path must match one attention per image.
+# ---------------------------------------------------------------------------
+
+
+class _FakeVisionAttention(torch.nn.Module):
+    def __init__(self, dim=32, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.scaling = (dim // num_heads) ** -0.5
+        self.qkv = torch.nn.Linear(dim, 3 * dim)
+        self.proj = torch.nn.Linear(dim, dim)
+
+
+def _reference_attention(attn, hidden, cos, sin, chunk_sizes):
+    """One SDPA per image, in float64, from the same q/k/v projections."""
+    seq = hidden.shape[0]
+    qkv = attn.qkv(hidden).reshape(seq, 3, attn.num_heads, -1).permute(1, 0, 2, 3)
+    q, k, v = qkv.unbind(0)
+    q = export._apply_rotary_real(q, cos, sin)
+    k = export._apply_rotary_real(k, cos, sin)
+    outs = []
+    for q_c, k_c, v_c in zip(*(torch.split(t, chunk_sizes) for t in (q, k, v))):
+        o = torch.nn.functional.scaled_dot_product_attention(
+            *(t.transpose(0, 1).double() for t in (q_c, k_c, v_c)), scale=attn.scaling
+        )
+        outs.append(o.transpose(0, 1).to(hidden.dtype))
+    return attn.proj(torch.cat(outs).reshape(seq, -1))
+
+
+@pytest.mark.parametrize("chunk_sizes", [[6, 6, 6], [5, 9], [12]])
+@pytest.mark.parametrize("softmax_fp32", [False, True])
+def test_vision_attention_export_matches_per_image_attention(chunk_sizes, softmax_fp32):
+    torch.manual_seed(0)
+    attn = _FakeVisionAttention()
+    seq = sum(chunk_sizes)
+    hidden = torch.randn(seq, 32)
+    head_dim = 32 // 4
+    angles = torch.randn(seq, head_dim)
+    cos, sin = angles.cos(), angles.sin()
+
+    forward = export._make_onnx_vision_attention_forward(
+        attn, chunk_sizes=chunk_sizes, softmax_fp32=softmax_fp32
+    )
+    with torch.no_grad():
+        got = forward(hidden, position_embeddings=(cos, sin))
+        want = _reference_attention(attn, hidden, cos, sin, chunk_sizes)
+    torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)

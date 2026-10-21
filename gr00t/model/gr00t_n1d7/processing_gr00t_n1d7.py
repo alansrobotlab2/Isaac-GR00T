@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import random
 import re
+import threading
 from typing import Any, Dict
 import warnings
 
@@ -30,6 +31,7 @@ import torch
 import torchvision.transforms.v2 as transforms
 from transformers import AutoProcessor
 from transformers.feature_extraction_utils import BatchFeature
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from transformers.utils import cached_file
 
 from gr00t.configs.data.embodiment_configs import ModalityConfig
@@ -156,6 +158,22 @@ def validate_action_horizons(modality_configs, max_action_horizon: int) -> None:
         )
 
 
+_EVAL_TRANSFORM_POOL = None
+_PROMPT_CACHE_SIZE = 32
+
+
+def _eval_transform_pool():
+    """Shared thread pool for the per-frame eval image transforms (created on first use)."""
+    global _EVAL_TRANSFORM_POOL
+    if _EVAL_TRANSFORM_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _EVAL_TRANSFORM_POOL = ThreadPoolExecutor(
+            max_workers=min(8, os.cpu_count() or 1), thread_name_prefix="gr00t-image"
+        )
+    return _EVAL_TRANSFORM_POOL
+
+
 class Gr00tN1d7DataCollator:
     def __init__(
         self,
@@ -169,6 +187,100 @@ class Gr00tN1d7DataCollator:
         self.processor.tokenizer.padding_side = "left"
         self.model_type = model_type
         self.model_name = model_name
+        # Device for the VLM image processor (resize, normalize, patchify). None keeps
+        # it on the CPU (training, data loaders). Inference sets it to the model's GPU:
+        # the uint8 frames are copied instead of float32 patches, and the work runs on a
+        # side stream that the calling thread's stream then waits for (no CPU sync).
+        self.image_device: str | torch.device | None = None
+        self._image_stream = None
+        # Skip the VLM image processor's resize. Only for frames already at a size it
+        # would keep (see Gr00tN1d7Processor.set_images_pretransformed); its resize
+        # otherwise resamples every frame, even one already at the target size.
+        self.skip_image_resize = False
+
+    def set_image_device(self, device: str | torch.device | None) -> None:
+        """Run the VLM image processor on ``device`` (e.g. ``"cuda"``), or the CPU if None."""
+        device = torch.device(device) if device is not None else None
+        self.image_device = device
+        self._image_stream = (
+            torch.cuda.Stream(device=device)
+            if device is not None and device.type == "cuda"
+            else None
+        )
+
+    def __getstate__(self):
+        # CUDA streams cannot be pickled (data loader workers); workers use the CPU path.
+        state = self.__dict__.copy()
+        state["image_device"] = None
+        state["_image_stream"] = None
+        state["_prompt_cache"] = None
+        return state
+
+    def enable_prompt_cache(self, enabled: bool = True) -> None:
+        """Reuse the tokenized prompt while the text and image grid stay the same.
+
+        At inference the prompt is identical from step to step; only the pixels change.
+        With the cache on, the image processor still runs every call, but the tokenizer
+        (and the image-token expansion before it) only runs for a new (text, image grid)
+        pair. The ids are identical to an uncached call.
+        """
+        self._prompt_cache = {} if enabled else None
+
+    def _run_processor(self, text_list: list[str], image_inputs: list) -> BatchFeature:
+        kwargs = {"return_tensors": "pt", "padding": True}
+        if self.image_device is not None:
+            kwargs["device"] = self.image_device
+        if self.skip_image_resize:
+            kwargs["do_resize"] = False
+        cache = getattr(self, "_prompt_cache", None)
+        if cache is None:
+            return self.processor(text=text_list, images=image_inputs, **kwargs)
+        image_kwargs = {"return_tensors": "pt"}
+        if self.image_device is not None:
+            image_kwargs["device"] = self.image_device
+        if self.skip_image_resize:
+            image_kwargs["do_resize"] = False
+        image_out = self.processor.image_processor(images=image_inputs, **image_kwargs)
+        grid = image_out["image_grid_thw"]
+        key = (tuple(text_list), tuple(tuple(row) for row in grid.tolist()))
+        text_out = cache.get(key)
+        if text_out is None:
+            full = self.processor(text=text_list, images=image_inputs, **kwargs)
+            text_out = {k: v for k, v in full.items() if k not in image_out}
+            if len(cache) >= _PROMPT_CACHE_SIZE:
+                cache.pop(next(iter(cache)))
+            cache[key] = text_out
+        out = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in text_out.items()}
+        out.update(image_out)
+        return BatchFeature(data=out)
+
+    def _process_vlm(self, text_list: list[str], image_inputs: list) -> BatchFeature:
+        stream = self._image_stream
+        if stream is None:
+            return self._run_processor(text_list, image_inputs)
+        consumer = torch.cuda.current_stream(stream.device)
+        if any(isinstance(img, torch.Tensor) and img.is_cuda for img in image_inputs):
+            # Frames already on the GPU may still be in flight on the caller's stream.
+            # (CPU frames need no wait, and waiting would serialize this thread behind
+            # whatever model work is queued, e.g. in a pipelined server.)
+            stream.wait_stream(consumer)
+        with torch.cuda.stream(stream):
+            vlm_inputs = self._run_processor(text_list, image_inputs)
+        if threading.current_thread() is not threading.main_thread():
+            # A prefetch thread: the main thread may be queueing the previous frame on
+            # the same default stream, so a GPU-side wait would stall that frame. Block
+            # only this thread instead.
+            stream.synchronize()
+            return vlm_inputs
+        # Main thread (e.g. the inference server): do not block the CPU. Work queued
+        # later on this stream (the model) waits for the image kernels on the GPU, so
+        # the remaining CPU preprocessing overlaps them. The allocator must not recycle
+        # these tensors until that stream is done with them.
+        consumer.wait_stream(stream)
+        for value in vlm_inputs.values():
+            if isinstance(value, torch.Tensor) and value.is_cuda:
+                value.record_stream(consumer)
+        return vlm_inputs
 
     def __call__(self, features: list[Dict[str, Any]]) -> BatchFeature:
         batch = {}
@@ -187,12 +299,7 @@ class Gr00tN1d7DataCollator:
                     curr_image_inputs = v["images"]
                     image_inputs += curr_image_inputs
 
-                vlm_inputs = self.processor(
-                    text=text_list,
-                    images=image_inputs,
-                    return_tensors="pt",
-                    padding=True,
-                )
+                vlm_inputs = self._process_vlm(text_list, image_inputs)
                 for k, v in vlm_inputs.items():
                     batch[k] = v
             elif key in (
@@ -296,6 +403,8 @@ class Gr00tN1d7Processor(BaseProcessor):
                 self.embodiment_id_mapping[k] = v
         self.shortest_image_edge = shortest_image_edge
         self.crop_fraction = crop_fraction
+        # Runtime-only inference option, not saved: see set_images_pretransformed.
+        self.images_pretransformed = False
 
         # Statistics cache (mirrors state_action_processor.statistics for serialization)
         self.statistics: dict[str, dict[str, dict[str, dict[str, list[float]]]]] = {}
@@ -333,6 +442,53 @@ class Gr00tN1d7Processor(BaseProcessor):
     @property
     def collator(self):
         return self._collator
+
+    def set_images_pretransformed(self, enabled: bool = True) -> None:
+        """Take inference camera frames as final model input: no crop, no resize.
+
+        For a camera pipeline that already produces what the eval transform and the VLM
+        image processor would: a centre crop of ``crop_fraction`` of the frame, resized to
+        a short edge of ``shortest_image_edge`` with both sides multiples of 32 (patch 16,
+        merge 2), e.g. 352x256 for 4:3 or 448x256 for 16:9 cameras. Frames of any other
+        size raise instead of being silently fed at the wrong framing. Training ignores it.
+        """
+        self.images_pretransformed = enabled
+        self._collator.skip_image_resize = enabled
+
+    def _use_pretransformed_images(self, image_transform) -> bool:
+        return getattr(self, "images_pretransformed", False) and (
+            image_transform is self.eval_image_transform
+        )
+
+    def _pretransformed_frame(self, image) -> torch.Tensor:
+        """An (H, W, 3) uint8 frame at a final model size, as a (3, H, W) uint8 tensor."""
+        frame = np.asarray(image)
+        if frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError(
+                f"Pre-transformed images must be (H, W, 3) uint8; got {frame.shape} {frame.dtype}"
+            )
+        height, width = frame.shape[:2]
+        image_processor = self.processor.image_processor
+        factor = image_processor.patch_size * image_processor.merge_size
+        short_edge = (
+            self.shortest_image_edge
+            if self.shortest_image_edge is not None
+            else self.image_target_size[0]
+        )
+        kept = smart_resize(
+            height,
+            width,
+            factor=factor,
+            min_pixels=image_processor.size["shortest_edge"],
+            max_pixels=image_processor.size["longest_edge"],
+        ) == (height, width)
+        if min(height, width) != short_edge or not kept:
+            raise ValueError(
+                f"Pre-transformed images must have a short edge of {short_edge} and both "
+                f"sides a multiple of {factor} (e.g. 352x256 for 4:3, 448x256 for 16:9 "
+                f"cameras); got {width}x{height}"
+            )
+        return torch.from_numpy(frame).permute(2, 0, 1)
 
     def train(self):
         super().train()
@@ -493,7 +649,14 @@ class Gr00tN1d7Processor(BaseProcessor):
         assert images.ndim == 6
         B, T, V, img_H, img_W, img_C = images.shape
 
-        if self.use_albumentations:
+        if self._use_pretransformed_images(self.eval_image_transform):
+            images_flat = images.reshape(B * T * V, img_H, img_W, img_C).numpy()
+            transformed_images = (
+                torch.stack([self._pretransformed_frame(img) for img in images_flat])
+                .reshape(B, T * V, img_C, img_H, img_W)
+                .numpy()
+            )
+        elif self.use_albumentations:
             images_flat = images.reshape(B * T * V, img_H, img_W, img_C)
             pil_images = [Image.fromarray(img.numpy()) for img in images_flat]
             transformed_pil, _ = apply_with_replay(self.eval_image_transform, pil_images)
@@ -543,6 +706,19 @@ class Gr00tN1d7Processor(BaseProcessor):
 
         return BatchFeature(transformed_observation)
 
+    def _chat_template_text(self, language: str, num_images: int, conversation) -> str:
+        cache = self.__dict__.setdefault("_chat_template_cache", {})
+        key = (language, num_images)
+        text = cache.get(key)
+        if text is None:
+            text = self.processor.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=False
+            )
+            if len(cache) >= 256:
+                cache.pop(next(iter(cache)))
+            cache[key] = text
+        return text
+
     def _apply_vlm_processing(self, images: np.ndarray, language: str) -> BatchFeature:
         """
         Args:
@@ -563,10 +739,9 @@ class Gr00tN1d7Processor(BaseProcessor):
             }
         ]
 
-        # Apply chat template but don't process yet - let collator handle it
-        text = self.processor.apply_chat_template(
-            conversation, tokenize=False, add_generation_prompt=False
-        )
+        # Apply chat template but don't process yet - let collator handle it. The text
+        # depends only on the instruction and the number of images, so it is cached.
+        text = self._chat_template_text(language, len(frames), conversation)
 
         # Return vlm_content format for collation
         return {
@@ -710,7 +885,37 @@ class Gr00tN1d7Processor(BaseProcessor):
     ):
         temporal_stacked_images = {}
 
-        if self.use_albumentations:
+        if self._use_pretransformed_images(image_transform):
+            # The camera pipeline already cropped and resized (set_images_pretransformed).
+            for view in image_keys:
+                assert view in images, f"{view} not in {images}"
+                temporal_stacked_images[view] = torch.stack(
+                    [self._pretransformed_frame(img) for img in images[view]]
+                )
+        elif (
+            self.use_albumentations
+            and masks is None
+            and image_transform is self.eval_image_transform
+            and not hasattr(image_transform, "replay")
+        ):
+            # Inference: the eval transform is deterministic, so every frame of every
+            # camera is independent. OpenCV releases the GIL, so a thread pool runs them
+            # in parallel (identical output; on a Jetson AGX Orin 4 frames take 2.5 ms
+            # instead of 5.7 ms, 12 frames 4.8 ms instead of 17 ms).
+            for view in image_keys:
+                assert view in images, f"{view} not in {images}"
+            jobs = [(view, img) for view in image_keys for img in images[view]]
+            results = list(
+                _eval_transform_pool().map(
+                    lambda job: apply_with_replay(image_transform, [job[1]])[0][0], jobs
+                )
+            )
+            start = 0
+            for view in image_keys:
+                count = len(images[view])
+                temporal_stacked_images[view] = torch.stack(results[start : start + count])
+                start += count
+        elif self.use_albumentations:
             # Use albumentations transforms
             replay = None
             for view in image_keys:

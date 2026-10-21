@@ -24,7 +24,13 @@ import threading
 import time
 
 from gr00t.data.types import ModalityConfig
-from gr00t.policy.server_client import MsgSerializer, PolicyClient, PolicyServer
+from gr00t.policy.server_client import (
+    MsgSerializer,
+    PipelinedPolicyClient,
+    PipelinedPolicyServer,
+    PolicyClient,
+    PolicyServer,
+)
 import msgpack
 import numpy as np
 import pytest
@@ -185,6 +191,131 @@ class TestPolicyServerAuth:
                 ) as valid_client:
                     valid_client.kill_server()
                 thread.join(timeout=3)
+
+
+class SplitMockPolicy(MockPolicy):
+    """Mock with the prepare / run / decode split the pipelined server overlaps."""
+
+    def __init__(self, prepare_s=0.0, model_s=0.0):
+        super().__init__()
+        self.prepare_s, self.model_s = prepare_s, model_s
+        self.threads = {"prepare": set(), "model": set()}
+
+    def prepare_inputs(self, observation):
+        self.threads["prepare"].add(threading.current_thread().name)
+        if observation.get("fail"):
+            raise ValueError("bad observation")
+        time.sleep(self.prepare_s)
+        return {"id": int(observation["id"])}, None
+
+    def run_model(self, inputs):
+        self.threads["model"].add(threading.current_thread().name)
+        time.sleep(self.model_s)
+        return inputs["id"]
+
+    def decode_model_output(self, pred, states):
+        return {"joint_pos": np.full(7, pred, dtype=np.float32)}
+
+
+def _start(server):
+    thread = threading.Thread(target=server.run, daemon=True, name="model-thread")
+    thread.start()
+    time.sleep(0.3)
+    return thread
+
+
+@pytest.mark.timeout(30)
+class TestPipelinedPolicyServer:
+    """The pipelined server: plain clients unchanged, several requests in flight, order kept."""
+
+    def test_plain_client_endpoints(self):
+        port = _find_free_port()
+        policy = SplitMockPolicy()
+        with PipelinedPolicyServer(policy, host="127.0.0.1", port=port) as server:
+            thread = _start(server)
+            with PolicyClient(host="127.0.0.1", port=port, timeout_ms=5000) as client:
+                assert client.ping()
+                action, _ = client.call_endpoint("get_action", {"observation": {"id": 3}})
+                np.testing.assert_array_equal(action["joint_pos"], np.full(7, 3, np.float32))
+                assert client.call_endpoint("reset", {"options": None})["reset_count"] == 1
+                assert client.get_modality_config()["state"].modality_keys == ["joint_pos"]
+                with pytest.raises(RuntimeError, match="Unknown endpoint"):
+                    client.call_endpoint("nonexistent_endpoint", requires_input=False)
+                client.kill_server()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+    def test_replies_in_order_and_errors_do_not_break_the_stream(self):
+        port = _find_free_port()
+        policy = SplitMockPolicy(prepare_s=0.01, model_s=0.02)
+        with PipelinedPolicyServer(policy, host="127.0.0.1", port=port, max_in_flight=3) as server:
+            thread = _start(server)
+            with PipelinedPolicyClient(host="127.0.0.1", port=port, timeout_ms=5000) as client:
+                ids = [0, 1, 2, 3, 4, 5]
+                for i in ids[:3]:
+                    client.submit({"id": i})
+                received = []
+                for i in ids[3:]:
+                    received.append(client.receive())
+                    client.submit({"id": i})
+                while client.in_flight:
+                    received.append(client.receive())
+                assert [int(a["joint_pos"][0]) for a, _ in received] == ids
+
+                client.submit({"id": 7, "fail": True})
+                client.submit({"id": 8})
+                with pytest.raises(RuntimeError, match="bad observation"):
+                    client.receive()
+                action, _ = client.receive()
+                assert int(action["joint_pos"][0]) == 8
+                client.call("kill")
+                client.receive()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        # Preprocessing and the model ran on different threads.
+        assert policy.threads["model"] == {"model-thread"}
+        assert policy.threads["prepare"].isdisjoint(policy.threads["model"])
+
+    def test_preprocessing_overlaps_the_model(self):
+        prepare_s, model_s, n = 0.06, 0.1, 6
+        port = _find_free_port()
+        policy = SplitMockPolicy(prepare_s=prepare_s, model_s=model_s)
+        with PipelinedPolicyServer(policy, host="127.0.0.1", port=port) as server:
+            thread = _start(server)
+            with PipelinedPolicyClient(host="127.0.0.1", port=port, timeout_ms=5000) as client:
+                start = time.perf_counter()
+                client.submit({"id": 0})
+                for i in range(1, n):
+                    client.submit({"id": i})
+                    client.receive()
+                client.receive()
+                elapsed = time.perf_counter() - start
+                client.call("kill")
+                client.receive()
+            thread.join(timeout=5)
+        serial = n * (prepare_s + model_s)
+        overlapped = prepare_s + n * model_s
+        assert elapsed < (serial + overlapped) / 2, (elapsed, serial, overlapped)
+
+    def test_token_required(self):
+        port = _find_free_port()
+        with PipelinedPolicyServer(
+            SplitMockPolicy(), host="127.0.0.1", port=port, api_token="correct"
+        ) as server:
+            thread = _start(server)
+            with PipelinedPolicyClient(
+                host="127.0.0.1", port=port, timeout_ms=5000, api_token="wrong"
+            ) as client:
+                with pytest.raises(RuntimeError, match="Unauthorized"):
+                    client.get_action({"id": 1})
+            with PipelinedPolicyClient(
+                host="127.0.0.1", port=port, timeout_ms=5000, api_token="correct"
+            ) as client:
+                action, _ = client.get_action({"id": 1})
+                assert int(action["joint_pos"][0]) == 1
+                client.call("kill")
+                client.receive()
+            thread.join(timeout=5)
 
 
 class TestMsgSerializer:

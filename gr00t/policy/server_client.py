@@ -151,6 +151,7 @@ class PolicyServer:
     # Bounded linger (ms) on close so a pending reply (e.g. the `kill` ack)
     # flushes instead of being dropped, while still releasing the port promptly.
     _CLOSE_LINGER_MS = 1000
+    _SOCKET_TYPE = zmq.REP
 
     def __init__(
         self,
@@ -165,7 +166,7 @@ class PolicyServer:
         self.running = True
         self._closed = False
         self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.REP)
+        self.socket = self.context.socket(self._SOCKET_TYPE)
         self.socket.bind(f"tcp://{host}:{port}")
         self._endpoints: dict[str, EndpointHandler] = {}
         self.api_token = api_token
@@ -229,6 +230,20 @@ class PolicyServer:
             requires_input: Whether the handler requires input data.
         """
         self._endpoints[name] = EndpointHandler(handler, requires_input)
+
+    def _handle_request(self, request: dict) -> Any:
+        """Run one decoded request to completion and return the reply payload."""
+        if not self._validate_token(request):
+            return {"error": "Unauthorized: Invalid API token"}
+        endpoint = request.get("endpoint", "get_action")
+        if endpoint not in self._endpoints:
+            raise ValueError(f"Unknown endpoint: {endpoint}")
+        handler = self._endpoints[endpoint]
+        return (
+            handler.handler(**request.get("data", {}))
+            if handler.requires_input
+            else handler.handler()
+        )
 
     def _validate_token(self, request: dict) -> bool:
         """
@@ -407,3 +422,218 @@ class PolicyClient(BasePolicy):
         raise NotImplementedError(
             "check_action is not implemented. Please use `strict=False` to disable strict mode or implement this method in the subclass."
         )
+
+
+class PipelinedPolicyServer(PolicyServer):
+    """A ``PolicyServer`` that overlaps one request's preprocessing with the previous
+    request's model run.
+
+    A plain server handles one request at a time: deserialize, preprocess on the CPU,
+    run the model, reply. With this server a client may keep several ``get_action``
+    requests in flight (see ``PipelinedPolicyClient``): a network thread receives each
+    request and runs the policy's ``prepare_inputs`` (CPU work and GPU image
+    preprocessing) while the main thread runs the model for the request before it.
+    Replies go out in request order. Each request still takes as long as before; what
+    improves is how often one completes, which approaches ``1 / model time``.
+
+    The policy needs ``prepare_inputs``, ``run_model`` and ``decode_model_output``
+    (``Gr00tPolicy`` has them). Any other policy, and every other endpoint, is handled
+    whole on the main thread, still in request order. Plain ``PolicyClient`` (REQ)
+    clients work unchanged; they just never have two requests in flight.
+    """
+
+    _SOCKET_TYPE = zmq.ROUTER
+
+    def __init__(
+        self,
+        policy: BasePolicy,
+        host: str = "*",
+        port: int = 5555,
+        api_token: str = None,
+        max_in_flight: int = 2,
+    ):
+        super().__init__(policy, host=host, port=port, api_token=api_token)
+        self.max_in_flight = max(1, max_in_flight)
+        self._split = all(
+            callable(getattr(policy, name, None))
+            for name in ("prepare_inputs", "run_model", "decode_model_output")
+        )
+
+    def _prepare(self, request: dict):
+        """Network thread: everything that can run ahead of the model."""
+        if not self._validate_token(request):
+            return ("reply", {"error": "Unauthorized: Invalid API token"})
+        endpoint = request.get("endpoint", "get_action")
+        if endpoint == "get_action" and self._split:
+            observation = request.get("data", {}).get("observation")
+            return ("model", self.policy.prepare_inputs(observation))
+        return ("call", request)
+
+    def _finish(self, job) -> Any:
+        """Main thread: the model run, or a whole non-split request."""
+        kind, payload = job
+        if kind == "reply":
+            return payload
+        if kind == "model":
+            collated_inputs, states = payload
+            action = self.policy.decode_model_output(self.policy.run_model(collated_inputs), states)
+            return (action, {})
+        return self._handle_request(payload)
+
+    def run(self):
+        import queue
+        import threading
+        import traceback
+
+        addr = self.socket.getsockopt_string(zmq.LAST_ENDPOINT)
+        print(
+            f"Server is ready and listening on {addr} (pipelined, {self.max_in_flight} in flight)"
+        )
+        inproc = f"inproc://gr00t-replies-{id(self)}"
+        replies_in = self.context.socket(zmq.PULL)
+        replies_in.bind(inproc)
+        replies_out = self.context.socket(zmq.PUSH)
+        replies_out.connect(inproc)
+        jobs: queue.Queue = queue.Queue(maxsize=self.max_in_flight)
+        stop = threading.Event()
+
+        def network_loop():
+            # Owns the ROUTER socket: receives and preprocesses requests, forwards replies.
+            poller = zmq.Poller()
+            poller.register(self.socket, zmq.POLLIN)
+            poller.register(replies_in, zmq.POLLIN)
+            while True:
+                events = dict(poller.poll(100))
+                if replies_in in events:
+                    frames = replies_in.recv_multipart()
+                    if frames == [b"__stop__"]:
+                        return
+                    self.socket.send_multipart(frames)
+                    continue
+                if stop.is_set():
+                    continue  # draining: only forward the remaining replies
+                if self.socket in events:
+                    frames = self.socket.recv_multipart()
+                    envelope, message = frames[:-1], frames[-1]
+                    try:
+                        job = self._prepare(MsgSerializer.from_bytes(message))
+                    except Exception as e:
+                        print(f"Error in server: {e}")
+                        print(traceback.format_exc())
+                        job = ("reply", {"error": str(e)})
+                    # Blocks while max_in_flight requests are waiting: backpressure.
+                    jobs.put((envelope, job))
+
+        network = threading.Thread(target=network_loop, name="gr00t-server-io", daemon=True)
+        network.start()
+        try:
+            while self.running:
+                try:
+                    envelope, job = jobs.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                try:
+                    result = self._finish(job)
+                except Exception as e:
+                    print(f"Error in server: {e}")
+                    print(traceback.format_exc())
+                    result = {"error": str(e)}
+                replies_out.send_multipart([*envelope, MsgSerializer.to_bytes(result)])
+        finally:
+            stop.set()
+            replies_out.send_multipart([b"__stop__"])
+            network.join(timeout=5)
+            replies_out.close(linger=0)
+            replies_in.close(linger=0)
+
+    @staticmethod
+    def start_server(
+        policy: BasePolicy,
+        port: int,
+        host: str = "*",
+        api_token: str = None,
+        max_in_flight: int = 2,
+    ):
+        with PipelinedPolicyServer(
+            policy, host=host, port=port, api_token=api_token, max_in_flight=max_in_flight
+        ) as server:
+            server.run()
+
+
+class PipelinedPolicyClient:
+    """Client that can keep several ``get_action`` requests in flight.
+
+    Use with ``PipelinedPolicyServer`` (``run_gr00t_server.py --pipelined``)::
+
+        client = PipelinedPolicyClient(port=5555)
+        client.submit(obs_0)
+        client.submit(obs_1)  # sent while obs_0 is still being processed
+        action_0, _ = client.receive()  # replies arrive in submission order
+        client.submit(obs_2)
+        action_1, _ = client.receive()
+
+    ``get_action`` (submit then receive) behaves like ``PolicyClient.get_action``.
+    """
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 5555,
+        timeout_ms: int = 15000,
+        api_token: str = None,
+    ):
+        self.host, self.port, self.timeout_ms, self.api_token = host, port, timeout_ms, api_token
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.DEALER)
+        self.socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        self.socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        self.socket.connect(f"tcp://{host}:{port}")
+        self.in_flight = 0
+        self._closed = False
+
+    def call(self, endpoint: str, data: dict | None = None) -> None:
+        request: dict = {"endpoint": endpoint}
+        if data is not None:
+            request["data"] = data
+        if self.api_token:
+            request["api_token"] = self.api_token
+        # Empty delimiter frame: the same envelope a REQ socket would send.
+        self.socket.send_multipart([b"", MsgSerializer.to_bytes(request)])
+        self.in_flight += 1
+
+    def submit(self, observation: dict[str, Any], options: dict[str, Any] | None = None) -> None:
+        """Send a ``get_action`` request without waiting for its reply."""
+        self.call("get_action", {"observation": observation, "options": options})
+
+    def receive(self) -> Any:
+        """Wait for the oldest outstanding reply and return it."""
+        if self.in_flight == 0:
+            raise RuntimeError("No request in flight")
+        frames = self.socket.recv_multipart()
+        self.in_flight -= 1
+        response = MsgSerializer.from_bytes(frames[-1])
+        if isinstance(response, dict) and "error" in response:
+            raise RuntimeError(f"Server error: {response['error']}")
+        return tuple(response) if isinstance(response, list) else response
+
+    def get_action(
+        self, observation: dict[str, Any], options: dict[str, Any] | None = None
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        self.submit(observation, options)
+        return self.receive()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.socket.close(linger=0)
+            self.context.term()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()

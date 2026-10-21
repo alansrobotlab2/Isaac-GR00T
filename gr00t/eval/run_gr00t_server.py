@@ -30,7 +30,7 @@ from gr00t.policy.inference_optimizations import (
     load_tensorrt_engines,
 )
 from gr00t.policy.replay_policy import ReplayPolicy
-from gr00t.policy.server_client import PolicyServer
+from gr00t.policy.server_client import PipelinedPolicyServer, PolicyServer
 import tyro
 
 
@@ -111,6 +111,20 @@ class ServerConfig:
     attn_implementation: Literal["flash_attention_2", "sdpa"] | None = None
     """Override the backbone attention implementation. None keeps the checkpoint's setting."""
 
+    pipelined: bool = False
+    """Accept several get_action requests at once and preprocess the next one while the
+    model runs the current one (needs a client that keeps two in flight, e.g.
+    gr00t.policy.server_client.PipelinedPolicyClient; plain clients still work)."""
+
+    gpu_image_preprocessing: bool = True
+    """Resize, normalize and patchify camera images on the GPU instead of the CPU (pixel
+    values match to within one 8-bit step). Ignored when --device is not a CUDA device."""
+
+    images_pretransformed: bool = False
+    """Camera frames arrive already centre-cropped (crop_fraction, 0.95) and resized to the
+    final model input size: short edge 256, both sides multiples of 32, e.g. 352x256 for
+    4:3 or 448x256 for 16:9 cameras. Skips the crop and both resizes; other sizes raise."""
+
     compile_backbone: bool = False
     """torch.compile the backbone (needs --attn-implementation sdpa; skipped under TensorRT)."""
 
@@ -144,7 +158,11 @@ def main(config: ServerConfig):
             device=config.device,
             strict=config.strict,
             attn_implementation=config.attn_implementation,
+            gpu_image_preprocessing=config.gpu_image_preprocessing,
+            images_pretransformed=config.images_pretransformed,
         )
+        if config.images_pretransformed:
+            print("  Images pre-transformed: crop and resize skipped")
         if config.denoising_steps is not None:
             # The action head reads num_inference_timesteps at sampling time.
             policy.model.action_head.num_inference_timesteps = config.denoising_steps
@@ -221,7 +239,8 @@ def main(config: ServerConfig):
 
         policy = Gr00tSimPolicyWrapper(policy)
 
-    with PolicyServer(
+    server_class = PipelinedPolicyServer if config.pipelined else PolicyServer
+    with server_class(
         policy=policy,
         host=config.host,
         port=config.port,

@@ -457,7 +457,11 @@ If you later run `uv sync`, rerun the Orin installer to restore the locally buil
 | `--num-iterations` | `20` | Number of benchmark iterations |
 | `--warmup` | `5` | Number of warmup iterations |
 | `--skip-compile` | `false` | Skip torch.compile benchmark |
-| `--steps` | `all` | Steps to run: `all` or comma-separated subset of `export,build,verify,benchmark` |
+| `--int8` | none | Quantize `vit`, `llm` and/or `action_head` (the DiT) to INT8, calibrated on `--dataset-path` (`llm` keeps its MLP down-projections in BF16). About 2x faster linear layers on Jetson Orin at a small accuracy cost; see `INFERENCE_OPTIMIZATIONS_N1D7.md` (round 3). Writes `<output-dir>/onnx_int8` and builds from it |
+| `--int8-calibration-frames` | `64` | Dataset frames used to calibrate the INT8 ranges |
+| `--int8-skip` | none | Keep linear layers whose ONNX node name matches this regular expression in BF16 |
+| `--int8-action-head-all` | `false` | Also quantize the VL self-attention and encoders inside the fused action head (faster, less accurate) |
+| `--steps` | `all` | Steps to run: `all` or comma-separated subset of `export,quantize,build,verify,benchmark` (`quantize` does nothing without `--int8`) |
 | `--log-file` | `<output-dir>/pipeline.log` | Log file path |
 
 ### `standalone_inference_script.py`
@@ -476,6 +480,7 @@ If you later run `uv sync`, rerun the Orin installer to restore the locally buil
 | `--denoising-steps` | `4` | Diffusion denoising iterations |
 | `--use-fp16` | `false` | Load the model in FP16 instead of BF16 |
 | `--attn-implementation` | checkpoint setting | Override backbone attention: `flash_attention_2` or `sdpa` |
+| `--gpu-image-preprocessing` | `false` | Resize, normalize and patchify camera images on the GPU (on by default in `run_gr00t_server.py`) |
 | `--compile-backbone` | `false` | `torch.compile` the backbone (requires `--attn-implementation sdpa`; skipped with flash attention or TRT) |
 | `--compile-dit` / `--compile-action-head` | `false` | `torch.compile` the DiT / the action encoder+decoder (skipped when replaced by TRT) |
 | `--compile-mode` | `default` | `torch.compile` mode: `default`, `reduce-overhead`, or `max-autotune` |

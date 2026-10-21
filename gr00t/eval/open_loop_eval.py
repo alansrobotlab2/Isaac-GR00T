@@ -330,6 +330,9 @@ class ArgsConfig:
     attn_implementation: Literal["flash_attention_2", "sdpa"] | None = None
     """Override the backbone attention implementation. None keeps the checkpoint's setting."""
 
+    gpu_image_preprocessing: bool = False
+    """Resize, normalize and patchify camera images on the GPU instead of the CPU."""
+
     trt_engine_path: str | None = None
     """Directory of full-pipeline TensorRT engines built by
     scripts/deployment/build_trt_pipeline.py. None runs the model in PyTorch."""
@@ -409,6 +412,7 @@ def main(args: ArgsConfig):
             device="cuda" if torch.cuda.is_available() else "cpu",
             use_fp16=args.use_fp16,
             attn_implementation=args.attn_implementation,
+            gpu_image_preprocessing=args.gpu_image_preprocessing,
         )
         # Apply --denoising-steps: the action head reads num_inference_timesteps
         # at sampling time.

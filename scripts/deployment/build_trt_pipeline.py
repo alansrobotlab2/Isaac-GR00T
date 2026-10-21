@@ -75,6 +75,7 @@ class Step(str, Enum):
     """Pipeline steps. Values are the user-facing CLI tokens for --steps."""
 
     EXPORT = "export"
+    QUANTIZE = "quantize"  # no-op unless --int8 is given
     BUILD = "build"
     VERIFY = "verify"
     BENCHMARK = "benchmark"
@@ -255,6 +256,23 @@ class PipelineConfig:
     policy runs that many steps; it is faster than the per-component engines, which are
     always built as the fallback. Adds about 3 GB and a few minutes per step count."""
 
+    int8: tuple[Literal["vit", "llm", "action_head"], ...] = ()
+    """Quantize these components to INT8 (post-training, calibrated on --dataset-path):
+    'vit', 'llm' and/or 'action_head' (the DiT, in the fused engines and the per-step engine).
+    About 2x faster linear layers on Jetson Orin at a small accuracy cost; check the verify
+    step and an open-loop eval. Adds a 'quantize' step that writes <output-dir>/onnx_int8."""
+
+    int8_calibration_frames: int = 64
+    """Dataset frames to calibrate the INT8 scales on (spread over all trajectories)."""
+
+    int8_skip: Optional[str] = None
+    """Keep linear layers whose ONNX node name matches this regular expression in BF16,
+    e.g. 'blocks\\.\\d+/mlp/linear_fc2' for the ViT MLP down-projections (more accurate, slower)."""
+
+    int8_action_head_all: bool = False
+    """With --int8 action_head: also quantize the VL self-attention and the state/action
+    encoders inside the fused engines, not only the DiT."""
+
     # -- Build options ------------------------------------------------------
     workspace: int = 8192
     """TRT builder workspace size in MB."""
@@ -275,7 +293,8 @@ class PipelineConfig:
 
     # -- Pipeline control ---------------------------------------------------
     steps: str = "all"
-    """Steps to run: 'all' or comma-separated subset of 'export,build,verify,benchmark'."""
+    """Steps to run: 'all' or comma-separated subset of
+    'export,quantize,build,verify,benchmark' ('quantize' does nothing without --int8)."""
 
     log_file: Optional[str] = None
     """Log file path. Defaults to <output_dir>/pipeline.log."""
@@ -302,6 +321,34 @@ def _run_export(cfg: PipelineConfig, onnx_dir: str, embodiment_tag, log_fp) -> N
     )
     with _redirect_to_log(log_fp):
         export_main(export_cfg)
+
+
+def _run_quantize(cfg: PipelineConfig, onnx_dir: str, int8_dir: str, embodiment_tag, log_fp):
+    from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
+    from gr00t.policy.gr00t_policy import Gr00tPolicy
+    from int8_calibration import quantize_pipeline
+
+    # The export step usually configures INFO logging; a run that starts here must too,
+    # or the per-graph calibration summaries never reach the log.
+    if logging.getLogger().level > logging.INFO:
+        logging.getLogger().setLevel(logging.INFO)
+    with _redirect_to_log(log_fp):
+        policy = Gr00tPolicy(
+            embodiment_tag=embodiment_tag, model_path=cfg.model_path, device="cuda"
+        )
+        dataset = LeRobotEpisodeLoader(
+            dataset_path=cfg.dataset_path, modality_configs=policy.get_modality_config()
+        )
+        return quantize_pipeline(
+            policy,
+            dataset,
+            onnx_dir,
+            int8_dir,
+            tuple(cfg.int8),
+            num_frames=cfg.int8_calibration_frames,
+            skip=cfg.int8_skip,
+            quantize_action_head_all=cfg.int8_action_head_all,
+        )
 
 
 def _run_build(
@@ -425,6 +472,20 @@ def main(cfg: PipelineConfig | None = None) -> None:
             steps.append(Step(token))
 
     # Validate step dependencies
+    int8_dir = os.path.join(cfg.output_dir, "onnx_int8")
+    if cfg.int8 and Step.BUILD in steps and Step.QUANTIZE not in steps:
+        if not os.path.isdir(int8_dir) or _count_files(int8_dir, ".onnx") == 0:
+            raise ValueError(
+                "--int8 builds from the INT8 graphs: include 'quantize' in --steps or "
+                f"ensure ONNX files exist in {int8_dir}"
+            )
+    if Step.QUANTIZE in steps and cfg.int8 and Step.EXPORT not in steps:
+        onnx_dir = os.path.join(cfg.output_dir, "onnx")
+        if not os.path.isdir(onnx_dir) or _count_files(onnx_dir, ".onnx") == 0:
+            raise ValueError(
+                "Step 'quantize' requires ONNX models. Either include 'export' in --steps "
+                f"or ensure ONNX files exist in {onnx_dir}"
+            )
     if Step.BUILD in steps and Step.EXPORT not in steps:
         onnx_dir = os.path.join(cfg.output_dir, "onnx")
         if not os.path.isdir(onnx_dir) or _count_files(onnx_dir, ".onnx") == 0:
@@ -472,6 +533,8 @@ def main(cfg: PipelineConfig | None = None) -> None:
         print(f"  Export mode:  {cfg.export_mode}")
         print(f"  Batch size:   {cfg.batch_size}")
         print(f"  Precision:    {cfg.precision}")
+        if cfg.int8:
+            print(f"  INT8:         {', '.join(cfg.int8)}")
         print(f"  Output:       {cfg.output_dir}")
         print(f"  Steps:        {', '.join(s.value for s in steps)}")
         print(f"  Log file:     {log_path}")
@@ -490,10 +553,28 @@ def main(cfg: PipelineConfig | None = None) -> None:
                     )
                     results[step.value] = f"{n} ONNX files ({_fmt_elapsed(elapsed)})"
 
+                elif step is Step.QUANTIZE:
+                    if not cfg.int8:
+                        results[step.value] = "skipped (no --int8)"
+                        continue
+                    _print_header(i, total, f"Quantizing {', '.join(cfg.int8)} to INT8...")
+                    t0 = time.time()
+                    summaries = _run_quantize(cfg, onnx_dir, int8_dir, embodiment_tag, log_fp)
+                    elapsed = time.time() - t0
+                    layers = sum(s["layers"] for s in summaries.values())
+                    _print_result(
+                        i,
+                        total,
+                        f"Quantize complete -- {layers} INT8 layers in {len(summaries)} graphs "
+                        f"({int8_dir})",
+                        elapsed,
+                    )
+                    results[step.value] = f"{layers} INT8 layers ({_fmt_elapsed(elapsed)})"
+
                 elif step is Step.BUILD:
                     _print_header(i, total, "Building TensorRT engines...")
                     t0 = time.time()
-                    _run_build(cfg, onnx_dir, engine_dir, log_fp)
+                    _run_build(cfg, int8_dir if cfg.int8 else onnx_dir, engine_dir, log_fp)
                     _copy_export_metadata(onnx_dir, engine_dir)
                     elapsed = time.time() - t0
                     n = _count_files(engine_dir, ".engine")

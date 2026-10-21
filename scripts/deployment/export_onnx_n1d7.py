@@ -318,29 +318,48 @@ def _apply_rotary_real(x, cos, sin):
     return (x * cos + rotated * sin).to(orig_dtype)
 
 
-def _make_onnx_vision_attention_forward(attn_module, chunk_sizes=None):
+def _make_onnx_vision_attention_forward(attn_module, chunk_sizes=None, softmax_fp32=False):
     """Create an ONNX-exportable attention forward for a single VisionAttention.
 
-    Three key changes from the original:
-    1. Replaces cu_seqlens-based splitting with static chunk splitting
-       (each image's patches attend only within their own chunk)
+    Changes from the original:
+    1. Replaces cu_seqlens-based splitting with static per-image attention. Images of
+       equal size (the usual case: every camera has the same resolution) are attended
+       as one batch; images of different sizes fall back to one attention per image.
     2. Replaces apply_rotary_pos_emb_vision (uses complex numbers) with
        real-valued rotate_half implementation
-    3. Casts to float32 before softmax for TRT accuracy
+
+    The attention itself is MatMul -> Softmax -> MatMul in the tensor's own dtype, which
+    is the pattern TensorRT fuses into a single attention kernel. ``softmax_fp32=True``
+    restores the older export that casts the scores to float32 around the softmax; that
+    cast blocks the fusion (on a Jetson AGX Orin, 4 images: 12 ms of a 60 ms engine).
 
     Args:
         attn_module: The VisionAttention module to wrap
         chunk_sizes: List of ints, number of patches per image.
             e.g. [256, 256] for 2 images of 256 patches each.
             If None or single chunk, does full-sequence attention.
+        softmax_fp32: Cast the attention scores to float32 for the softmax.
     """
+    chunk_sizes = list(chunk_sizes) if chunk_sizes else None
+    num_chunks = len(chunk_sizes) if chunk_sizes else 1
+    equal_chunks = num_chunks > 1 and len(set(chunk_sizes)) == 1
+
+    def attend(q, k, v):
+        # q, k, v: [..., num_heads, seq, head_dim]
+        weights = torch.matmul(q, k.transpose(-2, -1)) * attn_module.scaling
+        if softmax_fp32:
+            weights = F.softmax(weights.to(torch.float32), dim=-1).to(v.dtype)
+        else:
+            weights = F.softmax(weights, dim=-1)
+        return torch.matmul(weights, v)
 
     def forward(
         hidden_states, cu_seqlens=None, rotary_pos_emb=None, position_embeddings=None, **kwargs
     ):
         seq_length = hidden_states.shape[0]
+        num_heads = attn_module.num_heads
         qkv = attn_module.qkv(hidden_states)
-        qkv = qkv.reshape(seq_length, 3, attn_module.num_heads, -1)
+        qkv = qkv.reshape(seq_length, 3, num_heads, -1)
         qkv = qkv.permute(1, 0, 2, 3)
         q, k, v = qkv.unbind(0)
         # q, k, v: [seq_length, num_heads, head_dim]
@@ -349,42 +368,29 @@ def _make_onnx_vision_attention_forward(attn_module, chunk_sizes=None):
         q = _apply_rotary_real(q, cos, sin)
         k = _apply_rotary_real(k, cos, sin)
 
-        # Split by image chunks (mirrors cu_seqlens-based splitting in original)
-        # Each image's patches attend only within their own chunk.
-        if chunk_sizes is not None and len(chunk_sizes) > 1:
-            q_chunks = torch.split(q, chunk_sizes, dim=0)
-            k_chunks = torch.split(k, chunk_sizes, dim=0)
-            v_chunks = torch.split(v, chunk_sizes, dim=0)
-
+        # Each image's patches attend only within their own image (mirrors the
+        # cu_seqlens-based splitting in the original).
+        if equal_chunks:
+            # [seq, heads, dim] -> [images, heads, patches, dim]: one batched attention.
+            shape = (num_chunks, chunk_sizes[0], num_heads, -1)
+            q, k, v = (t.reshape(shape).transpose(1, 2) for t in (q, k, v))
+            attn_output = attend(q, k, v).transpose(1, 2)  # [images, patches, heads, dim]
+        elif num_chunks > 1:
             attn_outputs = []
-            for q_c, k_c, v_c in zip(q_chunks, k_chunks, v_chunks):
-                # q_c, k_c, v_c: [chunk_seq, num_heads, head_dim]
-                q_c = q_c.transpose(0, 1)  # [num_heads, chunk_seq, head_dim]
-                k_c = k_c.transpose(0, 1)
-                v_c = v_c.transpose(0, 1)
-
-                w = torch.matmul(q_c, k_c.transpose(-2, -1)) * attn_module.scaling
-                w = w.to(torch.float32)
-                w = F.softmax(w, dim=-1)
-                w = w.to(v_c.dtype)
-                out = torch.matmul(w, v_c)  # [num_heads, chunk_seq, head_dim]
+            for q_c, k_c, v_c in zip(
+                torch.split(q, chunk_sizes, dim=0),
+                torch.split(k, chunk_sizes, dim=0),
+                torch.split(v, chunk_sizes, dim=0),
+            ):
+                out = attend(q_c.transpose(0, 1), k_c.transpose(0, 1), v_c.transpose(0, 1))
                 attn_outputs.append(out.transpose(0, 1))  # [chunk_seq, num_heads, head_dim]
-
             attn_output = torch.cat(attn_outputs, dim=0)  # [seq, num_heads, head_dim]
         else:
             # Single image: full-sequence attention
-            q = q.transpose(0, 1)  # [num_heads, seq, head_dim]
-            k = k.transpose(0, 1)
-            v = v.transpose(0, 1)
-
-            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * attn_module.scaling
-            attn_weights = attn_weights.to(torch.float32)
-            attn_weights = F.softmax(attn_weights, dim=-1)
-            attn_weights = attn_weights.to(v.dtype)
-            attn_output = torch.matmul(attn_weights, v)
+            attn_output = attend(q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1))
             attn_output = attn_output.transpose(0, 1)  # [seq, num_heads, head_dim]
 
-        # [seq, num_heads, head_dim] → [seq, num_heads * head_dim]
+        # [..., num_heads, head_dim] → [seq, num_heads * head_dim]
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = attn_module.proj(attn_output)
         return attn_output
@@ -392,13 +398,14 @@ def _make_onnx_vision_attention_forward(attn_module, chunk_sizes=None):
     return forward
 
 
-def _patch_vision_attention_for_export(vision_model, chunk_sizes=None):
+def _patch_vision_attention_for_export(vision_model, chunk_sizes=None, softmax_fp32=False):
     """Monkey-patch all VisionAttention.forward with ONNX-friendly versions.
 
     Args:
         vision_model: The vision model whose attention blocks to patch
         chunk_sizes: List of ints, patches per image (from grid_thw).
             Enables per-image attention splitting. If None, full-sequence attention.
+        softmax_fp32: See ``_make_onnx_vision_attention_forward``.
 
     Returns list of original forwards for restoration after export.
     """
@@ -406,7 +413,9 @@ def _patch_vision_attention_for_export(vision_model, chunk_sizes=None):
     for block in vision_model.blocks:
         attn = block.attn
         originals.append(attn.forward)
-        attn.forward = _make_onnx_vision_attention_forward(attn, chunk_sizes=chunk_sizes)
+        attn.forward = _make_onnx_vision_attention_forward(
+            attn, chunk_sizes=chunk_sizes, softmax_fp32=softmax_fp32
+        )
     info = f"  Patched {len(originals)} vision attention blocks for ONNX export"
     if chunk_sizes and len(chunk_sizes) > 1:
         info += f" (chunk_sizes={chunk_sizes})"
@@ -529,7 +538,9 @@ def _assert_vision_rotary_matches_analytic(vision, vision_config, *, atol=1e-5, 
         )
 
 
-def export_vit_to_onnx(policy, output_dir, captured_vit, use_bf16=True, batch_size=1):
+def export_vit_to_onnx(
+    policy, output_dir, captured_vit, use_bf16=True, batch_size=1, softmax_fp32=False
+):
     """Export Qwen3-VL Vision Model to ONNX.
 
     Pre-computes position/rotary embeddings for the captured grid_thw to avoid
@@ -569,7 +580,9 @@ def export_vit_to_onnx(policy, output_dir, captured_vit, use_bf16=True, batch_si
     logger.info(f"  grid_thw: {grid_thw.tolist()}, chunk_sizes: {chunk_sizes}")
 
     # Patch attention for ONNX export with per-image chunk splitting
-    originals = _patch_vision_attention_for_export(vision, chunk_sizes=chunk_sizes)
+    originals = _patch_vision_attention_for_export(
+        vision, chunk_sizes=chunk_sizes, softmax_fp32=softmax_fp32
+    )
 
     # Build wrapper with pre-computed position embeddings
     wrapper = Qwen3VisionForExport(vision, grid_thw)

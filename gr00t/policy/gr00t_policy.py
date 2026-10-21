@@ -89,6 +89,8 @@ class Gr00tPolicy(BasePolicy):
         strict: bool = True,
         use_fp16: bool = False,
         attn_implementation: Literal["flash_attention_2", "sdpa"] | None = None,
+        gpu_image_preprocessing: bool = False,
+        images_pretransformed: bool = False,
     ):
         """Initialize the Gr00t Policy.
 
@@ -102,6 +104,14 @@ class Gr00tPolicy(BasePolicy):
                 than BF16 on Jetson Orin in the N1.6 optimization work (default: False)
             attn_implementation: Override the backbone attention implementation
                 ("flash_attention_2" or "sdpa"). None keeps the checkpoint's setting.
+            gpu_image_preprocessing: Run the VLM image processor (resize, normalize,
+                patchify) on ``device`` instead of the CPU. Pixel values match the CPU
+                path to within one 8-bit step; on a Jetson AGX Orin with 4 images it
+                removes about 10 ms of CPU work per step (default: False)
+            images_pretransformed: Camera frames arrive already centre-cropped and resized
+                to the final model input size (e.g. 352x256 for 4:3 cameras), so the crop
+                and both resizes are skipped. Frames of any other size raise. See
+                Gr00tN1d7Processor.set_images_pretransformed (default: False)
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -177,6 +187,17 @@ class Gr00tPolicy(BasePolicy):
             if k != "rl_info"
         }
         self.collate_fn = self.processor.collator
+        if hasattr(self.collate_fn, "enable_prompt_cache"):
+            # The prompt repeats every step at inference; tokenize it once.
+            self.collate_fn.enable_prompt_cache()
+        if gpu_image_preprocessing:
+            self.set_gpu_image_preprocessing(device)
+        if images_pretransformed:
+            if not hasattr(self.processor, "set_images_pretransformed"):
+                raise ValueError(
+                    f"{type(self.processor).__name__} does not support pre-transformed images"
+                )
+            self.processor.set_images_pretransformed(True)
 
         # Extract and validate language configuration
         # Some embodiments (e.g. OXE_DROID) define multiple language keys for
@@ -186,6 +207,18 @@ class Gr00tPolicy(BasePolicy):
         assert len(language_keys) >= 1, "At least one language key is required"
         assert len(language_delta_indices) == 1, "Only one language delta index is supported"
         self.language_key = language_keys[0]
+
+    def set_gpu_image_preprocessing(self, device: int | str | None) -> None:
+        """Run the VLM image processor on ``device`` (a CUDA device), or on the CPU if None."""
+        if not hasattr(self.collate_fn, "set_image_device"):
+            raise ValueError(
+                f"{type(self.collate_fn).__name__} does not support GPU image preprocessing"
+            )
+        if isinstance(device, int):
+            device = f"cuda:{device}"
+        if device is not None and torch.device(device).type != "cuda":
+            device = None  # CPU model: nothing to move
+        self.collate_fn.set_image_device(device)
 
     def _unbatch_observation(self, value: dict[str, Any]) -> list[dict[str, Any]]:
         """Unbatch a batched observation into a list of single observations.

@@ -11,6 +11,17 @@ rate on an AGX Orin 64GB — redone for N1.7 (Qwen3-VL / Cosmos-Reason2-2B backb
 below are the round-1 record; round 2 has its own section, and the recommended
 configuration at the end reflects both.
 
+**Round 3 (2026-10-13): 141 ms → 106 ms per step with 2-step denoising (9.5 Hz), 176 ms →
+131 ms with 4-step, and 164 ms → 118 ms through the inference server.** This uses opt-in
+INT8 ViT and DiT engines; open-loop MSE moves by under 3%, and the actions are about twice
+as far from PyTorch as with BF16 engines (2.9% vs 1.4% on average). Without INT8, GPU image
+preprocessing alone takes the server from 158 to 151 ms. See the round 3 section.
+
+**Round 4 (2026-10-14): 95 ms per step in-process (2-step), 104 ms through the server
+(9.6 Hz), and a sustained 10 Hz with 111 ms latency through the new pipelined server**, with
+the LLM in INT8 too. The cost is accuracy: actions are 4.2% from PyTorch on average (BF16
+engines: 1.4%), with open-loop MSE unchanged. See the round 4 section.
+
 ## Setup
 
 | | |
@@ -243,6 +254,209 @@ python scripts/deployment/build_tensorrt_engine.py --mode full_pipeline \
   blamed the socket; that was wrong.
 - **INT4 on a weight shared by several MatMuls**: TensorRT fails to build it.
 
+## Round 3: INT8 ViT and DiT, GPU image preprocessing
+
+Round 2 left the 2-step step at 141 ms and the server round trip at 164 ms. The target
+for the robot is 10 Hz, a 100 ms budget through the server, with 4 cameras today and
+possibly 6. Round 3 went after the ViT and the DiT, which round 2 left in BF16, and
+after the CPU preprocessing the server does before the model. Same device, model, data
+and harness as above.
+
+### Results
+
+End-to-end per step, `standalone_inference_script.py`, 3 trajectories. Action error is
+the relative L2 distance of the unnormalized action chunk from the PyTorch model with the
+same sampling noise, over 20 frames spread across the three DROID episodes.
+
+| Configuration | 2-step | 4-step | MSE (2 / 4-step) | Action error vs PyTorch (mean / worst) |
+|---|---|---|---|---|
+| Round-2 engines (BF16) | 139.5 ms | 175.8 ms | 0.016717 / 0.017283 | 1.4% / 5.1% |
+| INT8 ViT | 118.7 ms | 154.3 ms | 0.016701 / 0.017488 | 2.4% / 3.8% |
+| INT8 DiT (action head) | 127.4 ms | 152.0 ms | 0.017029 / 0.017540 | 2.1% / 6.5% |
+| **INT8 ViT + DiT** | **105.7 ms** | **130.9 ms** | 0.017017 / 0.017739 | 2.9% / 5.1% |
+
+2-step rows use `--pipeline-backbone-dit`. Open-loop MSE moves by at most 3% (it went
+down for the ViT alone). The PyTorch-relative error roughly doubles, but its worst case
+stays where the BF16 engines already are. That is the trade to judge on the robot.
+
+Through `run_gr00t_server.py` from a local client, one fixed prompt, 2-step, median of
+63 requests (the 90th percentile is within 2 ms of the median):
+
+| Configuration | Round trip |
+|---|---|
+| Round 2 (as measured in round 2) | 164 ms |
+| Round-2 engines, threaded CPU preprocessing (`--no-gpu-image-preprocessing`) | 157.6 ms |
+| + GPU image preprocessing (server default now) | 150.8 ms |
+| **+ INT8 ViT + DiT engines** | **117.7 ms** |
+
+### What changed
+
+1. **INT8 needs quantized activations, not just weights.** Round 2's INT4 experiment
+   only quantized weights, and TensorRT then runs BF16 kernels with the weights
+   dequantized, which is why it gained little. With a QuantizeLinear/DequantizeLinear
+   pair on the activation as well, TensorRT picks integer tensor-core GEMMs. On a
+   synthetic stack of MLP blocks on this GPU that is 2.1x faster at the ViT's 1,792
+   tokens, 2.1x at the LLM's 461 tokens, and 1.75x at the DiT's 41 tokens (there it
+   halves the weight bytes read).
+
+2. **New tool: `scripts/deployment/quantize_onnx_int8.py`.** It rewrites every linear
+   layer of an exported graph as INT8 (weights per output channel, activations per
+   tensor) and calibrates the activation ranges with TensorRT itself: the unmodified
+   graph is built once with every linear input marked as an output, calibration samples
+   run through it, and each range is the clip that minimizes squared error. No PyTorch
+   model or onnxruntime is needed.
+
+3. **Plain post-training INT8 breaks the ViT; SmoothQuant fixes most of it.** With every
+   ViT linear layer in INT8 and nothing else, the image embeddings fell to cosine 0.87
+   against an FP32 reference (BF16: 0.996) and the actions were 6.2% off on average,
+   31% on the worst frame. A per-layer sweep found no small set of culprits: the MLP
+   down-projections are the most sensitive, but even keeping the 24 worst layers in BF16
+   only reached 0.97. Several layer inputs have a few channels 3-10x larger than the
+   rest, which is what SmoothQuant addresses: divide each activation channel by
+   `s = amax_x^a / amax_w^(1-a)` and multiply the weight's input channel by `s`. The
+   tool inserts the division as a `Mul` that TensorRT fuses into the quantize kernel.
+   Strength 0.7 was best for the ViT (sweep 0.3-0.85), 0.8 for the DiT (0.5, 0.8, off).
+
+4. **INT8 ViT: 58 → 37 ms.** Keeping the MLP down-projections in BF16 (`--int8-skip
+   'blocks\.\d+/mlp/linear_fc2'`) costs 5.5 ms and did not lower the end-to-end action
+   error in the final measurement, so it is not the default.
+
+5. **INT8 action head: 47 → 35 ms for the fused 2-step engine** (without CUDA graphs;
+   engine alone). Only the DiT is quantized by default. Also quantizing the VL
+   self-attention and the encoders (`--int8-action-head-all`) saves another 3.6 ms but
+   doubles the head's error against the BF16 head (0.6% → 1.4%). The per-step DiT engine
+   (used when the step count has no fused engine) is quantized too.
+
+6. **Batched ViT attention: 1.3 ms, bit-identical.** Round 2's profile counted the ViT's
+   QKV projections as attention and suggested 12 ms of unfused attention. That was
+   wrong: TensorRT already used its fused attention kernel, once per image (96 calls).
+   The export now runs one batched attention per block (24 calls), and the softmax no
+   longer round-trips through FP32 in the graph. Outputs are bit-identical to the old
+   engine; the ViT engine goes from 59.7 to 58.4 ms.
+
+7. **Server preprocessing: 19.1 → 8.9 ms per observation.** Per observation with 4 images,
+   including the copy to the GPU:
+
+   | Preprocessing | Time |
+   |---|---|
+   | Round 2: sequential, all on the CPU | 19.1 ms |
+   | Per-frame resize/crop in a thread pool (identical output) | 13.6 ms |
+   | + Qwen image processor on the GPU | 8.9 ms |
+
+   The thread pool scales with cameras: 12 frames take 4.8 ms instead of 17 ms. The GPU
+   image processor (resize, normalize, patchify) copies uint8 frames instead of float32
+   patches and runs on its own CUDA stream. Pixel values match the CPU path to within
+   one 8-bit step (max difference 0.0098 in normalized units). It is on by default in
+   `run_gr00t_server.py` and opt-in (`--gpu-image-preprocessing`) in
+   `open_loop_eval.py`, `standalone_inference_script.py` and `Gr00tPolicy`.
+
+### How to build INT8 engines
+
+```bash
+python scripts/deployment/build_trt_pipeline.py \
+    --model-path <checkpoint> --dataset-path <dataset> --embodiment-tag <TAG> \
+    --vit-precision bf16 --fused-denoising-steps 2 \
+    --int8 vit action_head --steps export,quantize,build,verify
+```
+
+The `quantize` step runs the PyTorch model on 64 frames spread over the dataset
+(`--int8-calibration-frames`), records the inputs of the ViT, the fused heads and the
+DiT, and writes `<output-dir>/onnx_int8` (quantized graphs plus links to the rest). The
+build step then compiles that directory. On the AGX Orin the whole run took 31 minutes
+with fused engines for 2 and 4 steps: export 3, quantize 9, build 17, verify 3.
+
+Caveats:
+
+- **Calibrate on your own robot's data.** Here calibration and evaluation frames come
+  from the same three DROID episodes (different frames). A fine-tuned checkpoint has
+  different activation ranges; rebuild with its dataset.
+- **Engine size.** TensorRT needs a separate INT8 copy of a weight for each unrolled
+  denoising step, so the fused 4-step INT8 engine is 5.2 GB (BF16: 3.3 GB). The 2-step
+  one is the same size as BF16.
+- The verify step reported cosine 0.9952 for the final action (4-step, one frame).
+
+### What did not help in round 3
+
+- **Fusing the ViT attention** was worth 1.3 ms, not the 6-9 ms estimated from the
+  mislabelled profile (see above).
+- **Keeping the ViT MLP down-projections in BF16** (see above).
+- **Plain INT8 without smoothing** (see above).
+
+## Round 4: INT8 LLM, prompt cache, pipelined server
+
+Round 3 ended at 106 ms per step in-process and 118 ms through the server, against a
+10 Hz target. Round 4 quantized the LLM, trimmed what the server does around the model,
+and added an opt-in server mode that overlaps requests. Same device, model, data and
+harness as above.
+
+### Results
+
+In-process, `standalone_inference_script.py`, 3 trajectories; action error as in round 3
+(20 frames, 2-step, relative to PyTorch):
+
+| Engines | 2-step | 4-step | MSE (2 / 4-step) | Action error (mean / worst) |
+|---|---|---|---|---|
+| BF16 (round 2) | 139.5 ms | 175.8 ms | 0.016717 / 0.017283 | 1.4% / 5.1% |
+| INT8 ViT + DiT (round 3) | 105.7 ms | 130.9 ms | 0.017017 / 0.017739 | 2.9% / 5.1% |
+| **INT8 ViT + LLM + DiT** | **95.2 ms** | **119.8 ms** | 0.016788 / 0.017686 | 4.2% / 10.1% |
+
+Through `run_gr00t_server.py`, local client, one fixed prompt, 2-step, median of 63
+requests:
+
+| Engines | Server | Client | Result |
+|---|---|---|---|
+| INT8 ViT + DiT | default | one request at a time | 114.5 ms per action (round 3: 117.7 ms) |
+| INT8 ViT + DiT | `--pipelined` | two in flight | an action every 110.7 ms, each 221 ms after its frame |
+| INT8 ViT + LLM + DiT | default | one request at a time | **104.2 ms per action (9.6 Hz)** |
+| INT8 ViT + LLM + DiT | `--pipelined` | two in flight | an action every 101.0 ms, each 202 ms after its frame |
+| INT8 ViT + LLM + DiT | `--pipelined` | new frame every 100 ms | **keeps up at 10 Hz, each action 110.6 ms after its frame** (max 111.3) |
+
+With every component in INT8, a client that sends each camera frame as it arrives gets
+10 Hz with 111 ms latency. One request at a time gives 9.6 Hz with 104 ms latency. The
+ViT + DiT engines cannot keep up with 10 Hz in any mode (a 10 Hz stream through the
+pipelined server queues up).
+
+### What changed
+
+1. **INT8 LLM, keeping the MLP down-projections in BF16: 32 → about 21 ms.**
+   `build_trt_pipeline.py --int8 vit llm action_head`. With every linear layer in INT8
+   the step was 92 ms, but actions were 6.2% off on average and 12-20% on the worst
+   frame, while open-loop MSE went *down*. Open-loop MSE alone would have hidden the
+   damage. A per-layer study in PyTorch found the cause: layer 2's MLP down-projection
+   creates the LLM's "massive activations" (a few channels in the thousands). Quantizing
+   that single layer makes the backbone output 91% wrong; every other layer alone is
+   under 8%. Keeping all 16 down-projections in BF16 (the default) costs 3 ms and gives
+   4.0-4.2% mean action error. Keeping only layers 0-2's MLPs gave about the same error
+   (4.3%), so the more conservative set, which does not depend on where this checkpoint
+   happens to put its outliers, is the default. The LLM engine shrinks from 1.6 to 1.0 GB.
+
+2. **Prompt cache: 1.5-2 ms per request, identical inputs.** The instruction and image
+   layout repeat every step, so the chat template text and the tokenized prompt are
+   cached (keyed by text and image grid); only the image processor runs per request.
+   `Gr00tPolicy` turns it on; training is unaffected.
+
+3. **No CPU wait after GPU image preprocessing.** On the server's main thread the model's
+   stream now waits for the image kernels on the GPU instead of the CPU blocking on them,
+   so the remaining CPU preprocessing overlaps them. (Background prefetch threads still
+   block, so they cannot stall the frame the main thread is running.) Server preprocessing
+   is now 6-7 ms per request with 4 images, most of it OpenCV resizing in the thread pool.
+
+4. **Pipelined server (`run_gr00t_server.py --pipelined`).** A network thread receives and
+   preprocesses request N+1 while the main thread runs the model for request N; replies
+   go out in order. Clients use `gr00t.policy.server_client.PipelinedPolicyClient`
+   (`submit()` / `receive()`); a plain `PolicyClient` still works, one request at a time.
+   It raises how often actions can come out, not how fast one comes back: the model is
+   GPU-bound, so the overlap only hides the CPU work around it (about 4 ms). Only worth
+   using if the robot sends frames at a fixed rate instead of waiting for each action.
+
+### What did not help in round 4
+
+- **Plain INT8 on the whole LLM**: fastest (92 ms), but the action error doubled again.
+- **INT8 attention only in the LLM**: 3.7% mean error, but only about 6 ms faster.
+- **Moving the remaining preprocessing to the GPU**: what is left is OpenCV's
+  `INTER_AREA` resize, which the model was trained with. A GPU copy would change pixels;
+  not attempted. Its cost grows with camera resolution (measured here: 180x320 frames).
+
 ## Recommended configuration
 
 ```bash
@@ -256,6 +470,15 @@ source scripts/activate_orin.sh
 python scripts/deployment/build_trt_pipeline.py \
     --model-path <checkpoint> --dataset-path <dataset> --embodiment-tag <TAG> \
     --vit-precision bf16 --fused-denoising-steps 2 --steps export,build,verify
+
+# Faster, opt-in: INT8 engines. 'vit action_head': 106 instead of 140 ms per step here;
+# adding 'llm': 95 ms, at about 3x the PyTorch-relative action error of BF16 engines.
+# Calibrates on --dataset-path, so use your robot's data, then check verify and an
+# open-loop eval, and compare the actions against the BF16 engines on your task.
+python scripts/deployment/build_trt_pipeline.py \
+    --model-path <checkpoint> --dataset-path <dataset> --embodiment-tag <TAG> \
+    --vit-precision bf16 --fused-denoising-steps 2 --int8 vit llm action_head \
+    --output-dir ./gr00t_trt_deployment_int8 --steps export,quantize,build,verify
 
 # Inference / benchmarking
 python scripts/deployment/standalone_inference_script.py \
@@ -277,8 +500,12 @@ python gr00t/eval/open_loop_eval.py \
 ```
 
 Measured with these (2 DROID trajectories, 2-step): `open_loop_eval.py` in-process 145 ms per
-step; through the server from a local client 164 ms. The server does not seed the sampling
-noise, so its open-loop MSE varies run to run.
+step. Through the server from a local client, with round 3's GPU image preprocessing (on by
+default; `--no-gpu-image-preprocessing` turns it off): 151 ms with BF16 engines, 115 ms with
+INT8 ViT + DiT, 104 ms with INT8 ViT + LLM + DiT. For a camera that streams at a fixed rate,
+start the server with `--pipelined` and send frames with
+`gr00t.policy.server_client.PipelinedPolicyClient` (round 4). The server does not seed the sampling noise, so its open-loop MSE varies run
+to run.
 
 Notes:
 
@@ -308,11 +535,142 @@ in at export; rebuild after changing any of them.
 - Validation on a fine-tuned checkpoint and a real robot embodiment (everything above is the
   base model on DROID demo data). In particular, 2-step denoising and INT4 weights are
   only supported by open-loop MSE here.
-- The ViT is now the largest block (58 of ~141 ms) and nothing in round 2 touched it. It
-  is compute-bound (1,792 patches), so the levers are fewer or smaller camera images (a
-  data/fine-tuning decision), INT8 with calibration, or skipping the ViT for cameras
-  whose image has not changed.
-- The server runs CPU preprocessing (about 15 ms) serially before the model. A client
-  that sends the next observation early, or GPU-side image preprocessing, would hide it.
+  INT8 engines change the actions more than BF16 ones (round 3) and need the same check.
+- The pipelined server needs a client that sends frames without waiting for actions
+  (`PipelinedPolicyClient`); the robot client has not been changed or tested with it.
+- Remaining server time outside the model is about 8 ms (OpenCV resizing, action decode).
+- 6 cameras: engines must be rebuilt for the new image layout. ViT, LLM and preprocessing
+  cost grow with the image count; the action head does not.
 - The PyTorch wheel from the Orin installer has no sm_87 kernels (it warns at import and
   JIT-compiles). This only affects the PyTorch glue and the no-engine path.
+
+## Future areas of exploration
+
+Ranked by expected gain against the 100 ms server-path budget. The 2-step step currently
+splits as ViT 37 ms, fused action head 35 ms, LLM 21 ms, glue about 5 ms, plus about 9 ms
+of server preprocessing and decode. Measurements below are from 2026-10-14 on this box.
+
+1. **Action chunking on the robot.** If the robot executes one action per inference, running
+   the model every N control steps (execution horizon > 1, or asynchronous chunk execution)
+   decouples the 10 Hz control rate from the inference rate entirely. No model change; the
+   largest lever if it is not already in use.
+
+2. **Pre-sized frames from the camera pipeline.** Every frame currently goes through
+   `SmallestMaxSize(256)` → 95% center crop → `SmallestMaxSize(256)` on the CPU (OpenCV
+   `INTER_AREA`, thread pool), then the Qwen image processor rounds it to a multiple of 32
+   (256x455 → 256x448 for 16:9, 256x341 → 256x352 for 4:3) with one more resize on the GPU.
+   The crop and second resize run unconditionally, so a frame that already matches the
+   output size still pays. Measured per request with 4 frames (6 frames cost about the same):
+
+   | Source frame | CPU transform | GPU image step | On the critical path |
+   |---|---|---|---|
+   | 180x320 (DROID benchmark) | 2.5 ms | 2.7 ms | 5.2 ms |
+   | 480x640 | 3.4 ms | ~2 ms | ~5.4 ms |
+   | 720x1280 | 6.7 ms | 2.7 ms | 9.4 ms |
+   | 1080x1920 | 11.2 ms | 2.7 ms | 13.9 ms |
+   | 256x448, transform bypassed | 0 | 1.8 ms | 1.8 ms |
+
+   **Implemented (2026-10-14):** `run_gr00t_server.py --images-pretransformed` /
+   `Gr00tPolicy(images_pretransformed=True)` skips the eval transform and passes
+   `do_resize=False` to the Qwen image processor (whose resize otherwise resamples even a
+   frame already at the target size). Frames must have a short edge of 256 and both sides
+   a multiple of 32 (352x256 for 4:3, 448x256 for 16:9); anything else raises `ValueError`.
+   Measured on DROID (2 views, 180x320 source, 13 observations, 4 steps, PyTorch BF16): the
+   policy's input preparation goes from 6.73 to 4.56 ms; actions with camera-side frames (95%
+   center crop + one `INTER_AREA` resize) differ from the standard path by 3.1% mean / 10.4%
+   worst, against 8.2% between two noise seeds of the standard path. This source is
+   upsampled; a camera downsampling from native resolution should differ less.
+   Original plan: an explicit opt-in that
+   skips the eval transform and checks the shortest edge is 256; the client (or the camera
+   pipeline in hardware: nvvidconv / Argus output resolution on Jetson) delivers the 95%
+   center crop resized to shortest edge 256 with the long edge a multiple of 32. Cannot be
+   inferred from the frame shape, because the crop is a field-of-view change. One resize in
+   the client instead of two is not bit-identical: validate with the round-3 action-error
+   check. Also shrinks the request (a 720p frame is 2.7 MB, 256x448 is 0.34 MB). In
+   `--pipelined` mode the preprocessing already overlaps the GPU, so the gain there is a
+   few ms of latency only. Sending the full field of view without the crop would be a 5%
+   zoom-out relative to training; needs an open-loop check before use.
+
+3. **1-step denoising.** About 17 ms (one DiT pass). Quality is untested; cheap to measure
+   with the per-step engines (`--denoising-steps 1`) using open-loop MSE and action error.
+
+4. **Image aspect ratio.** A 4:3 source becomes 256x352 (88 tokens per image) instead of
+   256x448 (112 tokens): about 20% less ViT and LLM work, roughly 10 ms. Only applicable if
+   the cameras are natively 4:3 or that field of view is acceptable; engines must be rebuilt
+   for the new token range and the checkpoint re-validated.
+
+5. **INT8 VL self-attention and encoders** (`--int8-action-head-all`): 3.6 ms, already
+   built, but doubles the action head's error against BF16 (0.6% → 1.4%). Only after
+   validation on the deployed checkpoint.
+
+6. **Builder optimization level 5 plus static shape profiles:** about 2 ms combined (round 2
+   measurements), at 2.5x the build time and a rebuild for any change in prompt length.
+
+Checked and not a lever: the fused action head already shares the cross-attention
+key/value projections of the vision-language tokens across denoising steps.
+
+### Engine profile (2026-10-14) and the levers it exposes
+
+Per-layer `IProfiler` timing of the INT8 engines, run standalone (no CUDA graph), 461 VL
+tokens, 4 images. Engine sums match the 95 ms in-process step (glue is about 1 ms).
+
+| Engine | Total | GEMM (incl. fused epilogues) | Fused attention (BF16) | Norm / quantize / elementwise | Data movement | Notable |
+|---|---|---|---|---|---|---|
+| ViT (24 blocks) | 37.0 ms | 22.6 ms | 6.3 ms (0.26 ms per block) | 2.9 ms | 3.3 ms | patch-embed `Conv3d` 1.7 ms; rotary kernel 0.13 ms per block (3.1 ms) |
+| LLM (16 layers) | 25.8 ms | 17.3 ms | 4.5 ms (0.28 ms per layer) | 2.8 ms | 0.4 ms | BF16 `down_proj` 0.40 ms per layer (6.4 ms); standalone SiLU 1.0 ms |
+| Fused action head, 2 steps | 32.4 ms | 26.2 ms | 0.9 ms | 1.8 ms | 2.6 ms | see below |
+
+Action head breakdown: VL self-attention (4 blocks, BF16) 7.5 ms; cross-attention K/V
+projections of the VL tokens, computed once for all 16 cross blocks (one batched kernel)
+1.7 ms; adaLN linears 0.88 ms per step; embodiment weight gather 0.5 ms; encoders and
+decoder about 0.5 ms; the 32 DiT blocks about 9.7 ms per step (about 0.30 ms per block,
+of which the two MLP GEMMs are 0.14 ms and run near memory bandwidth).
+
+The INT8 GEMMs with many tokens run at 50-65 TOPS, close to this GPU's dense INT8 peak,
+so the remaining time is in things quantization does not touch:
+
+1. **DiT cross-attention is unfused: about 4.5 ms over 2 steps.** The alternate-VL DiT
+   gives every cross block a boolean mask (image tokens or text tokens), and TensorRT
+   then runs QK^T, a masked softmax with NaN handling, and PV as separate kernels
+   (about 165 µs per block plus mask preparation) while the self-attention blocks get
+   the fused kernel (10-17 µs). Fix in the export: gather the K/V of the image tokens and
+   of the text tokens once (index tensors from the host, where the policy already builds
+   `image_mask`) and run unmasked attention on each subset. Same math; no fully-masked
+   rows can occur at batch size 1.
+2. **adaLN linears from a constant: 1.75 ms over 2 steps, plus 155 MB of weights per
+   step.** In the fused graph the timestep is a constant per step, so the 32 blocks'
+   `norm1.linear(silu(temb))` and `proj_out_1` are constants too. The quantizer's Q/DQ
+   nodes stop TensorRT from folding them, and they run as one M=1, 33x1536x3072 INT8
+   GEMM per step (0.88 ms, memory-bound). Precompute scale/shift per block per step in
+   the export wrapper. Exact, and removes INT8 noise from these layers.
+3. **Patch embedding as a Conv3d: 1.7 ms for a 5.6 GFLOP product (3 TFLOPS).** The
+   kernel equals the stride, so it is a plain linear over the already-flattened 1536-wide
+   patches. Export it as a MatMul and the quantizer and TensorRT treat it like every
+   other linear (about 0.1-0.2 ms). Same math.
+4. **ViT rotary embedding: 3.1 ms.** `_apply_rotary_real` upcasts to FP32 and builds
+   `cat(-x2, x1)` with slices; Myelin emits a 130 µs kernel per block for a 3.7M-element
+   elementwise op. Applying it to q and k in one op, or in BF16, should bring it to
+   about 1 ms; BF16 changes numerics slightly (check cosine as in round 2).
+5. **LLM `down_proj` in BF16 for all 16 layers: 6.4 ms.** Round 4 measured the same
+   action error (4.3% vs 4.2%) with only layers 0-2 kept in BF16, which would save
+   about 2.5 ms. Needs the user's checkpoint to decide.
+6. **Embodiment weight gather: 0.5 ms.** The encoders and decoder gather the selected
+   embodiment's weights from the 32-embodiment stack on every step. The export already
+   takes the embodiment tag; selecting the weights at export turns them into plain
+   linears (and lets INT8 apply to them without the gather).
+7. **Fused attention kernels at about 6 TFLOPS** (ViT 6.3 ms, LLM 4.5 ms). The BF16
+   fused MHA kernel TensorRT picks on sm_87 is far from peak at 448-461 tokens. Untested
+   whether an INT8 fused MHA (needs Q/DQ on Q, K, V and the softmax) or another
+   formulation is faster. Uncertain gain, up to several ms.
+8. **Standalone SiLU in the LLM MLP: 1.0 ms.** Myelin fuses the gate*up product into
+   the up-projection but leaves SiLU as its own kernel over 461x6144. A fusion choice,
+   not directly controllable; worth a look if the MLP is re-exported.
+
+Items 1-6 are export-level changes with no accuracy cost except item 5 and part of
+item 4, and add up to roughly 12 ms per step: about 83 ms in-process and 92 ms through
+the one-request-at-a-time server, before pre-sized frames.
+
+Measured but ruled out: the cross-attention K/V projections are shared across steps as
+intended (48 `to_k` MatMuls: 16 self blocks x 2 steps + 16 cross blocks x 1); the LLM's
+deepstack injection runs once, not per layer; clocks were pinned during all measurements
+(GPU 1.3 GHz, CPU 2.2 GHz, min = max).
