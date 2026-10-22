@@ -567,6 +567,11 @@ configuration above is roughly 10% lighter in the ViT and LLM than this DROID be
   same 3.7M elements; the kernel is what Myelin generates for any formulation, so the
   export was left as it is.
 - **INT8 on the patch embedding** (item 4 above).
+- **Builder optimization level 5** (`--builder-optimization-level 5`, 2026-10-22). Round 2
+  measured about 2 ms on BF16 engines; on the round-5 INT8 graphs it changes nothing:
+  ViT 35.2 vs 35.4 ms, LLM 26.0 vs 25.9 ms, fused head 25.7 vs 25.6 ms, the in-process
+  step 87.2 ms either way, server round trips within a millisecond, same verify cosine
+  and action error. The build took 35 minutes instead of 9. Keep the default level.
 
 Two pitfalls worth knowing for further export work: a forward pre-hook that returns a
 value replaces the module's arguments (the embodiment capture did, and broke the shape
@@ -797,7 +802,8 @@ the one-request-at-a-time server, before pre-sized frames.
 
 *Status after round 5 (2026-10-21):* items 1, 2, 3 and 6 are done (86.7 ms in-process,
 94.1 ms through the server); item 4 is not a lever (every formulation costs the same
-kernel time); item 5 is available as `--int8-llm-keep-bf16`.
+kernel time); item 5 is available as `--int8-llm-keep-bf16`. Builder level 5 (future
+item 6 above) was also measured: no gain on the INT8 graphs.
 
 Measured but ruled out: the cross-attention K/V projections are shared across steps as
 intended (48 `to_k` MatMuls: 16 self blocks x 2 steps + 16 cross blocks x 1); the LLM's
