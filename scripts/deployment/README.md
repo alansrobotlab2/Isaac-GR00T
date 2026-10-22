@@ -461,6 +461,7 @@ If you later run `uv sync`, rerun the Orin installer to restore the locally buil
 | `--int8-calibration-frames` | `64` | Dataset frames used to calibrate the INT8 ranges |
 | `--int8-skip` | none | Keep linear layers whose ONNX node name matches this regular expression in BF16 |
 | `--int8-action-head-all` | `false` | Also quantize the VL self-attention and encoders inside the fused action head (faster, less accurate) |
+| `--int8-llm-keep-bf16` | `mlp/down_proj` | With `--int8 llm`: LLM layers (node-name regex) kept in BF16. `'layers\.[0-2]/mlp/down_proj'` keeps only the first three down-projections (faster; validate on your checkpoint); empty quantizes everything |
 | `--steps` | `all` | Steps to run: `all` or comma-separated subset of `export,quantize,build,verify,benchmark` (`quantize` does nothing without `--int8`) |
 | `--log-file` | `<output-dir>/pipeline.log` | Log file path |
 

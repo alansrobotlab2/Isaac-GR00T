@@ -273,6 +273,14 @@ class PipelineConfig:
     """With --int8 action_head: also quantize the VL self-attention and the state/action
     encoders inside the fused engines, not only the DiT."""
 
+    int8_llm_keep_bf16: Optional[str] = "mlp/down_proj"
+    """With --int8 llm: LLM linear layers (ONNX node name regex) that stay BF16. The default
+    keeps every MLP down-projection, whose activation outliers INT8 cannot represent (see
+    INFERENCE_OPTIMIZATIONS_N1D7.md, round 4). 'layers\\.[0-2]/mlp/down_proj' keeps only
+    the first three (faster; validate on your checkpoint). An empty string quantizes every
+    LLM linear. Check the backbone cosine of the verify step: a pattern that matches
+    nothing quantizes layer 2's down-projection and the backbone output collapses."""
+
     # -- Build options ------------------------------------------------------
     workspace: int = 8192
     """TRT builder workspace size in MB."""
@@ -348,6 +356,7 @@ def _run_quantize(cfg: PipelineConfig, onnx_dir: str, int8_dir: str, embodiment_
             num_frames=cfg.int8_calibration_frames,
             skip=cfg.int8_skip,
             quantize_action_head_all=cfg.int8_action_head_all,
+            llm_keep_bf16=cfg.int8_llm_keep_bf16 or None,
         )
 
 

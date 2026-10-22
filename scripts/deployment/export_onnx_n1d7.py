@@ -48,12 +48,14 @@ Usage:
         --export-mode action_head
 """
 
+import contextlib
 import copy
 from dataclasses import dataclass
 import json
 import logging
 import os
 from pathlib import Path
+import types
 from typing import Literal, Optional
 
 from _trt_contract import EXPORT_METADATA_SCHEMA_VERSION
@@ -429,6 +431,24 @@ def _restore_vision_attention(vision_model, originals):
         block.attn.forward = orig
 
 
+class _PatchEmbedLinear(torch.nn.Module):
+    """The ViT patch embedding as a linear layer (see ``Qwen3VisionForExport``).
+
+    A module of its own so the traced node is ``/patch_embed/Gemm``: the INT8 quantizer
+    selects layers by node name, and this one stays BF16 by default.
+    """
+
+    def __init__(self, proj: torch.nn.Conv3d):
+        super().__init__()
+        self.register_buffer(
+            "weight", proj.weight.detach().reshape(proj.out_channels, -1).contiguous()
+        )
+        self.register_buffer("bias", proj.bias.detach().clone())
+
+    def forward(self, pixel_values):
+        return F.linear(pixel_values.to(self.weight.dtype), self.weight, self.bias)
+
+
 class Qwen3VisionForExport(torch.nn.Module):
     """ONNX-exportable wrapper for Qwen3-VL Vision Model.
 
@@ -441,7 +461,6 @@ class Qwen3VisionForExport(torch.nn.Module):
 
     def __init__(self, vision_model, grid_thw: torch.Tensor):
         super().__init__()
-        self.patch_embed = vision_model.patch_embed
         self.blocks = vision_model.blocks
         self.merger = vision_model.merger
         self.deepstack_visual_indexes = vision_model.deepstack_visual_indexes
@@ -457,6 +476,13 @@ class Qwen3VisionForExport(torch.nn.Module):
         self.register_buffer("_pos_embeds", pos_embeds.clone().detach().contiguous())
         self.register_buffer("_rot_cos", emb.cos().clone().detach().contiguous())
         self.register_buffer("_rot_sin", emb.sin().clone().detach().contiguous())
+
+        # The patch embedding is a Conv3d whose kernel equals both its stride and its
+        # input (one patch), i.e. a linear layer over the already-flattened patch. As a
+        # Conv, TensorRT ran it at a few TFLOPS (1.7 ms for 1,792 patches on a Jetson AGX
+        # Orin); as a Gemm it gets the same kernels, and INT8 treatment, as every other
+        # linear layer. ``pixel_values`` is flattened in (C, T, pH, pW) order, like the weight.
+        self.patch_embed = _PatchEmbedLinear(vision_model.patch_embed.proj)
 
     def forward(self, pixel_values):
         hidden_states = self.patch_embed(pixel_values)
@@ -1363,19 +1389,133 @@ def _supports_shared_kv(attn) -> bool:
     )
 
 
+@contextlib.contextmanager
+def _bake_embodiment_weights(action_head, embodiment_id: int):
+    """Select one embodiment's weights in every ``CategorySpecificLinear`` of ``action_head``.
+
+    The encoders and the decoder keep a weight stack for all embodiments and gather the
+    requested one on every call. An engine is built for one embodiment anyway, so the
+    export selects the weights once and each layer becomes a MatMul with a constant
+    weight, which also lets the INT8 quantizer see it. The modules are restored on exit.
+    """
+    from gr00t.model.modules.embodiment_conditioned_mlp import CategorySpecificLinear
+
+    def baked_forward(module, x, cat_ids=None):
+        return torch.matmul(x, module._baked_weight) + module._baked_bias
+
+    patched = []
+    for module in action_head.modules():
+        if not isinstance(module, CategorySpecificLinear):
+            continue
+        if not 0 <= embodiment_id < module.num_categories:
+            raise ValueError(
+                f"embodiment_id {embodiment_id} is outside the action head's "
+                f"{module.num_categories} embodiments"
+            )
+        module.register_buffer(
+            "_baked_weight", module.W[embodiment_id].detach().clone(), persistent=False
+        )
+        module.register_buffer(
+            "_baked_bias", module.b[embodiment_id].detach().clone(), persistent=False
+        )
+        module.forward = types.MethodType(baked_forward, module)
+        patched.append(module)
+    try:
+        yield len(patched)
+    finally:
+        for module in patched:
+            del module.forward  # back to the class method
+            del module._baked_weight
+            del module._baked_bias
+
+
+def _sample_actions_reference(head, backbone_features, state, embodiment_id, init_actions, masks):
+    """``Gr00tN1d7ActionHead.get_action`` with given noise, through the unmodified modules.
+
+    Used to check :class:`_FusedActionHead` before export. ``masks`` is a dict with
+    ``image_mask`` and ``backbone_attention_mask`` (empty for a DiT without them).
+    """
+    dtype = backbone_features.dtype
+    device = backbone_features.device
+    batch_size = backbone_features.shape[0]
+    num_steps = head.num_inference_timesteps
+    vl_embs = head.vl_self_attention(head.vlln(backbone_features))
+    state_features = head.state_encoder(state, embodiment_id)
+    pos_embs = None
+    if head.config.add_pos_embed:
+        pos_ids = torch.arange(head.config.action_horizon, dtype=torch.long, device=device)
+        pos_embs = head.position_embedding(pos_ids).unsqueeze(0)
+    actions = init_actions.float()
+    dt = 1.0 / num_steps
+    for step in range(num_steps):
+        t_discretized = int(step / float(num_steps) * head.num_timestep_buckets)
+        timesteps = torch.full((batch_size,), t_discretized, dtype=torch.long, device=device)
+        action_features = head.action_encoder(actions.to(dtype), timesteps, embodiment_id)
+        if pos_embs is not None:
+            action_features = action_features + pos_embs
+        sa_embs = torch.cat((state_features, action_features), dim=1)
+        model_output = head.model(
+            hidden_states=sa_embs, encoder_hidden_states=vl_embs, timestep=timesteps, **masks
+        )
+        pred = head.action_decoder(model_output, embodiment_id)
+        actions = actions + dt * pred[:, -head.action_horizon :].float()
+    return actions
+
+
 class _FusedActionHead(nn.Module):
     """The action head's whole sampling path as one module: VLLN, VL self-attention, state
     encoder, and ``num_steps`` unrolled Euler steps of action encoder -> DiT -> decoder.
 
     Mirrors ``Gr00tN1d7ActionHead.get_action``: the trajectory is integrated in FP32.
+    Three things that are constant for a given engine are resolved at export time, with
+    no change to the math:
+
+    - The alternate-VL DiT's cross-attention blocks attend to either the image tokens or
+      the text tokens. With a boolean mask over the whole sequence TensorRT ran QK^T, a
+      masked softmax and PV as separate kernels; instead the two token subsets are
+      gathered once from host-provided index tensors (``image_index``, ``text_index``)
+      and attended unmasked, which gets the fused attention kernel. A masked-out key
+      contributes nothing to a softmax, so the result is the same.
+    - The timestep of every unrolled step is a constant, so each block's adaLN scale and
+      shift and the output projection's shift and scale are precomputed (the quantizer's
+      Q/DQ nodes otherwise stop TensorRT from folding them).
+    - The embodiment's weights in the encoders and decoder (:func:`_bake_embodiment_weights`;
+      the caller enters that context around tracing and any reference run).
     """
 
-    def __init__(self, action_head, num_steps: int):
+    def __init__(self, action_head, num_steps: int, embodiment_id: int):
         super().__init__()
         self.head = action_head
         self.num_steps = num_steps
-        self.use_masks = bool(action_head.config.use_alternate_vl_dit)
+        self.embodiment_id = int(embodiment_id)
+        self.token_subsets = bool(action_head.config.use_alternate_vl_dit)
         self.shared_kv = []
+        self._precompute_conditioning()
+
+    def _timestep(self, step: int) -> int:
+        return int(step / float(self.num_steps) * self.head.num_timestep_buckets)
+
+    def _precompute_conditioning(self):
+        dit = self.head.model
+        device = next(dit.parameters()).device
+        for block in dit.transformer_blocks:
+            if block.norm_type != "ada_norm":
+                raise ValueError(
+                    f"Fused action head export expects adaLN DiT blocks, got {block.norm_type!r}"
+                )
+        with torch.no_grad():
+            for step in range(self.num_steps):
+                timestep = torch.full((1,), self._timestep(step), dtype=torch.long, device=device)
+                conditioning = F.silu(dit.timestep_encoder(timestep))
+                for idx, block in enumerate(dit.transformer_blocks):
+                    scale, shift = block.norm1.linear(conditioning).chunk(2, dim=1)
+                    self.register_buffer(
+                        f"_norm_scale_{step}_{idx}", (1 + scale)[:, None].contiguous()
+                    )
+                    self.register_buffer(f"_norm_shift_{step}_{idx}", shift[:, None].contiguous())
+                shift, scale = dit.proj_out_1(conditioning).chunk(2, dim=1)
+                self.register_buffer(f"_out_scale_{step}", (1 + scale)[:, None].contiguous())
+                self.register_buffer(f"_out_shift_{step}", shift[:, None].contiguous())
 
     def install_shared_kv(self):
         """Swap in the shared-K/V processors; returns the originals for restoring."""
@@ -1388,23 +1528,70 @@ class _FusedActionHead(nn.Module):
                 self.shared_kv.append(processor)
         return originals
 
-    def forward(
-        self,
-        backbone_features,
-        state,
-        embodiment_id,
-        init_actions,
-        image_mask,
-        backbone_attention_mask,
-    ):
+    def install_export_forwards(self):
+        """Give the DiT and its blocks forwards that take the precomputed conditioning.
+
+        The step logic runs through the modules' own ``forward`` (instead of calling
+        their children from here) so that the traced ONNX node names keep the module
+        hierarchy (``/model/transformer_blocks.N/...``), which the INT8 quantizer uses
+        to pick the DiT's layers. Returns the patched modules; delete their ``forward``
+        attribute to restore them.
+        """
+        wrapper = self
+        dit = self.head.model
+        interleave = bool(dit.config.interleave_self_attention)
+        text_period = 2 * getattr(dit, "attend_text_every_n_blocks", 2)
+
+        def block_forward(block, hidden_states, encoder_hidden_states, scale, shift):
+            norm_hidden = block.norm1.norm(hidden_states) * scale + shift
+            if block.pos_embed is not None:
+                norm_hidden = block.pos_embed(norm_hidden)
+            attn_output = block.attn1(norm_hidden, encoder_hidden_states=encoder_hidden_states)
+            hidden_states = attn_output + hidden_states
+            return block.ff(block.norm3(hidden_states)) + hidden_states
+
+        def dit_forward(module, hidden_states, vl_embs, vl_image, vl_text, step):
+            """One DiT pass (``AlternateVLDiT.forward``) for unrolled step ``step``."""
+            for idx, block in enumerate(module.transformer_blocks):
+                if interleave and idx % 2 == 1:
+                    conditioning = None  # self-attention block
+                elif not wrapper.token_subsets:
+                    conditioning = vl_embs
+                else:
+                    conditioning = vl_text if idx % text_period == 0 else vl_image
+                hidden_states = block(
+                    hidden_states,
+                    conditioning,
+                    getattr(wrapper, f"_norm_scale_{step}_{idx}"),
+                    getattr(wrapper, f"_norm_shift_{step}_{idx}"),
+                )
+            hidden_states = module.norm_out(hidden_states) * getattr(
+                wrapper, f"_out_scale_{step}"
+            ) + getattr(wrapper, f"_out_shift_{step}")
+            return module.proj_out_2(hidden_states)
+
+        dit.forward = types.MethodType(dit_forward, dit)
+        for block in dit.transformer_blocks:
+            block.forward = types.MethodType(block_forward, block)
+        return [dit, *dit.transformer_blocks]
+
+    def forward(self, backbone_features, state, init_actions, image_index=None, text_index=None):
         head = self.head
         for processor in self.shared_kv:
             processor.cache = None
         dtype = backbone_features.dtype
         device = backbone_features.device
         batch_size = backbone_features.shape[0]
+        # Ignored by the baked layers; keeps the modules' signatures.
+        embodiment_id = torch.full(
+            (batch_size,), self.embodiment_id, dtype=torch.long, device=device
+        )
 
         vl_embs = head.vl_self_attention(head.vlln(backbone_features))
+        vl_image = vl_text = None
+        if self.token_subsets:
+            vl_image = vl_embs.index_select(1, image_index)
+            vl_text = vl_embs.index_select(1, text_index)
         state_features = head.state_encoder(state, embodiment_id)
 
         pos_embs = None
@@ -1412,47 +1599,46 @@ class _FusedActionHead(nn.Module):
             pos_ids = torch.arange(head.config.action_horizon, dtype=torch.long, device=device)
             pos_embs = head.position_embedding(pos_ids).unsqueeze(0)
 
-        mask_kwargs = {}
-        if self.use_masks:
-            mask_kwargs = {
-                "image_mask": image_mask,
-                "backbone_attention_mask": backbone_attention_mask,
-            }
-
         actions = init_actions.float()
         dt = 1.0 / self.num_steps
         for step in range(self.num_steps):
-            t_discretized = int(step / float(self.num_steps) * head.num_timestep_buckets)
-            timesteps = torch.full((batch_size,), t_discretized, dtype=torch.long, device=device)
+            timesteps = torch.full(
+                (batch_size,), self._timestep(step), dtype=torch.long, device=device
+            )
             action_features = head.action_encoder(actions.to(dtype), timesteps, embodiment_id)
             if pos_embs is not None:
                 action_features = action_features + pos_embs
             sa_embs = torch.cat((state_features, action_features), dim=1)
-            model_output = head.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs,
-                timestep=timesteps,
-                **mask_kwargs,
-            )
+            model_output = head.model(sa_embs, vl_embs, vl_image, vl_text, step)
             pred = head.action_decoder(model_output, embodiment_id)
             actions = actions + dt * pred[:, -head.action_horizon :].float()
         return actions
 
 
 def export_fused_action_head_to_onnx(
-    policy, output_dir, vl_seq_len, num_steps, use_bf16=True, batch_size=1
+    policy,
+    output_dir,
+    vl_seq_len,
+    num_steps,
+    embodiment_id,
+    num_image_tokens,
+    use_bf16=True,
+    batch_size=1,
 ):
     """Export the action head with ``num_steps`` denoising steps unrolled into one graph.
 
     Replaces seven engine calls per inference (VL self-attention, state encoder, and
     per step: action encoder, DiT, action decoder) with one, and shares the DiT's
     cross-attention key/value projections of the vision-language tokens between steps.
-    The step count is baked in; export one graph per count you intend to run.
+    The step count and the embodiment are baked in; export one graph per step count
+    you intend to run (see :class:`_FusedActionHead` for what else is resolved here).
 
     Inputs:  backbone_features [B, vl_seq_len, backbone_embedding_dim] (pre-VLLN),
-             state [B, 1, max_state_dim * state_history_length], embodiment_id [B],
+             state [B, 1, max_state_dim * state_history_length],
              init_actions [B, action_horizon, max_action_dim] (sampled noise),
-             image_mask [B, vl_seq_len], backbone_attention_mask [B, vl_seq_len]
+             image_index [num_image_tokens], text_index [num_text_tokens]: positions in
+             the vision-language sequence of the image tokens and of the other attended
+             tokens (only for the alternate-VL DiT; the layout is shared by the batch)
     Output:  actions [B, action_horizon, max_action_dim] (FP32, normalized)
     """
     logger.info("\n" + "=" * 80)
@@ -1463,6 +1649,13 @@ def export_fused_action_head_to_onnx(
     config = action_head.config
     dtype = torch.bfloat16 if use_bf16 else torch.float32
     action_head = action_head.to(dtype).eval().cuda()
+    embodiment_id = int(embodiment_id)
+    num_image_tokens = int(num_image_tokens)
+    if not 0 < num_image_tokens < vl_seq_len:
+        raise ValueError(
+            f"Fused action head export needs image and text tokens in the captured prompt "
+            f"(got {num_image_tokens} image tokens of {vl_seq_len})"
+        )
 
     backbone_features = torch.randn(
         batch_size, vl_seq_len, config.backbone_embedding_dim, dtype=dtype, device="cuda"
@@ -1474,61 +1667,85 @@ def export_fused_action_head_to_onnx(
         dtype=dtype,
         device="cuda",
     )
-    embodiment_id = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
     init_actions = torch.randn(
         batch_size, config.action_horizon, config.max_action_dim, dtype=dtype, device="cuda"
     )
-    image_mask = torch.ones(batch_size, vl_seq_len, dtype=torch.bool, device="cuda")
-    backbone_attention_mask = torch.ones(batch_size, vl_seq_len, dtype=torch.bool, device="cuda")
+    # Where the tokens sit does not matter for tracing, only the two counts.
+    image_index = torch.arange(num_image_tokens, dtype=torch.int64, device="cuda")
+    text_index = torch.arange(num_image_tokens, vl_seq_len, dtype=torch.int64, device="cuda")
 
-    export_inputs = (
-        backbone_features,
-        state,
-        embodiment_id,
-        init_actions,
-        image_mask,
-        backbone_attention_mask,
-    )
-    input_names = [
-        "backbone_features",
-        "state",
-        "embodiment_id",
-        "init_actions",
-        "image_mask",
-        "backbone_attention_mask",
-    ]
+    export_inputs = [backbone_features, state, init_actions]
+    input_names = ["backbone_features", "state", "init_actions"]
+    dynamic_axes = {"backbone_features": {1: "vl_seq_len"}}
+    token_subsets = bool(config.use_alternate_vl_dit)
+    if token_subsets:
+        export_inputs += [image_index, text_index]
+        input_names += ["image_index", "text_index"]
+        dynamic_axes["image_index"] = {0: "num_image_tokens"}
+        dynamic_axes["text_index"] = {0: "num_text_tokens"}
+    export_inputs = tuple(export_inputs)
     logger.info("  Export input shapes:")
     for name, tensor in zip(input_names, export_inputs):
         logger.info(f"    {name}: {tensor.shape} ({tensor.dtype})")
+    logger.info(f"  Embodiment id baked into the encoders/decoder: {embodiment_id}")
 
     output_path = os.path.join(output_dir, FUSED_ACTION_HEAD_ONNX.format(steps=num_steps))
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    wrapper = _FusedActionHead(action_head, num_steps).eval()
+    # Reference actions from the unmodified modules (masks, weight gathers, per-step
+    # conditioning) for the same noise: the wrapper must reproduce them before it is traced.
+    masks = {}
+    if token_subsets:
+        image_mask = torch.zeros(batch_size, vl_seq_len, dtype=torch.bool, device="cuda")
+        image_mask[:, :num_image_tokens] = True
+        masks = {
+            "image_mask": image_mask,
+            "backbone_attention_mask": torch.ones_like(image_mask),
+        }
+    embodiment_ids = torch.full((batch_size,), embodiment_id, dtype=torch.int64, device="cuda")
+    saved_steps = action_head.num_inference_timesteps
+    action_head.num_inference_timesteps = num_steps
+    with torch.inference_mode():
+        reference = _sample_actions_reference(
+            action_head, backbone_features, state, embodiment_ids, init_actions, masks
+        )
+    action_head.num_inference_timesteps = saved_steps
+
+    wrapper = _FusedActionHead(action_head, num_steps, embodiment_id).eval()
     originals = wrapper.install_shared_kv()
     logger.info(f"  Sharing key/value projections in {len(originals)} cross-attention blocks")
+    patched = wrapper.install_export_forwards()
     try:
-        logger.info(f"  Exporting to {output_path}...")
-        with torch.inference_mode():
-            torch.onnx.export(
-                wrapper,
-                export_inputs,
-                output_path,
-                input_names=input_names,
-                output_names=["actions"],
-                opset_version=19,
-                do_constant_folding=True,
-                export_params=True,
-                dynamic_axes={
-                    "backbone_features": {1: "vl_seq_len"},
-                    "image_mask": {1: "vl_seq_len"},
-                    "backbone_attention_mask": {1: "vl_seq_len"},
-                },
-                dynamo=False,  # same reason as the DiT: dynamo specializes vl_seq_len
-            )
+        with _bake_embodiment_weights(action_head, embodiment_id) as num_baked:
+            logger.info(f"  Baked embodiment weights into {num_baked} category-specific linears")
+            with torch.inference_mode():
+                actual = wrapper(*export_inputs)
+            rel_err = ((actual - reference).norm() / reference.norm().clamp_min(1e-12)).item()
+            logger.info(f"  Fused graph vs reference sampling: relative error {rel_err:.2e}")
+            if rel_err > 1e-2:
+                raise RuntimeError(
+                    f"Fused action head wrapper diverges from the reference sampling "
+                    f"(relative error {rel_err:.3e}); refusing to export it"
+                )
+            logger.info(f"  Exporting to {output_path}...")
+            with torch.inference_mode():
+                torch.onnx.export(
+                    wrapper,
+                    export_inputs,
+                    output_path,
+                    input_names=input_names,
+                    output_names=["actions"],
+                    opset_version=19,
+                    do_constant_folding=True,
+                    export_params=True,
+                    dynamic_axes=dynamic_axes,
+                    dynamo=False,  # same reason as the DiT: dynamo specializes vl_seq_len
+                )
     finally:
         for attn, processor in originals:
             attn.set_processor(processor)
+        for module in patched:
+            del module.forward  # back to the class method
 
     logger.info("  Fused action head exported successfully!")
     _consolidate_external_data(output_path)
@@ -1578,6 +1795,16 @@ def main(args):
     dit_hook = policy.model.action_head.model.register_forward_pre_hook(
         dit_capture.hook_fn, with_kwargs=True
     )
+    # The embodiment id the processor assigns this tag; baked into the fused action head.
+    embodiment_capture: dict[str, torch.Tensor] = {}
+
+    def _capture_embodiment(module, args):
+        embodiment_capture.setdefault("id", args[1].detach().cpu().clone())
+        # A pre-hook returning a value would replace the module's arguments.
+
+    embodiment_hook = policy.model.action_head.state_encoder.register_forward_pre_hook(
+        _capture_embodiment
+    )
 
     # Also capture ViT and LLM inputs if doing full_pipeline
     vit_capture = None
@@ -1602,6 +1829,7 @@ def main(args):
         _ = policy.get_action(observation)
 
     dit_hook.remove()
+    embodiment_hook.remove()
     if vit_hook is not None:
         vit_hook.remove()
     if llm_hook is not None:
@@ -1609,6 +1837,9 @@ def main(args):
 
     if not dit_capture.captured:
         logger.error("  Failed to capture DiT inputs!")
+        return
+    if "id" not in embodiment_capture:
+        logger.error("  Failed to capture the embodiment id!")
         return
     if args.export_mode == "full_pipeline" and not vit_capture.captured:
         logger.error("  Failed to capture ViT inputs!")
@@ -1621,6 +1852,15 @@ def main(args):
     action_head_config = policy.model.action_head.config
     sa_seq_len = 1 + action_head_config.action_horizon
     vl_seq_len = dit_capture.vl_embs.shape[1]
+    embodiment_id = int(embodiment_capture["id"].flatten()[0])
+    # Image tokens the DiT's cross-attention sees (the rest of the attended sequence is text).
+    if dit_capture.image_mask is not None:
+        attended = dit_capture.image_mask
+        if dit_capture.backbone_attention_mask is not None:
+            attended = attended & dit_capture.backbone_attention_mask
+        num_image_tokens = int(attended[0].sum())
+    else:
+        num_image_tokens = 0
 
     # Save export metadata
     num_patches = vit_capture.pixel_values_shape[0] if vit_capture and vit_capture.captured else 256
@@ -1658,6 +1898,9 @@ def main(args):
         "input_embedding_dim": int(action_head_config.input_embedding_dim),
         "backbone_embedding_dim": int(action_head_config.backbone_embedding_dim),
         "embodiment_tag": str(args.embodiment_tag),
+        "embodiment_id": embodiment_id,  # baked into the fused action head graphs
+        "num_image_tokens": int(num_image_tokens),  # fused head: image_index length
+        "num_text_tokens": int(vl_seq_len - num_image_tokens),  # fused head: text_index length
         "export_mode": args.export_mode,
         "precision": args.precision,
         "batch_size": args.batch_size,
@@ -1782,6 +2025,8 @@ def main(args):
                 args.output_dir,
                 vl_seq_len=vl_seq_len,
                 num_steps=num_steps,
+                embodiment_id=embodiment_id,
+                num_image_tokens=num_image_tokens,
                 use_bf16=True,
                 batch_size=bs,
             )

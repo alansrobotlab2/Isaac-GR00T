@@ -457,6 +457,124 @@ pipelined server queues up).
   `INTER_AREA` resize, which the model was trained with. A GPU copy would change pixels;
   not attempted. Its cost grows with camera resolution (measured here: 180x320 frames).
 
+## Round 5: export-level changes to the fused action head and the ViT
+
+Round 4 ended at 95 ms per step in-process and 104 ms through the server. The engine
+profile at the end of round 4 pointed at work that quantization cannot touch: the DiT's
+masked cross-attention, the adaLN linears the Q/DQ nodes kept TensorRT from folding, the
+patch embedding as a Conv3d, and the per-step embodiment weight gather. Round 5 resolves
+these at export time. Same device, model, data and harness as above; the box was idle
+during the measurements (the robot's ROS stack adds about 20 ms per step when it runs
+alongside the server).
+
+### Results
+
+Old and new engines measured in the same session (2026-10-21), 2-step, DROID, 3 trajectories:
+
+| | Round-4 engines | Round-5 engines |
+|---|---|---|
+| In-process step (`standalone_inference_script.py`, `--pipeline-backbone-dit`) | 96.5 ms | **86.7 ms** |
+| Server, one request at a time (median of 63) | 103.4 ms (9.7 Hz) | **94.1 ms (10.6 Hz)** |
+| Server `--pipelined`, two in flight | an action every 98.4 ms | an action every 90.8 ms |
+| Server `--pipelined`, a frame every 100 ms | keeps up, one frame behind (200 ms latency) | keeps up at 10 Hz |
+| Open-loop MSE | 0.016788 | 0.016737 |
+| Action error vs PyTorch, same noise (mean / worst of 20 frames) | 3.94% / 12.4% | 3.91% / 12.8% |
+| Verify cosine (ViT / backbone / actions) | 0.9590 / 0.99767 / 0.99875 | 0.9603 / 0.99782 / 0.99883 |
+
+Per engine, standalone (`IProfiler`, 461 VL tokens): ViT 36.9 → 35.0 ms, LLM 25.9 → 25.8 ms,
+fused 2-step action head 32.1 → 25.4 ms. The action-head weights shrink from 3.1 to 2.2 GB.
+
+### What changed
+
+All of it is in `export_onnx_n1d7.py` (with the matching runtime in `trt_model_forward.py`,
+calibration inputs in `int8_calibration.py` and shape hints in `build_tensorrt_engine.py`).
+None of it changes the math; the export checks the new graph against the unmodified
+modules before tracing (relative error 1.6e-3 in BF16) and refuses to export above 1e-2.
+
+1. **Cross-attention over token subsets instead of masks: about 4.5 ms.** The alternate-VL
+   DiT gives every cross block a boolean mask selecting the image tokens or the text
+   tokens, and TensorRT ran those blocks as separate QK^T, masked-softmax and PV kernels.
+   The fused graph now takes two index tensors (`image_index`, `text_index`), gathers the
+   two subsets of the VL sequence once, and each cross block attends unmasked to its
+   subset, which gets the fused attention kernel. A masked-out key contributes nothing to
+   a softmax, so the result is the same. The backbone forward computes the indices once
+   per token layout (with the other static-plan tensors), so no host read is added per
+   step. The K/V projections also shrink: text blocks project 13 tokens, not 461.
+   Engines with the old mask inputs still load; the runtime binds whichever the engine
+   declares.
+2. **Timestep conditioning precomputed: about 1.8 ms and 0.9 GB.** With the steps unrolled
+   the timestep is a constant per step, so each block's adaLN scale and shift and the
+   output projection's shift and scale are computed once at export and stored as
+   constants, instead of 33 small INT8 GEMMs per step with their own weight copies. This
+   also removes INT8 noise from these layers.
+3. **Embodiment weights selected at export: about 0.5 ms.** The state/action encoders and
+   the decoder gathered the embodiment's weights from the 32-embodiment stack on every
+   call. The engine is built for one embodiment anyway, so the export selects them and
+   each layer becomes a MatMul with a constant weight. `export_metadata.json` records the
+   `embodiment_id`; the runtime checks the policy's id against it once.
+4. **ViT patch embedding as a linear layer: about 1.6 ms.** The Conv3d's kernel equals its
+   stride and its input, so it is a linear layer over the flattened patch; as a Conv it
+   ran at 3 TFLOPS. Exported as `/patch_embed/Gemm` it runs in 0.1 ms. It is kept in BF16:
+   quantizing it (raw normalized pixels in INT8) cost 0.4 points of mean action error
+   for 0.1 ms.
+5. **Shape profile for the text tokens.** The text count gets the sequence's whole range
+   (up to 922 tokens) rather than twice the exported prompt, so a longer instruction
+   does not need a rebuild.
+
+### Going further: pre-sized frames, one denoising step, more INT8
+
+Three ways to buy margin below the 100 ms budget, measured with the round-5 engines on the
+same day. Server numbers are a local client with 4 DROID frames; "at 10 Hz" is the
+`--pipelined` server with a new frame every 100 ms and the latency of each action behind
+its frame.
+
+| Configuration | In-process | Server, one at a time | At 10 Hz | Action error vs PyTorch (same step count) | Open-loop MSE |
+|---|---|---|---|---|---|
+| Round-5 engines, 2-step | 86.7 ms | 94.3 ms | 95.9 ms | 3.91% / 12.8% | 0.016737 |
+| + pre-sized frames (`--images-pretransformed`, client sends 448x256) | | 93.6 ms | **92.1 ms** | | |
+| + `--denoising-steps 1` (fused 1-step engine) | 79.1 ms | 84.6 ms | **83.9 ms** | 3.87% / 8.4% | 0.016648 |
+| Aggressive engines (`--int8-action-head-all --int8-llm-keep-bf16 'layers\.[0-2]/mlp/down_proj'`), 2-step | 80.7 ms | 86.2 ms | **85.3 ms** | 4.75% / 17.7% | 0.016664 |
+| Aggressive engines, `--denoising-steps 1` | 72.7 ms | 77.5 ms | **77.4 ms** | 4.57% / 12.4% | 0.016571 |
+
+(The pre-sized row and the three below it use pre-sized frames on the server path.)
+
+- **Pre-sized frames** are worth 0.7 ms on this benchmark's 180x320 source and 3.8 ms at
+  10 Hz; on a 720p or 1080p camera they are worth 7-12 ms (round 4's table). The robot's
+  pipeline already emits 352x256 frames, so this is the deployed path.
+- **One denoising step** removes one DiT pass (about 8 ms). Open-loop MSE does not move,
+  and the TRT engine tracks the 1-step PyTorch model as closely as the 2-step one does
+  (3.9% mean). What open-loop metrics cannot settle is whether 1-step actions are as good
+  as 2-step actions. PyTorch alone, 20 frames, same noise, relative L2 against 8-step
+  actions: 1-step 13.0% / 25.1% worst, 2-step 6.6% / 18.4%, 4-step 2.5% / 4.0%, and two
+  noise seeds at 8 steps differ by 14.3% / 29.8%. One step therefore sits within the
+  sampling noise, but twice as far from the converged trajectory as two steps. A fused
+  1-step engine is built with `--fused-denoising-steps 1 2`; whether to run it is a
+  robot-side decision.
+- **Aggressive INT8** (VL self-attention, encoders and decoder in INT8 too, and only LLM
+  layers 0-2 keeping their BF16 down-projection) costs 0.8 points of mean action error
+  for 6 ms. The verify cosine on actions is actually higher (0.99916 vs 0.99883); the
+  per-frame error against PyTorch is the number to watch. Mind the regex: one that matches
+  nothing quantizes layer 2's down-projection and the backbone cosine drops to 0.50.
+
+With the robot's actual 4:3 frames (352x256, 88 tokens per image instead of 112) every
+configuration above is roughly 10% lighter in the ViT and LLM than this DROID benchmark.
+
+### What did not help in round 5
+
+- **Rewriting the ViT rotary embedding.** The profile showed 3.1 ms in a 130 µs
+  elementwise kernel per block. A TensorRT micro-benchmark of the alternatives (q and k
+  in one op, BF16 instead of FP32, no Neg/Concat) all run at 86-90 µs per block for the
+  same 3.7M elements; the kernel is what Myelin generates for any formulation, so the
+  export was left as it is.
+- **INT8 on the patch embedding** (item 4 above).
+
+Two pitfalls worth knowing for further export work: a forward pre-hook that returns a
+value replaces the module's arguments (the embodiment capture did, and broke the shape
+run), and the legacy ONNX exporter names nodes by the stack of module *forwards* that
+were called, so calling a block's children directly from a wrapper drops the
+`/model/transformer_blocks.N/` scope and the quantizer's name filters stop matching.
+The export routes the per-step logic through patched `forward`s for that reason.
+
 ## Recommended configuration
 
 ```bash
@@ -472,13 +590,20 @@ python scripts/deployment/build_trt_pipeline.py \
     --vit-precision bf16 --fused-denoising-steps 2 --steps export,build,verify
 
 # Faster, opt-in: INT8 engines. 'vit action_head': 106 instead of 140 ms per step here;
-# adding 'llm': 95 ms, at about 3x the PyTorch-relative action error of BF16 engines.
-# Calibrates on --dataset-path, so use your robot's data, then check verify and an
-# open-loop eval, and compare the actions against the BF16 engines on your task.
+# adding 'llm': 87 ms with the round-5 export (94 ms through the server), at about 3x
+# the PyTorch-relative action error of BF16 engines. Calibrates on --dataset-path, so
+# use your robot's data, then check verify and an open-loop eval, and compare the
+# actions against the BF16 engines on your task. '--fused-denoising-steps 1 2' also
+# builds a 1-step engine (79 ms in-process); see round 5 before using one step.
 python scripts/deployment/build_trt_pipeline.py \
     --model-path <checkpoint> --dataset-path <dataset> --embodiment-tag <TAG> \
     --vit-precision bf16 --fused-denoising-steps 2 --int8 vit llm action_head \
     --output-dir ./gr00t_trt_deployment_int8 --steps export,quantize,build,verify
+
+# Fastest, least accurate (81 ms, +0.8 points of mean action error): everything in the
+# action head in INT8 and BF16 down-projections only in LLM layers 0-2.
+#   ... --int8 vit llm action_head --int8-action-head-all \
+#       --int8-llm-keep-bf16 'layers\.[0-2]/mlp/down_proj'
 
 # Inference / benchmarking
 python scripts/deployment/standalone_inference_script.py \
@@ -502,7 +627,7 @@ python gr00t/eval/open_loop_eval.py \
 Measured with these (2 DROID trajectories, 2-step): `open_loop_eval.py` in-process 145 ms per
 step. Through the server from a local client, with round 3's GPU image preprocessing (on by
 default; `--no-gpu-image-preprocessing` turns it off): 151 ms with BF16 engines, 115 ms with
-INT8 ViT + DiT, 104 ms with INT8 ViT + LLM + DiT. For a camera that streams at a fixed rate,
+INT8 ViT + DiT, 104 ms with INT8 ViT + LLM + DiT (round 4), 94 ms with round 5's export. For a camera that streams at a fixed rate,
 start the server with `--pipelined` and send frames with
 `gr00t.policy.server_client.PipelinedPolicyClient` (round 4). The server does not seed the sampling noise, so its open-loop MSE varies run
 to run.
@@ -669,6 +794,10 @@ so the remaining time is in things quantization does not touch:
 Items 1-6 are export-level changes with no accuracy cost except item 5 and part of
 item 4, and add up to roughly 12 ms per step: about 83 ms in-process and 92 ms through
 the one-request-at-a-time server, before pre-sized frames.
+
+*Status after round 5 (2026-10-21):* items 1, 2, 3 and 6 are done (86.7 ms in-process,
+94.1 ms through the server); item 4 is not a lever (every formulation costs the same
+kernel time); item 5 is available as `--int8-llm-keep-bf16`.
 
 Measured but ruled out: the cross-attention K/V projections are shared across steps as
 intended (48 `to_k` MatMuls: 16 self blocks x 2 steps + 16 cross blocks x 1); the LLM's

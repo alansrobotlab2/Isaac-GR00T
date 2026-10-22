@@ -171,7 +171,7 @@ def derive_shapes_from_onnx(onnx_path, max_batch=8):
     return min_shapes, opt_shapes, max_shapes
 
 
-def derive_shapes_with_hint(onnx_path, opt_seq_lens=None, max_batch=8):
+def derive_shapes_with_hint(onnx_path, opt_seq_lens=None, max_batch=8, max_seq_lens=None):
     """Derive shapes from ONNX, with optional sequence length hints.
 
     Args:
@@ -179,9 +179,13 @@ def derive_shapes_with_hint(onnx_path, opt_seq_lens=None, max_batch=8):
         opt_seq_lens: Dict mapping dynamic dim names to optimal sequence lengths.
                       e.g. {"sa_seq_len": 51, "vl_seq_len": 280, "sequence_length": 280}
         max_batch: Maximum batch size
+        max_seq_lens: Optional dict of dynamic dim name -> maximum, for dims whose
+                      maximum should not be derived from the optimum (default
+                      ``max(2 * opt, opt + 64)``).
     """
     model = onnx.load(onnx_path, load_external_data=False)
     opt_seq_lens = opt_seq_lens or {}
+    max_seq_lens = max_seq_lens or {}
 
     min_shapes, opt_shapes, max_shapes = {}, {}, {}
 
@@ -208,7 +212,7 @@ def derive_shapes_with_hint(onnx_path, opt_seq_lens=None, max_batch=8):
                     opt_val = opt_seq_lens[dim_name]
                     min_shape.append(1)
                     opt_shape.append(opt_val)
-                    max_shape.append(max(opt_val * 2, opt_val + 64))
+                    max_shape.append(max_seq_lens.get(dim_name, max(opt_val * 2, opt_val + 64)))
                 else:
                     # Unknown dynamic dim — use wide range
                     min_shape.append(1)
@@ -461,15 +465,24 @@ def build_full_pipeline(
                 f"{onnx_dir} records precision={metadata['precision']!r}. Build at the "
                 f"exported precision (--precision {metadata['precision']}) or re-export."
             )
+        vl_seq_len = metadata["vl_seq_len"]
+        num_image_tokens = metadata.get("num_image_tokens", metadata["num_vis_tokens"])
         seq_hints = {
             "sa_seq_len": metadata["sa_seq_len"],
-            "vl_seq_len": metadata["vl_seq_len"],
+            "vl_seq_len": vl_seq_len,
             "sequence_length": metadata["llm_seq_len"],
             "seq_len": metadata["llm_seq_len"],  # N1.7 LLM dynamic dim name
             "num_patches": metadata["num_patches"],
             "num_merged_patches": metadata["num_merged_patches"],
             "num_vis_tokens": metadata["num_vis_tokens"],  # N1.7 deepstack
+            # Fused action head: the vision-language sequence split into its image
+            # tokens and its text tokens.
+            "num_image_tokens": num_image_tokens,
+            "num_text_tokens": metadata.get("num_text_tokens", vl_seq_len - num_image_tokens),
         }
+        # A longer instruction only changes the text count, so it may use the whole
+        # range the sequence itself can grow to.
+        max_hints = {"num_text_tokens": max(vl_seq_len * 2, vl_seq_len + 64)}
         logger.info(f"Loaded shape hints from export_metadata.json in {onnx_dir}: {seq_hints}")
     else:
         seq_hints = {
@@ -477,6 +490,7 @@ def build_full_pipeline(
             "vl_seq_len": 280,  # typical backbone output seq_len
             "sequence_length": 280,  # LLM seq_len
         }
+        max_hints = {}
         logger.warning(f"Using default shape hints (no usable metadata): {seq_hints}")
 
     # Build order, ONNX candidates, and engine filenames come from the shared
@@ -556,7 +570,7 @@ def build_full_pipeline(
         try:
             # Derive shapes from the ONNX model itself
             min_shapes, opt_shapes, max_shapes = derive_shapes_with_hint(
-                onnx_path, opt_seq_lens=seq_hints
+                onnx_path, opt_seq_lens=seq_hints, max_seq_lens=max_hints
             )
 
             logger.info(f"  Auto-derived shape profiles for {name}:")

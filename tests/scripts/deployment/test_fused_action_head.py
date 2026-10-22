@@ -95,6 +95,104 @@ def test_find_fused_engines_maps_step_count_to_path(tmp_path, trt_model_forward)
     }
 
 
+class _FakeEngine:
+    """Records what the fused forward binds; declares the given input names."""
+
+    def __init__(self, input_names):
+        self.in_meta = [[name, (-1,), None] for name in input_names]
+        self.shapes = {}
+        self.calls = []
+
+    def set_runtime_tensor_shape(self, name, shape):
+        self.shapes[name] = tuple(shape)
+
+    def __call__(self, **inputs):
+        self.calls.append(inputs)
+        return {"actions": inputs["init_actions"].float()}
+
+
+def _fused_inputs(torch):
+    from transformers.feature_extraction_utils import BatchFeature
+
+    image_mask = torch.zeros(1, 9, dtype=torch.bool)
+    image_mask[:, 1:6] = True
+    attended = torch.ones(1, 9, dtype=torch.bool)
+    backbone_output = BatchFeature(
+        data={
+            "backbone_features": torch.zeros(1, 9, 8, dtype=torch.bfloat16),
+            "image_mask": image_mask,
+            "backbone_attention_mask": attended,
+        }
+    )
+    action_input = BatchFeature(
+        data={
+            "state": torch.zeros(1, 1, 4, dtype=torch.bfloat16),
+            "embodiment_id": torch.tensor([3]),
+        }
+    )
+    return backbone_output, action_input
+
+
+def test_fused_forward_feeds_token_indices_to_current_engines(trt_model_forward):
+    """A graph with index inputs gets the two token subsets (computed when the backbone
+    output lacks them); a mask graph gets the masks; the embodiment is checked once."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    backbone_output, action_input = _fused_inputs(torch)
+    head = types.SimpleNamespace(
+        init_actions=torch.zeros(1, 2, 4, dtype=torch.bfloat16),
+        _trt_fused_embodiment_id=3,
+        _trt_fused_embodiment_ok=False,
+    )
+
+    engine = _FakeEngine(
+        ["backbone_features", "state", "init_actions", "image_index", "text_index"]
+    )
+    trt_model_forward._fused_action_head_forward(head, engine, backbone_output, action_input)
+    bound = engine.calls[0]
+    assert bound["image_index"].tolist() == [1, 2, 3, 4, 5]
+    assert bound["text_index"].tolist() == [0, 6, 7, 8]
+    assert engine.shapes["image_index"] == (5,) and engine.shapes["text_index"] == (4,)
+    assert "image_mask" not in bound and head._trt_fused_embodiment_ok
+
+    # Indices supplied by the backbone forward (cached per layout) are used as given.
+    backbone_output["image_index"] = torch.tensor([2, 3])
+    backbone_output["text_index"] = torch.tensor([0, 1])
+    trt_model_forward._fused_action_head_forward(head, engine, backbone_output, action_input)
+    assert engine.calls[1]["image_index"].tolist() == [2, 3]
+
+    # Older graphs: boolean masks over the whole sequence.
+    old = _FakeEngine(
+        [
+            "backbone_features",
+            "state",
+            "embodiment_id",
+            "init_actions",
+            "image_mask",
+            "backbone_attention_mask",
+        ]
+    )
+    trt_model_forward._fused_action_head_forward(head, old, backbone_output, action_input)
+    assert "image_mask" in old.calls[0] and "image_index" not in old.calls[0]
+    assert old.shapes["image_mask"] == (1, 9)
+
+
+def test_fused_forward_rejects_other_embodiment(trt_model_forward):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    backbone_output, action_input = _fused_inputs(torch)
+    head = types.SimpleNamespace(
+        init_actions=torch.zeros(1, 2, 4, dtype=torch.bfloat16),
+        _trt_fused_embodiment_id=7,
+        _trt_fused_embodiment_ok=False,
+    )
+    engine = _FakeEngine(
+        ["backbone_features", "state", "init_actions", "image_index", "text_index"]
+    )
+    with pytest.raises(ValueError, match="embodiment id 7"):
+        trt_model_forward._fused_action_head_forward(head, engine, backbone_output, action_input)
+
+
 def test_fused_onnx_and_engine_names_agree(monkeypatch, trt_model_forward):
     """The exporter's ONNX name, the builder's pattern and the runtime's pattern must line up."""
     monkeypatch.syspath_prepend(DEPLOY_DIR)

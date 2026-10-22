@@ -74,6 +74,7 @@ from _trt_contract import (  # noqa: E402
     assert_engine_bundle_present,
     assert_engine_matches_policy,
     assert_grid_thw_matches,
+    load_export_metadata,
 )
 from trt_torch import Engine  # noqa: E402
 
@@ -176,6 +177,19 @@ class _StaticPlan:
     valid_mask: torch.Tensor | None  # [full_seq_len] bool, None when there is no padding
     image_mask_out: torch.Tensor  # [B, seq_len] bool
     backbone_attention_mask: torch.Tensor  # [B, seq_len] bool
+    image_index: torch.Tensor  # [num_image_tokens] positions of the image tokens
+    text_index: torch.Tensor  # [num_text_tokens] positions of the other attended tokens
+
+
+def _token_subset_indices(image_mask, backbone_attention_mask):
+    """Positions of the image tokens and of the other attended tokens (fused head inputs).
+
+    The layout is shared by the batch (see ``_assert_supports_trt_padding_strip``), so
+    the indices come from the first row. Reads the masks back to the host.
+    """
+    image = image_mask[0] & backbone_attention_mask[0]
+    text = ~image_mask[0] & backbone_attention_mask[0]
+    return image.nonzero().squeeze(1), text.nonzero().squeeze(1)
 
 
 def _static_plan_key(input_ids, attention_mask, grid_thw):
@@ -228,6 +242,7 @@ def _build_static_plan(self, input_ids, attention_mask, grid_thw, inputs_embeds,
         image_mask_out = image_mask_out[:, valid_mask]
         backbone_attention_mask = backbone_attention_mask[:, valid_mask]
 
+    image_index, text_index = _token_subset_indices(image_mask_out, backbone_attention_mask)
     return _StaticPlan(
         # masked_scatter fills masked positions in row-major order, i.e. these indices.
         visual_index=visual_pos_masks.reshape(-1).nonzero().squeeze(1),
@@ -238,6 +253,8 @@ def _build_static_plan(self, input_ids, attention_mask, grid_thw, inputs_embeds,
         valid_mask=valid_mask,
         image_mask_out=image_mask_out.contiguous(),
         backbone_attention_mask=backbone_attention_mask.contiguous(),
+        image_index=image_index.contiguous(),
+        text_index=text_index.contiguous(),
     )
 
 
@@ -321,6 +338,8 @@ def _qwen3_vit_and_scatter(self, vl_input):
         "deepstack_list": deepstack_list,
         "image_mask_out": plan.image_mask_out,
         "backbone_attention_mask": plan.backbone_attention_mask,
+        "image_index": plan.image_index,
+        "text_index": plan.text_index,
     }
 
 
@@ -360,6 +379,8 @@ def qwen3_backbone_tensorrt_forward(self, vl_input):
             "backbone_features": outputs.last_hidden_state,
             "backbone_attention_mask": prepared["backbone_attention_mask"],
             "image_mask": prepared["image_mask_out"],
+            "image_index": prepared["image_index"],
+            "text_index": prepared["text_index"],
         }
     )
 
@@ -453,11 +474,14 @@ def qwen3_backbone_llm_trt_forward(self, vl_input):
     if backbone_features.dtype != torch.bfloat16:
         backbone_features = backbone_features.to(torch.bfloat16)
 
+    image_index, text_index = _token_subset_indices(image_mask_out, backbone_attention_mask)
     return BatchFeature(
         data={
             "backbone_features": backbone_features,
             "backbone_attention_mask": backbone_attention_mask,
             "image_mask": image_mask_out,
+            "image_index": image_index,
+            "text_index": text_index,
         }
     )
 
@@ -529,6 +553,8 @@ def qwen3_backbone_full_trt_forward(self, vl_input):
             "backbone_features": backbone_features,
             "backbone_attention_mask": prepared["backbone_attention_mask"],
             "image_mask": prepared["image_mask_out"],
+            "image_index": prepared["image_index"],
+            "text_index": prepared["text_index"],
         }
     )
 
@@ -622,17 +648,46 @@ def _fused_action_head_forward(self, engine, backbone_output, action_input):
     image_mask = backbone_output.image_mask
     backbone_attention_mask = backbone_output.backbone_attention_mask
 
+    # The engine is built for one embodiment (export_metadata.json records which);
+    # checked once, the id does not change for a loaded policy.
+    expected_embodiment = getattr(self, "_trt_fused_embodiment_id", None)
+    if expected_embodiment is not None and not getattr(self, "_trt_fused_embodiment_ok", False):
+        actual = sorted(set(embodiment_id.flatten().tolist()))
+        if actual != [expected_embodiment]:
+            raise ValueError(
+                f"The fused action head engine was exported for embodiment id "
+                f"{expected_embodiment}, but the policy uses {actual}. Re-export the engines "
+                "with the policy's embodiment tag."
+            )
+        self._trt_fused_embodiment_ok = True
+
+    inputs = {
+        "backbone_features": backbone_features,
+        "state": state,
+        "embodiment_id": embodiment_id,
+        "init_actions": init_actions,
+    }
     engine.set_runtime_tensor_shape("backbone_features", backbone_features.shape)
-    engine.set_runtime_tensor_shape("image_mask", image_mask.shape)
-    engine.set_runtime_tensor_shape("backbone_attention_mask", backbone_attention_mask.shape)
-    actions = engine(
-        backbone_features=backbone_features,
-        state=state,
-        embodiment_id=embodiment_id,
-        init_actions=init_actions,
-        image_mask=image_mask,
-        backbone_attention_mask=backbone_attention_mask,
-    )["actions"]
+    engine_inputs = {meta[0] for meta in engine.in_meta}
+    if "image_index" in engine_inputs:
+        # Current graphs take the token layout as index tensors (unmasked cross-attention
+        # over the image and text subsets). The backbone forwards cache them per layout;
+        # anything else (e.g. a PyTorch backbone) pays a host read here.
+        image_index = getattr(backbone_output, "image_index", None)
+        text_index = getattr(backbone_output, "text_index", None)
+        if image_index is None or text_index is None:
+            image_index, text_index = _token_subset_indices(image_mask, backbone_attention_mask)
+        engine.set_runtime_tensor_shape("image_index", image_index.shape)
+        engine.set_runtime_tensor_shape("text_index", text_index.shape)
+        inputs["image_index"] = image_index
+        inputs["text_index"] = text_index
+    else:
+        # Older graphs: boolean masks over the whole sequence.
+        engine.set_runtime_tensor_shape("image_mask", image_mask.shape)
+        engine.set_runtime_tensor_shape("backbone_attention_mask", backbone_attention_mask.shape)
+        inputs["image_mask"] = image_mask
+        inputs["backbone_attention_mask"] = backbone_attention_mask
+    actions = engine(**inputs)["actions"]
     return BatchFeature(data={"action_pred": actions})
 
 
@@ -967,6 +1022,10 @@ def _setup_n17_full_pipeline(policy, trt_engine_path, use_vit_engine=True, engin
     action_head._trt_engine_source = (trt_engine_path, dict(engine_kwargs or {}))
     action_head._trt_fused_engine_paths = _find_fused_engines(trt_engine_path)
     action_head._trt_fused_engines = {}
+    # Fused graphs bake the embodiment's weights; the forward checks the policy's id once.
+    metadata = load_export_metadata(trt_engine_path) or {}
+    action_head._trt_fused_embodiment_id = metadata.get("embodiment_id")
+    action_head._trt_fused_embodiment_ok = False
     action_head._trt_step_engines_loaded = False
     num_steps = action_head.num_inference_timesteps
     if _fused_engine_for(action_head, num_steps) is None:

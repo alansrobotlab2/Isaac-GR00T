@@ -47,6 +47,10 @@ _FUSED_RE = re.compile(r"action_head_fused_\d+step\.onnx")
 # LLM layers that stay BF16 under --int8 llm (set from a per-layer sensitivity study on
 # GR00T-N1.7-3B; see INFERENCE_OPTIMIZATIONS_N1D7.md, round 4).
 LLM_KEEP_BF16: str | None = r"mlp/down_proj"
+# The ViT patch embedding (a Gemm over raw normalized pixels since round 5) costs about
+# 0.4 points of mean action error in INT8 for ~0.1 ms; as a BF16 Gemm it is still far
+# cheaper than the Conv3d it replaced.
+VIT_KEEP_BF16: str | None = r"patch_embed"
 
 # The DiT inside a fused action head graph; the other parts of the head stay BF16 unless
 # ``quantize_action_head_all`` is set.
@@ -141,12 +145,14 @@ def capture_calibration_data(
         add("action_head_fused", "state", state.to(torch.bfloat16))
         add("action_head_fused", "embodiment_id", action_input.embodiment_id.to(torch.int64))
         add("action_head_fused", "init_actions", noise.to(torch.bfloat16))
-        add("action_head_fused", "image_mask", backbone_output.image_mask.to(torch.bool))
-        add(
-            "action_head_fused",
-            "backbone_attention_mask",
-            backbone_output.backbone_attention_mask.to(torch.bool),
-        )
+        image_mask = backbone_output.image_mask.to(torch.bool)
+        attended = backbone_output.backbone_attention_mask.to(torch.bool)
+        add("action_head_fused", "image_mask", image_mask)
+        add("action_head_fused", "backbone_attention_mask", attended)
+        # The current fused graph takes the token layout as index tensors (the graph
+        # inputs decide which of these the calibration run feeds).
+        add("action_head_fused", "image_index", (image_mask[0] & attended[0]).nonzero().squeeze(1))
+        add("action_head_fused", "text_index", (~image_mask[0] & attended[0]).nonzero().squeeze(1))
         return original_get_action(backbone_output, action_input, *args, **kwargs)
 
     modality_configs = policy.get_modality_config()
@@ -213,11 +219,13 @@ def quantize_pipeline(
     num_frames: int = 64,
     skip: str | None = None,
     quantize_action_head_all: bool = False,
+    llm_keep_bf16: str | None = LLM_KEEP_BF16,
 ) -> dict[str, dict]:
     """Calibrate on ``dataset`` and write INT8 versions of ``components`` to ``int8_dir``.
 
     ``policy`` is released (moved off the GPU) after the capture so the calibration
-    engines have the memory. Returns the per-file quantization summaries.
+    engines have the memory. ``llm_keep_bf16`` is the LLM's own keep-BF16 pattern
+    (``None`` quantizes every LLM linear). Returns the per-file quantization summaries.
     """
     from quantize_onnx_int8 import quantize_file
 
@@ -234,11 +242,11 @@ def quantize_pipeline(
         vit = next((n for n in ("vit_bf16.onnx", "vit_fp32.onnx") if n in names), None)
         if vit is None:
             raise FileNotFoundError(f"--int8 vit: no ViT graph in {onnx_dir}")
-        targets[vit] = ("vit", None, None, SMOOTH_ALPHA["vit"])
+        targets[vit] = ("vit", None, VIT_KEEP_BF16, SMOOTH_ALPHA["vit"])
     if "llm" in components:
         if "llm_bf16.onnx" not in names:
             raise FileNotFoundError(f"--int8 llm: no llm_bf16.onnx in {onnx_dir}")
-        targets["llm_bf16.onnx"] = ("llm", None, LLM_KEEP_BF16, SMOOTH_ALPHA["llm"])
+        targets["llm_bf16.onnx"] = ("llm", None, llm_keep_bf16, SMOOTH_ALPHA["llm"])
     if "action_head" in components:
         only = None if quantize_action_head_all else _FUSED_DIT_FILTER
         found = False
