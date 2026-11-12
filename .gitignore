@@ -8,11 +8,30 @@
 /examples/LIBERO/libero_object_no_noops_1.0.0_lerobot/
 /examples/LIBERO/libero_spatial_no_noops_1.0.0_lerobot/
 
-# Local checkpoints / datasets (alfie)
+# Local checkpoints / datasets / build outputs (alfie). Never commit these.
 /alfie-gr00t/
 /alfiebot.CanDoChallenge/
 /checkpoints/
-/gr00t_trt_deployment/
+/lerobot/
+/cando*/
+/calibration_data*/
+/groot_n1d6_onnx/
+# TensorRT pipeline output dirs (gr00t_trt_deployment, gr00t_trt_deployment_int8, ...)
+/gr00t_trt_deployment*/
+# demo_data/: the upstream sample datasets stay tracked (tests use them; ignore rules do not
+# affect tracked files), but nothing new added locally is picked up.
+/demo_data/
+# Model weights, optimizer state and engine artifacts, wherever they are written
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.onnx.data
+*.engine
+*.trt
+*.plan
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
