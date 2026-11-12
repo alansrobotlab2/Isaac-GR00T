@@ -580,6 +580,58 @@ were called, so calling a block's children directly from a wrapper drops the
 `/model/transformer_blocks.N/` scope and the quantizer's name filters stop matching.
 The export routes the per-step logic through patched `forward`s for that reason.
 
+## Upstream merge and the first fine-tuned checkpoint (2026-11-12)
+
+Upstream `main` (22 commits, including the `scripts/deployment/trt/` layout, strict
+action/VL padding masks and the Thor TensorRT work) was merged into this branch. Upstream's
+code is the base; the Orin work is re-applied on top of it. The TRT scripts and the INT8/INT4
+tools now live in `scripts/deployment/trt/` (`python -m scripts.deployment.trt.<module>`).
+
+**The merge changes nothing on Orin.** Round-5 recipe rebuilt on DROID, same harness:
+
+| | Round 5 | After the merge |
+|---|---|---|
+| In-process step, 2-step | 86.7 ms | 86.4 ms |
+| Server, one request at a time | 94.1 ms | 95.3 ms |
+| Open-loop MSE (3 trajectories) | 0.016737 | 0.016737 |
+| Action error vs PyTorch (mean / worst of 20 frames) | 3.98% / 10.1% | 3.98% / 10.1% |
+
+The quantized ONNX graphs are byte-identical to round 5's (round 5's action error is
+re-measured here with a recreated harness, hence 3.98% instead of the 3.91% above).
+
+**Upstream's `--execution-profile optimized` is not a lever on Orin.** It keeps per-step
+engines, replays the action head as one CUDA graph, caches the cross-attention K/V and
+precomputes the timestep modulations, and fuses the LLM gate/up projections. Its
+quantization policies (FP8, NVFP4) need hardware that Orin does not have. BF16 engines,
+alfie checkpoint, 4 denoising steps (its constants are exported for the checkpoint's step
+count and it refuses any other):
+
+| BF16 engines, in-process | 4-step | 2-step | Open-loop MSE (4-step) |
+|---|---|---|---|
+| Fused action head (this branch) | **130.7 ms** | **107.9 ms** | 0.00313 |
+| Upstream optimized profile | 135.6 ms | not available | 0.00314 |
+
+The LLM engines time the same standalone (26.9 vs 27.0 ms; TensorRT already fuses the
+gate/up matmuls), so the 4.9 ms gap is the action head: the fused graph attends to gathered
+token subsets instead of masking, and it can be INT8-quantized.
+
+**First fine-tuned checkpoint (alfie, CleanTheRoom).** 4 cameras at 352x256 (352 visual
+tokens, 372 LLM tokens), action horizon 16, trained with 4 denoising steps; ViT and LLM
+frozen. Round-5 INT8 recipe calibrated on the robot's own data (`--int8 vit llm action_head
+--fused-denoising-steps 2 4`, about 30 minutes to build); verify cosine 0.99963. Robot stack
+stopped during the measurements:
+
+| | PyTorch, 4-step | INT8 engines, 4-step | INT8 engines, 2-step |
+|---|---|---|---|
+| Open-loop MSE / MAE (3 episodes) | 0.00316 / 0.0139 | 0.00314 / 0.0139 | 0.00268 / 0.0136 |
+| Action error vs PyTorch (mean / worst) | | 2.20% / 8.4% | 2.37% / 9.2% |
+| In-process step | 390 ms | 87.7 ms | 74.2 ms |
+| Server, one request at a time | | 91.9 ms | 77.3 ms |
+
+All three episodes were in the training set, so the open-loop numbers show the engines
+reproduce the model, not how well it generalizes; 2-step vs 4-step still has to be judged
+on the robot.
+
 ## Recommended configuration
 
 ```bash
@@ -662,10 +714,9 @@ in at export; rebuild after changing any of them.
 
 ## Not yet done
 
-- Validation on a fine-tuned checkpoint and a real robot embodiment (everything above is the
-  base model on DROID demo data). In particular, 2-step denoising and INT4 weights are
-  only supported by open-loop MSE here.
-  INT8 engines change the actions more than BF16 ones (round 3) and need the same check.
+- Validation on the real robot. The first fine-tuned checkpoint (alfie) matches PyTorch
+  open-loop with INT8 engines at 2 and 4 steps, but 2-step denoising and INT8 have only been
+  judged by open-loop numbers on training episodes. INT4 weights are untested on it.
 - The pipelined server needs a client that sends frames without waiting for actions
   (`PipelinedPolicyClient`); the robot client has not been changed or tested with it.
 - Remaining server time outside the model is about 8 ms (OpenCV resizing, action decode).
