@@ -18,12 +18,48 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 from pathlib import Path
+import sys
 import tempfile
 
 from filelock import FileLock
 import pytest
+
+
+def _retain_failure_output(report) -> None:
+    """Keep complete failed-test output in CI artifacts and bound console sections."""
+    directory = os.environ.get("PYTEST_FAILURE_LOG_DIR")
+    if not directory or not report.failed:
+        return
+    identity = hashlib.sha256((report.nodeid + report.when).encode()).hexdigest()[:16]
+    path = Path(directory) / f"{identity}-{report.when}.log"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w") as stream:
+            stream.write(f"{report.nodeid} ({report.when})\n\n{report.longrepr}\n")
+            for name, content in report.sections:
+                stream.write(f"\n=== {name} ===\n{content}\n")
+        note = f"Complete failure log: {path}"
+    except OSError as error:
+        # Artifact storage trouble must not hide the original test failure.
+        note = f"Could not retain full failure log at {path}: {type(error).__name__}"
+        report.sections.append(("Failure log retention", note))
+    limit = 8192
+    report.sections[:] = [
+        (
+            name,
+            f"[Output truncated; {note}]\n" + content[-limit:] if len(content) > limit else content,
+        )
+        for name, content in report.sections
+    ]
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    _retain_failure_output(outcome.get_result())
 
 
 def _pin_xdist_worker_to_gpu() -> None:
@@ -56,6 +92,58 @@ def _pin_xdist_worker_to_gpu() -> None:
 
 
 _pin_xdist_worker_to_gpu()
+
+
+def _cgroup_cpu_quota() -> int | None:
+    """Whole CPUs allowed by a cgroup v2 or v1 CFS quota, or None without one."""
+    cgroup = Path("/sys/fs/cgroup")
+    try:
+        quota, period = (cgroup / "cpu.max").read_text().split()
+    except (OSError, ValueError):
+        try:
+            quota = (cgroup / "cpu/cpu.cfs_quota_us").read_text().strip()
+            period = (cgroup / "cpu/cpu.cfs_period_us").read_text().strip()
+        except OSError:
+            return None
+    if not quota.isdigit() or not period.isdigit() or int(period) == 0:
+        return None  # "max" (v2) or -1 (v1) means no quota.
+    return max(1, int(quota) // int(period))
+
+
+def _available_cpus() -> int:
+    """CPUs this process may use, including a cgroup CPU quota."""
+    cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+    quota = _cgroup_cpu_quota()
+    if quota is not None:
+        cpus = min(cpus or quota, quota)
+    return cpus or 1
+
+
+def _limit_xdist_worker_threads() -> None:
+    """Share the CPUs among pytest-xdist workers instead of oversubscribing them.
+
+    Each worker's torch would otherwise start one OpenMP thread per host core,
+    so eight workers on a CPU-limited pod thrash. Earlier collection may
+    already have imported torch, so its thread pool is resized as well.
+    An explicit OMP_NUM_THREADS or MKL_NUM_THREADS is kept. torch.set_num_threads
+    sets both pools, so it uses the smaller explicit limit, if any. Values that
+    are not a positive integer, such as nested OpenMP lists, are left to the
+    runtime and not used for resizing.
+    """
+    workers = os.environ.get("PYTEST_XDIST_WORKER_COUNT")
+    if not workers or not workers.isdigit() or int(workers) == 0:
+        return
+    threads = max(1, _available_cpus() // int(workers))
+    names = ("OMP_NUM_THREADS", "MKL_NUM_THREADS")
+    explicit = [int(v) for n in names if (v := os.environ.get(n, "")).isdigit() and int(v) > 0]
+    for name in names:
+        os.environ.setdefault(name, str(threads))
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        torch.set_num_threads(min(explicit, default=threads))
+
+
+_limit_xdist_worker_threads()
 
 
 def _configure_shared_caches() -> None:

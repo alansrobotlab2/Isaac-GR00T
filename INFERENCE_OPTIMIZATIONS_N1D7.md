@@ -226,16 +226,16 @@ smaller, because most layers are small:
 | Worst-case action cosine vs PyTorch (20 frames) | 0.99992 | 0.99951 |
 
 Open-loop error is unchanged, but each action chunk is about six times further from the
-PyTorch reference, so this is not the default. `scripts/deployment/quantize_onnx_int4.py`
+PyTorch reference, so this is not the default. `scripts/deployment/trt/quantize_onnx_int4.py`
 writes a mirrored ONNX directory to build from. Two things TensorRT 10.16 is picky about:
 only block size 128 has a fast kernel (block 32 was four times *slower* than BF16), and a
 quantized weight must feed exactly one `MatMul`, so the tool gives each unrolled step its
 own INT4 copy.
 
 ```bash
-python scripts/deployment/quantize_onnx_int4.py \
+python -m scripts.deployment.trt.quantize_onnx_int4 \
     --onnx-dir gr00t_trt_deployment/onnx --output-dir gr00t_trt_deployment/onnx_int4
-python scripts/deployment/build_tensorrt_engine.py --mode full_pipeline \
+python -m scripts.deployment.trt.build_tensorrt_engine --mode full_pipeline \
     --onnx-dir gr00t_trt_deployment/onnx_int4 --engine-dir gr00t_trt_deployment/engines_int4
 ```
 
@@ -299,7 +299,7 @@ Through `run_gr00t_server.py` from a local client, one fixed prompt, 2-step, med
    tokens, 2.1x at the LLM's 461 tokens, and 1.75x at the DiT's 41 tokens (there it
    halves the weight bytes read).
 
-2. **New tool: `scripts/deployment/quantize_onnx_int8.py`.** It rewrites every linear
+2. **New tool: `scripts/deployment/trt/quantize_onnx_int8.py`.** It rewrites every linear
    layer of an exported graph as INT8 (weights per output channel, activations per
    tensor) and calibrates the activation ranges with TensorRT itself: the unmodified
    graph is built once with every linear input marked as an output, calibration samples

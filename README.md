@@ -67,7 +67,9 @@ NVIDIA Isaac GR00T N1.7 is an open vision-language-action (VLA) model for genera
 
 GR00T N1.7 is trained on a diverse mixture of robot data including bimanual, semi-humanoid and an expansive humanoid dataset. It is adaptable through post-training for specific embodiments, tasks and environments.
 
-GR00T N1.7 is fully commercially licensable under Apache 2.0. It delivers comparable performance to N1.6, with improved generalization and language-following capabilities driven by the inclusion of 20K hours of EgoScale human video data in pretraining.
+GR00T N1.7 is fully commercially usable: the code is released under Apache 2.0 and the model weights under the NVIDIA Open Model License (see [License](#license)). It delivers comparable performance to N1.6, with improved generalization and language-following capabilities driven by the inclusion of 20K hours of EgoScale human video data in pretraining.
+
+**GR00T N1.7 runs at ~40 Hz on NVIDIA RTX PRO 6000 Blackwell Server Edition and ~28 Hz on Jetson AGX Thor** with TensorRT. [Benchmark details](scripts/deployment/README.md#benchmark-results) (batch-1 LIBERO; Thor MAXN + `jetson_clocks`).
 
 The neural network architecture of GR00T N1.7 is a combination of vision-language foundation model and diffusion transformer head that denoises continuous actions. Here is a schematic diagram of the architecture:
 
@@ -134,6 +136,26 @@ the N1.6 model package and runtime behavior.
 **Fine-tuning:** 1 or more GPUs with 40 GB+ VRAM recommended. We recommend H100 or L40 nodes for optimal performance. Other hardware (e.g., A6000) works but may require longer training time. See the [Hardware Recommendation Guide](getting_started/hardware_recommendation.md) for detailed specs.
 
 **CUDA / Python per platform:** dGPU on CUDA 12.8 with Python 3.12; Jetson Thor and Orin on JetPack 7.2 / CUDA 13.2 with Python 3.12; DGX Spark on CUDA 13.0 with Python 3.12. The per-platform install scripts and Dockerfiles live under `scripts/deployment/`; see the [Deployment & Inference Guide](scripts/deployment/README.md) for the full matrix.
+
+### N1.7 Single-GPU Training Performance
+
+Training measurements cover the non-edge GPUs used for development and post-training.
+The standard batch is 1 and uses the same canonical two-camera workload on every
+device. A timed step includes the synchronized BF16 forward pass, backward pass,
+and AdamW update. The language and visual backbones are frozen while the projector,
+diffusion model, and VLLN modules are trainable. Maximum batch is the largest local
+batch that completed, bounded by an adjacent CUDA out-of-memory trial.
+
+| Device | Standard batch | Training step (ms) | Max batch | Max-batch step (ms) | Samples/s |
+|---|---:|---:|---:|---:|---:|
+| H100 80GB HBM3 | 1 | 115.5 | 409 | 2123.9 | 192.57 |
+| L40 | 1 | 190.5 | 213 | 3775.5 | 56.42 |
+| RTX Pro 6000 Blackwell Server Edition (96 GB) | 1 | 119.3 | 502 | 3822.4 | 131.33 |
+
+Each passing batch uses two warmup steps and five timed steps; the table reports
+the median. Candidates run in fresh processes, doubling from batch 1 until OOM and
+then bisecting to an adjacent pass/OOM boundary. Data loading is excluded. These
+are local optimizer-step measurements, not distributed-training results.
 
 ### Clone the Repository
 
@@ -484,6 +506,9 @@ Replace `demo_data/cube_to_bowl_5` and `examples/SO100/so100_config.py` with you
 - Maximize batch size for your hardware and train for a few thousand steps.
 - Users may observe 5-6% variance between runs due to non-deterministic image augmentations. Keep this in mind when comparing to reported benchmarks.
 - **`--state_dropout_prob`** (model config default: 0.8; finetune CLI default: 0.2; see `gr00t/configs/finetune_config.py`): Randomly drops state inputs during training to improve generalization and reduce state-dependency. The shipped benchmark scripts override the CLI default per suite: LIBERO 10-Long uses 0.2 (the CLI default), SimplerEnv Bridge uses 0.8, SimplerEnv Fractal uses 0.5. If your task relies heavily on proprioceptive state, lower this value.
+- **`--strict_vl_padding_mask`** (default: inherit from the checkpoint, off for released checkpoints; see `gr00t/configs/finetune_config.py`): Keeps left-padded VL tokens out of the action head: out of every `vl_self_attention` layer, and out of the DiT's cross-attention when `use_alternate_vl_dit=False` (`AlternateVLDiT` already masks it). Prompts in a batch are padded to the longest one, and with this off an observation's action shifts with the prompt lengths of the rest of its batch (~2% of action magnitude, measured with the released checkpoint's action head on synthetic backbone features). It stays off for existing checkpoints to preserve their behavior; new training runs may opt in. It requires `positional_embeddings=None` in `vl_self_attention_cfg`, as in the released config, and a run that passes the flag with positional embeddings set refuses to start. A checkpoint saved with the flag and positional embeddings still loads: it logs a warning and masks VL padding only in the DiT, so its actions still depend on batch padding. The setting is persisted in the checkpoint's `config.json`, and fine-tuning a checkpoint keeps its value unless the flag is given. VL ONNX/TensorRT export follows whether `vl_self_attention` is masked: if not (flag off, or positional embeddings set), it preserves the legacy single-input `vl_self_attention` engine; if so, it adds an `attention_mask` input, so rebuild that engine when the setting changes. The runtime refuses an engine whose mask input does not match the checkpoint, and plain-DiT TensorRT paths refuse batches that contain VL padding.
+- **`--strict_action_padding_mask`** (default: inherit from the checkpoint, off for released checkpoints; see `gr00t/configs/finetune_config.py`): Keeps padded action dimensions and horizon tokens out of the action encoder and the DiT self-attention. A real embodiment fills only part of the fixed `action_horizon` x `max_action_dim` canvas, and released checkpoints were both trained and served with the remaining padding visible, so this stays off by default to preserve their behavior. New training runs may opt in when the same strict masking behavior will be used at inference. The setting is persisted in the checkpoint's `config.json` and `processor_config.json`, and fine-tuning a checkpoint keeps its value unless the flag is given. TensorRT serves these checkpoints too: their exported DiT takes the padding mask as a `hidden_attention_mask` input, and the TensorRT action-head loops apply the same masks as PyTorch. An engine exported with the other setting is refused, so re-export the engines when the setting changes.
+- **`--data_loader`** (default: `fast`; see `gr00t/configs/finetune_config.py`): The `fast` loader decodes only the video frames each sample reads and starts serving samples while it is still loading, which on full BridgeV2 with 8×H100 trained about 5× faster than the previous loader. It serves the same samples as `--data_loader stock`, but shuffles them within a rolling window of about one shard instead of within each shard, so a batch mixes datasets more. Pass `--data_loader stock` to get the previous loader and its sample order, and please [open an issue](https://github.com/NVIDIA/Isaac-GR00T/issues) if the `fast` loader is slower or behaves differently on your data.
 
 ---
 
@@ -600,6 +625,8 @@ We welcome issues and pull requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for 
 
 - **Code:** Apache 2.0 — see [LICENSE](LICENSE)
 - **Model weights:** [NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/)
+
+Built on NVIDIA Cosmos. The GR00T N1.7 vision-language backbone is [`nvidia/Cosmos-Reason2-2B`](https://huggingface.co/nvidia/Cosmos-Reason2-2B).
 
 ```
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.

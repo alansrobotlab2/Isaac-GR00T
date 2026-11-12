@@ -32,7 +32,7 @@ def quantizer(monkeypatch):
     pytest.importorskip("onnx")
     pytest.importorskip("torch")
     monkeypatch.syspath_prepend(DEPLOY_DIR)
-    import quantize_onnx_int4
+    from trt import quantize_onnx_int4
 
     return quantize_onnx_int4
 

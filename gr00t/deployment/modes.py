@@ -82,6 +82,7 @@ class BenchmarkMode(_StrEnum):
     """Allowed values for ``benchmark_inference`` ``--trt-mode``."""
 
     dit_only = enum.auto()
+    action_head = enum.auto()
     n17_full_pipeline = enum.auto()
     vit_llm_only = enum.auto()
 
@@ -143,6 +144,21 @@ EXPORT_MODE_COMPONENTS: dict[ExportMode, frozenset[str]] = {
     ExportMode.full_pipeline: frozenset(c.name for c in FULL_PIPELINE_COMPONENTS),
 }
 
+
+def components_to_build(
+    only: frozenset[str] | None, metadata: dict | None
+) -> frozenset[str] | None:
+    """Narrow ``only`` by what the export recorded it kept in PyTorch.
+
+    ``vl_self_attention_exported`` is False when the module is Identity or the export
+    mode is not ``full_pipeline``. Bundles without the key are unchanged.
+    """
+    if metadata is None or metadata.get("vl_self_attention_exported", True):
+        return only
+    selected = EXPORT_MODE_COMPONENTS[ExportMode.full_pipeline] if only is None else only
+    return selected - {"VL Self-Attention"}
+
+
 # Per ``export_mode``, the (build, verify, benchmark) mode each downstream stage
 # runs in ``build_trt_pipeline``. One selector fans out to three sibling
 # stage-modes that each consume a *different* engine set; the binding between
@@ -157,7 +173,7 @@ PIPELINE_STAGE_MODES: dict[ExportMode, tuple[BuildEngineMode, VerifyMode, Benchm
     ExportMode.action_head: (
         BuildEngineMode.full_pipeline,
         VerifyMode.action_head,
-        BenchmarkMode.dit_only,
+        BenchmarkMode.action_head,
     ),
     ExportMode.dit_only: (
         BuildEngineMode.single,

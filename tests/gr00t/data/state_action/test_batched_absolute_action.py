@@ -100,4 +100,3 @@ def test_identity_relative_action_returns_reference():
     )
     np.testing.assert_allclose(absolute, np.tile(expected, (HORIZON, 1)), atol=1e-12)
     np.testing.assert_allclose(absolute[:, :3], np.tile(reference[:3], (HORIZON, 1)), atol=1e-12)
-

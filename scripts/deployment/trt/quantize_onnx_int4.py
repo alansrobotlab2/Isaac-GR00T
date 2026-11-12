@@ -28,9 +28,9 @@ Validate on your own checkpoint and task before relying on it.
 
 Usage, after ``build_trt_pipeline.py --steps export`` (or a full run)::
 
-    python scripts/deployment/quantize_onnx_int4.py \\
+    python -m scripts.deployment.trt.quantize_onnx_int4 \\
         --onnx-dir gr00t_trt_deployment/onnx --output-dir gr00t_trt_deployment/onnx_int4
-    python scripts/deployment/build_tensorrt_engine.py --mode full_pipeline \\
+    python -m scripts.deployment.trt.build_tensorrt_engine --mode full_pipeline \\
         --onnx-dir gr00t_trt_deployment/onnx_int4 --engine-dir gr00t_trt_deployment/engines_int4
 
 The output directory mirrors the input one: the DiT (``dit_bf16.onnx``) and the DiT inside

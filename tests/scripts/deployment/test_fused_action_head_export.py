@@ -35,7 +35,7 @@ def export(monkeypatch):
     pytest.importorskip("torch")
     pytest.importorskip("diffusers")
     monkeypatch.syspath_prepend(DEPLOY_DIR)
-    import export_onnx_n1d7
+    from trt import export_onnx_n1d7
 
     return export_onnx_n1d7
 

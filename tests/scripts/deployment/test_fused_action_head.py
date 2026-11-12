@@ -34,7 +34,7 @@ def test_shared_kv_processor_matches_default_attention(monkeypatch):
     from diffusers.models.attention import Attention
 
     monkeypatch.syspath_prepend(DEPLOY_DIR)
-    from export_onnx_n1d7 import _SharedKVCrossAttnProcessor, _supports_shared_kv
+    from trt.export_onnx_n1d7 import _SharedKVCrossAttnProcessor, _supports_shared_kv
 
     torch.manual_seed(0)
     attn = Attention(query_dim=48, heads=4, dim_head=12, cross_attention_dim=32, bias=True).eval()
@@ -72,7 +72,7 @@ def trt_model_forward(monkeypatch):
             monkeypatch.setitem(sys.modules, "trt_torch", trt_torch_stub)
     monkeypatch.syspath_prepend(DEPLOY_DIR)
     monkeypatch.delitem(sys.modules, "trt_model_forward", raising=False)
-    import trt_model_forward as module
+    from trt import trt_model_forward as module
 
     return module
 
@@ -197,8 +197,8 @@ def test_fused_onnx_and_engine_names_agree(monkeypatch, trt_model_forward):
     """The exporter's ONNX name, the builder's pattern and the runtime's pattern must line up."""
     monkeypatch.syspath_prepend(DEPLOY_DIR)
     pytest.importorskip("tensorrt")
-    from build_tensorrt_engine import FUSED_ACTION_HEAD_ONNX_RE
-    from export_onnx_n1d7 import FUSED_ACTION_HEAD_ONNX
+    from trt.build_tensorrt_engine import FUSED_ACTION_HEAD_ONNX_RE
+    from trt.export_onnx_n1d7 import FUSED_ACTION_HEAD_ONNX
 
     onnx_name = FUSED_ACTION_HEAD_ONNX.format(steps=2)
     match = FUSED_ACTION_HEAD_ONNX_RE.fullmatch(onnx_name)

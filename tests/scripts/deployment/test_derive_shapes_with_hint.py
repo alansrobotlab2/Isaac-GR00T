@@ -44,7 +44,7 @@ def _graph_with_named_dims(path):
 
 def test_max_seq_lens_overrides_the_derived_maximum(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(DEPLOY_DIR)
-    from build_tensorrt_engine import derive_shapes_with_hint
+    from trt.build_tensorrt_engine import derive_shapes_with_hint
 
     path = str(tmp_path / "g.onnx")
     _graph_with_named_dims(path)

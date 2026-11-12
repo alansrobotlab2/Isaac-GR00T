@@ -26,12 +26,16 @@ import time
 from typing import Any, Literal
 import warnings
 
-from _trt_contract import assert_exec_horizon_within_model, resolve_batch_size
 from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
 from gr00t.data.dataset.sharded_single_step_dataset import extract_step_data
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.utils import parse_observation_gr00t
+from gr00t.deployment.action_padding import (
+    HIDDEN_ATTENTION_MASK,
+    assert_dit_engine_matches_action_padding,
+)
 from gr00t.deployment.modes import InferenceMode
+from gr00t.deployment.vl_padding import assert_plain_dit_sees_no_vl_padding
 from gr00t.eval._horizon_contract import migrate_deprecated_action_horizon_argv
 from gr00t.policy.gr00t_policy import Gr00tPolicy
 from gr00t.policy.inference_optimizations import (
@@ -46,6 +50,7 @@ from matplotlib import pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+from trt._trt_contract import assert_exec_horizon_within_model, resolve_batch_size
 import tyro
 
 
@@ -140,7 +145,25 @@ class TensorRTDiTWrapper:
         self.context = self.engine.create_execution_context()
         logging.info(f"TensorRT engine loaded: {engine_path}")
 
-    def __call__(self, sa_embs, vl_embs, timestep, image_mask=None, backbone_attention_mask=None):
+    @property
+    def input_names(self) -> set[str]:
+        import tensorrt as trt
+
+        return {
+            name
+            for name in (self.engine.get_tensor_name(i) for i in range(self.engine.num_io_tensors))
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+        }
+
+    def __call__(
+        self,
+        sa_embs,
+        vl_embs,
+        timestep,
+        image_mask=None,
+        backbone_attention_mask=None,
+        hidden_attention_mask=None,
+    ):
         """Forward pass through TensorRT DiT."""
         # Setup context bindings
         sa_embs = sa_embs.to(f"cuda:{self.device}").contiguous()
@@ -151,6 +174,8 @@ class TensorRTDiTWrapper:
             image_mask = image_mask.to(f"cuda:{self.device}").contiguous()
         if backbone_attention_mask is not None:
             backbone_attention_mask = backbone_attention_mask.to(f"cuda:{self.device}").contiguous()
+        if hidden_attention_mask is not None:
+            hidden_attention_mask = hidden_attention_mask.to(f"cuda:{self.device}").contiguous()
 
         self.context.set_input_shape("sa_embs", sa_embs.shape)
         self.context.set_input_shape("vl_embs", vl_embs.shape)
@@ -159,6 +184,8 @@ class TensorRTDiTWrapper:
             self.context.set_input_shape("image_mask", image_mask.shape)
         if backbone_attention_mask is not None:
             self.context.set_input_shape("backbone_attention_mask", backbone_attention_mask.shape)
+        if hidden_attention_mask is not None:
+            self.context.set_input_shape(HIDDEN_ATTENTION_MASK, hidden_attention_mask.shape)
 
         self.context.set_tensor_address("sa_embs", sa_embs.data_ptr())
         self.context.set_tensor_address("vl_embs", vl_embs.data_ptr())
@@ -169,6 +196,8 @@ class TensorRTDiTWrapper:
             self.context.set_tensor_address(
                 "backbone_attention_mask", backbone_attention_mask.data_ptr()
             )
+        if hidden_attention_mask is not None:
+            self.context.set_tensor_address(HIDDEN_ATTENTION_MASK, hidden_attention_mask.data_ptr())
 
         # Output in BF16 (matches ONNX export and engine precision)
         output_shape = self.context.get_tensor_shape("output")
@@ -187,6 +216,9 @@ class TensorRTDiTWrapper:
 def replace_dit_with_tensorrt(policy: Gr00tPolicy | Any, trt_engine_path: str, device: int = 0):
     """Replace the DiT forward method with TensorRT inference."""
     trt_dit = TensorRTDiTWrapper(trt_engine_path, device=device)
+    assert_dit_engine_matches_action_padding(
+        policy.model.action_head.config, trt_dit.input_names, "TensorRT DiT replacement"
+    )
 
     def trt_forward(
         hidden_states,
@@ -196,6 +228,7 @@ def replace_dit_with_tensorrt(policy: Gr00tPolicy | Any, trt_engine_path: str, d
         return_all_hidden_states=False,
         image_mask=None,
         backbone_attention_mask=None,
+        hidden_attention_mask=None,
     ):
         """
         TensorRT wrapper matching DiT forward signature.
@@ -204,14 +237,21 @@ def replace_dit_with_tensorrt(policy: Gr00tPolicy | Any, trt_engine_path: str, d
         - hidden_states -> sa_embs
         - encoder_hidden_states -> vl_embs
         - timestep -> timestep
-        - image_mask, backbone_attention_mask passed through
+        - image_mask, backbone_attention_mask, hidden_attention_mask passed through
+
+        The action head passes ``hidden_attention_mask`` only with
+        ``strict_action_padding_mask`` on, whose engine takes it as an input.
         """
+        assert_plain_dit_sees_no_vl_padding(
+            policy.model.action_head.config, encoder_attention_mask, "TensorRT DiT replacement"
+        )
         output = trt_dit(
             sa_embs=hidden_states,
             vl_embs=encoder_hidden_states,
             timestep=timestep,
             image_mask=image_mask,
             backbone_attention_mask=backbone_attention_mask,
+            hidden_attention_mask=hidden_attention_mask,
         )
 
         # DiT returns (output, all_hidden_states) when return_all_hidden_states=True
@@ -750,7 +790,7 @@ def main(args: ArgsConfig):
     # Apply inference mode
     if args.inference_mode == "trt_full_pipeline":
         logging.info(f"Loading full-pipeline TRT engines from: {args.trt_engine_path}")
-        from trt_model_forward import setup_tensorrt_engines
+        from trt.trt_model_forward import setup_tensorrt_engines
 
         # This script runs one observation at a time (batch=1); fail fast if the
         # engine was baked for a different static batch instead of hitting a cryptic
@@ -945,6 +985,16 @@ def main(args: ArgsConfig):
         raise ValueError(
             f"No valid trajectories to process. Requested IDs {args.traj_ids} are all out of range (dataset has {len(dataset)} trajectories, valid IDs: 0-{len(dataset) - 1})."
         )
+
+    if args.inference_mode == "trt_full_pipeline":
+        # Release the engines here rather than leaving them to interpreter
+        # shutdown: the optimized runtime's CUDA graph must be destroyed before
+        # the execution contexts it references, and shutdown frees module globals
+        # in an arbitrary order, which intermittently hangs or segfaults inside
+        # the C++ destructors.
+        from trt.trt_model_forward import close_tensorrt_engines
+
+        close_tensorrt_engines(policy)
 
     logging.info("=" * 80)
     logging.info("Done")

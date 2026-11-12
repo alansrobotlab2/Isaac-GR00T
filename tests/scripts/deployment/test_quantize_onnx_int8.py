@@ -33,7 +33,7 @@ def quantizer(monkeypatch):
     pytest.importorskip("onnx")
     pytest.importorskip("torch")
     monkeypatch.syspath_prepend(DEPLOY_DIR)
-    import quantize_onnx_int8
+    from trt import quantize_onnx_int8
 
     return quantize_onnx_int8
 
@@ -228,7 +228,7 @@ def test_calibrate_with_tensorrt(quantizer, tmp_path):
 def calibration(monkeypatch):
     pytest.importorskip("torch")
     monkeypatch.syspath_prepend(DEPLOY_DIR)
-    import int8_calibration
+    from trt import int8_calibration
 
     return int8_calibration
 

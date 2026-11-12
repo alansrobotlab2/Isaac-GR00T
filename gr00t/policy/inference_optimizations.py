@@ -288,8 +288,8 @@ def load_tensorrt_engines(
         )
     if str(deploy_dir) not in sys.path:
         sys.path.insert(0, str(deploy_dir))
-    from _trt_contract import resolve_batch_size
-    from trt_model_forward import setup_tensorrt_engines
+    from trt._trt_contract import resolve_batch_size
+    from trt.trt_model_forward import setup_tensorrt_engines
 
     from gr00t.deployment.modes import InferenceMode
 

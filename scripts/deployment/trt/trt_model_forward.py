@@ -53,12 +53,21 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
+import gc
+import json
 import logging
 import os
 import re
 import sys
+from typing import Optional
 
+from gr00t.deployment.action_padding import (
+    HIDDEN_ATTENTION_MASK,
+    assert_dit_engine_matches_action_padding,
+    strict_action_masks,
+)
 from gr00t.deployment.modes import InferenceMode
+from gr00t.deployment.vl_padding import assert_plain_dit_sees_no_vl_padding
 import torch
 from transformers.feature_extraction_utils import BatchFeature
 
@@ -67,16 +76,693 @@ logger = logging.getLogger(__name__)
 
 
 # Ensure sibling modules are importable (scripts/deployment is not a package)
-_deploy_dir = os.path.dirname(os.path.abspath(__file__))
+_deploy_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _deploy_dir not in sys.path:
     sys.path.insert(0, _deploy_dir)
-from _trt_contract import (  # noqa: E402
+from ._trt_contract import (  # noqa: E402
     assert_engine_bundle_present,
     assert_engine_matches_policy,
     assert_grid_thw_matches,
     load_export_metadata,
 )
-from trt_torch import Engine  # noqa: E402
+from .n1d7_optimization_config import (  # noqa: E402
+    ACTION_HEAD_FORMAT_VERSION,
+    OptimizationArtifacts,
+    format_quantization_summary,
+)
+from .trt_torch import Engine  # noqa: E402
+
+
+def _validate_vl_attention_engine(engine, *, mask_vl_padding=False):
+    """Check that the VL engine has a mask input exactly when the action head masks VL padding.
+
+    A mismatched engine is closed before raising, since the caller never keeps it.
+    """
+    has_mask = any(name == "attention_mask" for name, *_ in engine.in_meta)
+    if has_mask != mask_vl_padding:
+        engine.close()
+        raise ValueError(
+            "VL Self-Attention engine attention_mask binding does not match the action "
+            f"head's mask_vl_padding={mask_vl_padding} (strict_vl_padding_mask, unless "
+            "vl_self_attention uses positional embeddings). Re-export vl_self_attention.onnx "
+            "and rebuild vl_self_attention.engine from this checkpoint."
+        )
+
+
+def _refine_vl_features(action_head, backbone_output, engine=None, *, cache_outputs=None):
+    """Apply the same VL padding mask in PyTorch and TensorRT inference.
+
+    Engine loaders validate the mask binding once, so it is not rechecked per call.
+    """
+    features = backbone_output["backbone_features"]
+    vlln_param = next(action_head.vlln.parameters(), None)
+    if vlln_param is not None:
+        features = features.to(dtype=vlln_param.dtype)
+    if engine is None:
+        # Refine a copy so the caller's backbone_output stays unchanged, as with TRT.
+        refined = action_head.process_backbone_output(
+            BatchFeature(data={**backbone_output, "backbone_features": features})
+        )
+        return refined["backbone_features"]
+    strict = action_head.mask_vl_padding
+    features = action_head.vlln(features)
+    features = features.to(dtype=engine.dtype_of("hidden_states"))
+    engine.set_runtime_tensor_shape("hidden_states", features.shape)
+    kwargs = {} if cache_outputs is None else {"cache_outputs": cache_outputs}
+    if strict:
+        mask = backbone_output.get("backbone_attention_mask")
+        if mask is None:
+            mask = torch.ones(features.shape[:2], dtype=torch.bool, device=features.device)
+        mask = mask.to(device=features.device, dtype=engine.dtype_of("attention_mask"))
+        engine.set_runtime_tensor_shape("attention_mask", mask.shape)
+        kwargs["attention_mask"] = mask
+    return engine(hidden_states=features, **kwargs)["output"]
+
+
+class GraphSafeEngine(Engine):
+    """Engine variant with stable output addresses and asynchronous execution."""
+
+    def __init__(self, file, plugins=None):
+        super().__init__(file, plugins=plugins or [])
+        self._output_cache = {}
+        self._closed = False
+
+    def close(self):
+        """Release cached buffers, then use the upstream Engine lifecycle."""
+        if self._closed:
+            return
+        self._output_cache.clear()
+        super().close()
+        self.plugins = []
+
+    def _get_output_tensor(self, name, shape, dtype, device, cache):
+        if not cache:
+            return torch.empty(tuple(shape), dtype=dtype, device=device)
+        key = (name, tuple(shape), dtype, device.type, device.index)
+        output = self._output_cache.get(key)
+        if output is None:
+            output = torch.empty(tuple(shape), dtype=dtype, device=device)
+            self._output_cache[key] = output
+        return output
+
+    def set_runtime_tensor_shape(self, name, shape):
+        if self._closed:
+            raise RuntimeError(f"TensorRT engine is closed: {self.file}")
+        if not self.execution_context.set_input_shape(name, shape):
+            raise RuntimeError(f"Failed to set runtime shape for {name}: {tuple(shape)}")
+
+    def forward(self, *args, **kwargs):
+        if self._closed:
+            raise RuntimeError(f"TensorRT engine is closed: {self.file}")
+        return_list = kwargs.pop("return_list", False)
+        synchronize = kwargs.pop("synchronize", False)
+        # Stable (cached) output addresses are required under CUDA graph
+        # capture; transient eager calls pass cache_outputs=False so one-off
+        # shapes don't grow the cache.
+        cache_outputs = kwargs.pop("cache_outputs", True)
+        references = []
+        stream = torch.cuda.current_stream()
+
+        for index, tensor in enumerate(args):
+            name, _shape, dtype = self.in_meta[index]
+            self._bind_input(name, dtype, tensor, references)
+        for name, _shape, dtype in self.in_meta:
+            if name in kwargs:
+                self._bind_input(name, dtype, kwargs[name], references)
+
+        if len(references) != len(self.in_meta):
+            raise ValueError(
+                f"Expected {len(self.in_meta)} input tensors, received {len(references)}"
+            )
+
+        for name, _shape, dtype in self.out_meta:
+            runtime_shape = self.execution_context.get_tensor_shape(name)
+            output = self._get_output_tensor(
+                name, runtime_shape, dtype, references[0].device, cache_outputs
+            )
+            self.execution_context.set_tensor_address(name, output.data_ptr())
+            references.append(output)
+
+        if not self.execution_context.execute_async_v3(stream.cuda_stream):
+            raise RuntimeError(f"TensorRT execution failed for {self.file}")
+        if synchronize:
+            stream.synchronize()
+
+        outputs = references[len(self.in_meta) :]
+        if return_list:
+            return outputs
+        return {item[0]: outputs[index] for index, item in enumerate(self.out_meta)}
+
+    def _bind_input(self, name, dtype, tensor, references):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"Input {name} must be a torch.Tensor")
+        runtime_shape = self.execution_context.get_tensor_shape(name)
+        if runtime_shape != tensor.shape:
+            raise ValueError(f"Invalid input shape for {name}: {tensor.shape} != {runtime_shape}")
+        if tensor.dtype != dtype:
+            raise TypeError(f"Invalid input dtype for {name}: {tensor.dtype} != {dtype}")
+        if not tensor.is_cuda:
+            raise ValueError(f"Input {name} must be a CUDA tensor")
+        tensor = tensor.contiguous()
+        self.execution_context.set_tensor_address(name, tensor.data_ptr())
+        references.append(tensor)
+
+
+@dataclass
+class ActionHeadGraphState:
+    backbone_features: torch.Tensor
+    image_mask: torch.Tensor
+    backbone_attention_mask: torch.Tensor
+    state: torch.Tensor
+    embodiment_id: torch.Tensor
+    actions: torch.Tensor
+    initial_actions: torch.Tensor
+    time_embeddings: torch.Tensor
+    adaln_modulations: torch.Tensor
+    output_modulations: torch.Tensor
+    position_embeddings: Optional[torch.Tensor]
+    graph: Optional[torch.cuda.CUDAGraph] = None
+    output: Optional[torch.Tensor] = None
+    # Set only for a strict_action_padding_mask checkpoint.
+    action_mask: Optional[torch.Tensor] = None
+    action_token_mask: Optional[torch.Tensor] = None
+    hidden_attention_mask: Optional[torch.Tensor] = None
+
+
+class OptimizedActionHeadRunner:
+    """Own optimized action-head engines, constants, buffers, graph, and teardown."""
+
+    def __init__(self, action_head, engine_dir: str, metadata: dict, dit_engine_path: str):
+        artifacts = OptimizationArtifacts.from_metadata(
+            engine_dir, metadata, artifact_kind="engine"
+        )
+        if artifacts is None:
+            raise ValueError("OptimizedActionHeadRunner requires optimized metadata")
+        if artifacts.format_version != ACTION_HEAD_FORMAT_VERSION:
+            raise ValueError(f"Unsupported action-head format version: {artifacts.format_version}")
+        for path in (artifacts.cross_kv, artifacts.constants):
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Missing optimized action-head artifact: {path}")
+
+        self.action_head = action_head
+        self.engine_dir = engine_dir
+        self.metadata = metadata
+        self.closed = False
+        # One CUDA graph for the first input signature; other signatures run
+        # eagerly with transient buffers (see module docstring).
+        self._graph_state: Optional[ActionHeadGraphState] = None
+        self._graph_signature = None
+        self._capture_failed = False
+        self._eager_signatures_warned = set()
+
+        # Reused directories may contain a stale full-pipeline VL attention engine.
+        # Action-head-only exports retain this module in PyTorch.
+        vl_sa_path = (
+            vl_self_attention_engine_path(action_head, engine_dir, metadata)
+            if metadata.get("export_mode") == "full_pipeline"
+            else None
+        )
+        self.vl_sa_engine = GraphSafeEngine(vl_sa_path) if vl_sa_path is not None else None
+        if self.vl_sa_engine is not None:
+            _validate_vl_attention_engine(
+                self.vl_sa_engine, mask_vl_padding=action_head.mask_vl_padding
+            )
+        self.state_encoder_engine = GraphSafeEngine(
+            os.path.join(engine_dir, "state_encoder.engine")
+        )
+        self.action_encoder_engine = GraphSafeEngine(
+            os.path.join(engine_dir, "action_encoder.engine")
+        )
+        self.cross_kv_engine = GraphSafeEngine(artifacts.cross_kv)
+        self.dit_engine = GraphSafeEngine(dit_engine_path)
+        self.action_decoder_engine = GraphSafeEngine(
+            os.path.join(engine_dir, "action_decoder.engine")
+        )
+        self._validate_interfaces()
+        self.constants = self._load_constants(artifacts.constants)
+        self.position_embeddings = self._make_position_embeddings()
+
+    @classmethod
+    def maybe_create(
+        cls,
+        action_head,
+        engine_dir: str,
+        metadata: Optional[dict],
+        dit_engine_path: str,
+    ) -> Optional["OptimizedActionHeadRunner"]:
+        artifacts = OptimizationArtifacts.from_metadata(
+            engine_dir, metadata, artifact_kind="engine"
+        )
+        if artifacts is None:
+            return None
+        return cls(action_head, engine_dir, metadata or {}, dit_engine_path)
+
+    def _validate_interfaces(self):
+        action_inputs = {item[0] for item in self.action_encoder_engine.in_meta}
+        dit_inputs = {item[0] for item in self.dit_engine.in_meta}
+        expected_dit = {
+            "sa_embs",
+            "cross_keys",
+            "cross_values",
+            "adaln_modulations",
+            "output_modulation",
+            "image_mask",
+            "backbone_attention_mask",
+        }
+        if "timestep_embedding" not in action_inputs or not expected_dit.issubset(dit_inputs):
+            raise RuntimeError(
+                "Optimized metadata does not match the Action Encoder/DiT interfaces"
+            )
+        assert_dit_engine_matches_action_padding(
+            self.action_head.config, dit_inputs, "Optimized TensorRT action head"
+        )
+
+    def _load_constants(self, path: str):
+        constants = torch.load(path, map_location="cpu", weights_only=True)
+        if constants.get("format_version") != ACTION_HEAD_FORMAT_VERSION:
+            raise ValueError(f"Unsupported constants format: {constants.get('format_version')}")
+        device = next(self.action_head.vlln.parameters()).device
+        result = {
+            "action_time_embeddings": constants["action_time_embeddings"]
+            .to(
+                device=device,
+                dtype=self.action_encoder_engine.dtype_of("timestep_embedding"),
+            )
+            .contiguous(),
+            "adaln_modulations": constants["adaln_modulations"]
+            .to(device=device, dtype=self.dit_engine.dtype_of("adaln_modulations"))
+            .contiguous(),
+            "output_modulations": constants["output_modulations"]
+            .to(device=device, dtype=self.dit_engine.dtype_of("output_modulation"))
+            .contiguous(),
+        }
+        if result["action_time_embeddings"].shape[0] != int(
+            self.action_head.num_inference_timesteps
+        ):
+            raise ValueError("Exported and runtime denoising step counts differ")
+        return result
+
+    def _make_position_embeddings(self):
+        if not self.action_head.config.add_pos_embed:
+            return None
+        device = next(self.action_head.vlln.parameters()).device
+        position_ids = torch.arange(
+            self.action_head.config.action_horizon, dtype=torch.long, device=device
+        )
+        return (
+            self.action_head.position_embedding(position_ids)
+            .unsqueeze(0)
+            .to(self.action_encoder_engine.dtype_of("actions"))
+            .contiguous()
+        )
+
+    def __call__(self, backbone_output, action_input, options=None):
+        if "action" in action_input:
+            raise NotImplementedError(
+                "Optimized TensorRT action-head graph does not support RTC action overlap"
+            )
+        del options
+        if self.closed:
+            raise RuntimeError("Optimized action-head runner is closed")
+        if backbone_output.image_mask is None:
+            raise ValueError("Optimized action head requires image_mask")
+        if backbone_output.backbone_attention_mask is None:
+            raise ValueError("Optimized action head requires backbone_attention_mask")
+
+        signature = self._signature(backbone_output, action_input)
+
+        # Capture the single CUDA graph on the first call.
+        if self._graph_state is None and not self._capture_failed:
+            state = self._make_graph_state(backbone_output, action_input)
+            try:
+                self._capture_graph(state)
+                self._graph_state = state
+                self._graph_signature = signature
+                logger.info("Captured action-head CUDA graph for signature %s", signature)
+            except Exception:
+                logger.exception("CUDA graph capture failed; running eager TensorRT path")
+                self._capture_failed = True
+                return BatchFeature(data={"action_pred": self._execute(state, cache_outputs=False)})
+            # The fresh state already holds this call's inputs and diffusion
+            # noise. Replay without the noise refresh below, so a seeded run
+            # (verify_n1d7_trt) consumes the same first RNG draw as the
+            # PyTorch reference it is compared against.
+            state.graph.replay()
+            return BatchFeature(data={"action_pred": state.output})
+
+        if self._graph_state is not None and signature == self._graph_signature:
+            state = self._graph_state
+            self._copy_inputs(state, backbone_output, action_input)
+            # Latest N1.7 samples fresh diffusion noise on every inference.
+            # The graph reads this persistent buffer, so refresh it before replay.
+            if not hasattr(self.action_head, "init_actions"):
+                state.initial_actions.normal_()
+            state.graph.replay()
+            return BatchFeature(data={"action_pred": state.output})
+
+        # Different signature (or capture failed): eager TensorRT fallback with
+        # transient buffers — nothing is cached, memory stays bounded.
+        if signature not in self._eager_signatures_warned:
+            self._eager_signatures_warned.add(signature)
+            logger.warning(
+                "Optimized action head running eager TensorRT fallback for input "
+                "signature %s (CUDA graph is captured only for %s)",
+                signature,
+                self._graph_signature,
+            )
+        state = self._make_graph_state(backbone_output, action_input)
+        return BatchFeature(data={"action_pred": self._execute(state, cache_outputs=False)})
+
+    def _signature(self, backbone_output, action_input):
+        return (
+            tuple(backbone_output.backbone_features.shape),
+            backbone_output.backbone_features.dtype,
+            tuple(backbone_output.image_mask.shape),
+            tuple(backbone_output.backbone_attention_mask.shape),
+            tuple(action_input.state.shape),
+            tuple(action_input.embodiment_id.shape),
+            backbone_output.backbone_features.device.index,
+        )
+
+    @staticmethod
+    def _reshape_state(state):
+        if state.ndim == 3 and state.shape[1] > 1:
+            return state.view(state.shape[0], 1, -1)
+        return state
+
+    def _copy_inputs(self, state, backbone_output, action_input):
+        state.backbone_features.copy_(backbone_output.backbone_features)
+        state.image_mask.copy_(backbone_output.image_mask)
+        state.backbone_attention_mask.copy_(backbone_output.backbone_attention_mask)
+        state.state.copy_(self._reshape_state(action_input.state))
+        state.embodiment_id.copy_(action_input.embodiment_id)
+        if state.action_mask is not None:
+            masks = strict_action_masks(
+                self.action_head.config, action_input, state.actions, state.state.shape[1]
+            )
+            state.action_mask.copy_(masks.action)
+            state.action_token_mask.copy_(masks.tokens)
+            state.hidden_attention_mask.copy_(masks.hidden)
+
+    def _make_graph_state(self, backbone_output, action_input):
+        device = backbone_output.backbone_features.device
+        batch_size = backbone_output.backbone_features.shape[0]
+        constants_batch = self.constants["action_time_embeddings"].shape[1]
+        if constants_batch != batch_size:
+            raise ValueError(
+                f"Runtime batch {batch_size} != exported constants batch {constants_batch}"
+            )
+        vlln_parameter = next(self.action_head.vlln.parameters(), None)
+        vlln_dtype = (
+            vlln_parameter.dtype
+            if vlln_parameter is not None
+            else backbone_output.backbone_features.dtype
+        )
+        auxiliary_dtype = self.state_encoder_engine.dtype_of("state")
+        action_state = self._reshape_state(action_input.state)
+        actions = torch.empty(
+            batch_size,
+            self.action_head.config.action_horizon,
+            self.action_head.action_dim,
+            device=device,
+            dtype=auxiliary_dtype,
+        )
+        if hasattr(self.action_head, "init_actions"):
+            initial_actions = (
+                self.action_head.init_actions.expand_as(actions)
+                .to(device=device, dtype=auxiliary_dtype)
+                .contiguous()
+            )
+        else:
+            initial_actions = torch.randn_like(actions)
+
+        state = ActionHeadGraphState(
+            backbone_features=torch.empty(
+                backbone_output.backbone_features.shape,
+                device=device,
+                dtype=vlln_dtype,
+            ),
+            image_mask=torch.empty_like(backbone_output.image_mask),
+            backbone_attention_mask=torch.empty_like(backbone_output.backbone_attention_mask),
+            state=torch.empty(action_state.shape, device=device, dtype=auxiliary_dtype),
+            embodiment_id=torch.empty(
+                action_input.embodiment_id.shape, device=device, dtype=torch.int64
+            ),
+            actions=actions,
+            initial_actions=initial_actions,
+            time_embeddings=self.constants["action_time_embeddings"],
+            adaln_modulations=self.constants["adaln_modulations"],
+            output_modulations=self.constants["output_modulations"],
+            position_embeddings=self.position_embeddings,
+        )
+        masks = strict_action_masks(
+            self.action_head.config, action_input, actions, action_state.shape[1]
+        )
+        if masks is not None:
+            state.action_mask = torch.empty_like(masks.action)
+            state.action_token_mask = torch.empty_like(masks.tokens)
+            state.hidden_attention_mask = torch.empty_like(masks.hidden)
+        self._copy_inputs(state, backbone_output, action_input)
+        return state
+
+    def _execute(self, state, cache_outputs=True):
+        vl_embs = _refine_vl_features(
+            self.action_head,
+            BatchFeature(
+                data={
+                    "backbone_features": state.backbone_features,
+                    "backbone_attention_mask": state.backbone_attention_mask,
+                }
+            ),
+            self.vl_sa_engine,
+            cache_outputs=cache_outputs,
+        )
+
+        vl_embs = vl_embs.to(self.cross_kv_engine.dtype_of("vl_embs"))
+        self.cross_kv_engine.set_runtime_tensor_shape("vl_embs", vl_embs.shape)
+        cross_kv = self.cross_kv_engine(vl_embs, cache_outputs=cache_outputs)
+
+        self.state_encoder_engine.set_runtime_tensor_shape("state", state.state.shape)
+        self.state_encoder_engine.set_runtime_tensor_shape(
+            "embodiment_id", state.embodiment_id.shape
+        )
+        state_features = self.state_encoder_engine(
+            state.state, state.embodiment_id, cache_outputs=cache_outputs
+        )["output"]
+
+        actions = state.actions
+        actions.copy_(state.initial_actions)
+        if state.action_mask is not None:
+            actions.mul_(state.action_mask)
+        dit_dtype = self.dit_engine.dtype_of("sa_embs")
+        time_delta = 1.0 / self.action_head.num_inference_timesteps
+        for step in range(self.action_head.num_inference_timesteps):
+            timestep_embedding = state.time_embeddings[step]
+            self.action_encoder_engine.set_runtime_tensor_shape("actions", actions.shape)
+            self.action_encoder_engine.set_runtime_tensor_shape(
+                "timestep_embedding", timestep_embedding.shape
+            )
+            self.action_encoder_engine.set_runtime_tensor_shape(
+                "embodiment_id", state.embodiment_id.shape
+            )
+            action_features = self.action_encoder_engine(
+                actions,
+                timestep_embedding,
+                state.embodiment_id,
+                cache_outputs=cache_outputs,
+            )["output"]
+            if state.position_embeddings is not None:
+                action_features = action_features + state.position_embeddings
+            if state.action_token_mask is not None:
+                action_features = action_features * state.action_token_mask.to(
+                    action_features.dtype
+                )
+
+            dit_inputs = {
+                "sa_embs": torch.cat((state_features, action_features), dim=1).to(dit_dtype),
+                "cross_keys": cross_kv["cross_keys"],
+                "cross_values": cross_kv["cross_values"],
+                "adaln_modulations": state.adaln_modulations[step],
+                "output_modulation": state.output_modulations[step],
+                "image_mask": state.image_mask,
+                "backbone_attention_mask": state.backbone_attention_mask,
+            }
+            if state.hidden_attention_mask is not None:
+                dit_inputs[HIDDEN_ATTENTION_MASK] = state.hidden_attention_mask
+            for name, tensor in dit_inputs.items():
+                self.dit_engine.set_runtime_tensor_shape(name, tensor.shape)
+            model_output = self.dit_engine(cache_outputs=cache_outputs, **dit_inputs)["output"]
+
+            self.action_decoder_engine.set_runtime_tensor_shape("model_output", model_output.shape)
+            self.action_decoder_engine.set_runtime_tensor_shape(
+                "embodiment_id", state.embodiment_id.shape
+            )
+            prediction = self.action_decoder_engine(
+                model_output, state.embodiment_id, cache_outputs=cache_outputs
+            )["output"]
+            velocity = prediction[:, -self.action_head.action_horizon :]
+            if state.action_mask is not None:
+                velocity = velocity * state.action_mask
+            actions.add_(velocity, alpha=time_delta)
+            if state.action_mask is not None:
+                actions.mul_(state.action_mask)
+        return actions
+
+    def _capture_graph(self, state):
+        current_stream = torch.cuda.current_stream()
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(current_stream)
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                self._execute(state)
+        warmup_stream.synchronize()
+        current_stream.wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(current_stream)
+        with torch.cuda.graph(graph, stream=capture_stream):
+            output = self._execute(state)
+        current_stream.wait_stream(capture_stream)
+        state.graph = graph
+        state.output = output
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        if self._graph_state is not None:
+            self._graph_state.graph = None
+            self._graph_state.output = None
+            self._graph_state = None
+        gc.collect()
+        for engine in self.engines:
+            if engine is not None:
+                engine.close()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    @property
+    def engines(self):
+        return (
+            self.vl_sa_engine,
+            self.state_encoder_engine,
+            self.action_encoder_engine,
+            self.cross_kv_engine,
+            self.dit_engine,
+            self.action_decoder_engine,
+        )
+
+
+def release_replaced_action_modules(action_head, runner: OptimizedActionHeadRunner):
+    """Delete only PyTorch modules replaced by the optimized runner."""
+    if runner.vl_sa_engine is not None and hasattr(action_head, "vl_self_attention"):
+        del action_head.vl_self_attention
+    for name in ("model", "state_encoder", "action_encoder", "action_decoder"):
+        if hasattr(action_head, name):
+            delattr(action_head, name)
+    torch.cuda.empty_cache()
+
+
+def close_optimized_action_head(policy):
+    """Destroy the runner's CUDA graph before its TensorRT execution contexts.
+
+    Engines stored as plain module attributes are closed by
+    ``trt_model_forward.close_tensorrt_engines``, which calls this first.
+    """
+    action_head = getattr(getattr(policy, "model", None), "action_head", None)
+    runner = getattr(action_head, "_trt_optimization_runner", None)
+    if runner is not None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        runner.close()
+        action_head._trt_optimization_runner = None
+
+
+_COMPONENT_PRECISION_KEYS = {
+    "vit": "vit_precision",
+    "llm": "llm_precision",
+    "dit": "dit_precision",
+}
+_ENGINE_METADATA_CACHE = {}
+
+
+def _load_engine_metadata(engine_dir):
+    """Load per-component precision metadata.
+
+    The metadata file (``export_metadata.json``) is written by
+    ``export_onnx_n1d7.py`` into the ONNX output directory. We look in the
+    following locations, in order:
+
+    1. ``<engine_dir>/export_metadata.json``        — standalone-shipped engines
+    2. ``<engine_dir>/../onnx/export_metadata.json`` — default build layout
+       produced by ``build_trt_pipeline.py``
+
+    Returns the parsed dict, or ``None`` if no metadata is found.
+    """
+    if os.path.isfile(engine_dir):
+        engine_dir = os.path.dirname(os.path.abspath(engine_dir))
+    if engine_dir in _ENGINE_METADATA_CACHE:
+        return _ENGINE_METADATA_CACHE[engine_dir]
+
+    candidates = [
+        os.path.join(engine_dir, "export_metadata.json"),
+        os.path.join(os.path.dirname(os.path.abspath(engine_dir)), "onnx", "export_metadata.json"),
+    ]
+    metadata = None
+    for path in candidates:
+        if os.path.exists(path):
+            with open(path) as f:
+                metadata = json.load(f)
+            logger.info(f"Loaded engine metadata from {path}")
+            break
+    _ENGINE_METADATA_CACHE[engine_dir] = metadata
+    return metadata
+
+
+def vl_self_attention_engine_path(action_head, engine_dir, metadata):
+    """Return the VL self-attention engine to load, or None to keep the PyTorch module."""
+    path = os.path.join(engine_dir, "vl_self_attention.engine")
+    if not os.path.exists(path):
+        return None
+    if metadata is not None and not metadata.get("vl_self_attention_exported", True):
+        logger.warning(
+            "Ignoring %s: the export kept VL self-attention in PyTorch, so this engine is "
+            "left over from an earlier export into the same directory.",
+            path,
+        )
+        return None
+    return path
+
+
+def _engine_path(engine_dir, component, default_precision="bf16"):
+    """Build the engine file path for a given component.
+
+    Resolution order:
+    1. If ``export_metadata.json`` is present, use the per-component precision
+       recorded there (auto-detection). A quantized bundle resolves to that
+       name even if the file is missing, so the caller fails with the right
+       expected filename instead of silently loading a mismatched engine.
+    2. Otherwise, fall back to the legacy BF16 engine names.
+    """
+    metadata = _load_engine_metadata(engine_dir)
+    precision_key = _COMPONENT_PRECISION_KEYS.get(component)
+    if metadata is not None and precision_key is not None and precision_key in metadata:
+        resolved = os.path.join(engine_dir, f"{component}_{metadata[precision_key]}.engine")
+        if os.path.exists(resolved):
+            logger.info(
+                f"  [{component}] precision={metadata[precision_key]} (from export_metadata.json)"
+            )
+            return resolved
+        if metadata.get("quantization", "none") != "none":
+            return resolved
+
+    if component == "vit":
+        return _resolve_vit_engine_path(engine_dir)
+    return os.path.join(engine_dir, f"{component}_{default_precision}.engine")
 
 
 def _assert_supports_trt_padding_strip(attention_mask: torch.Tensor) -> None:
@@ -99,7 +785,7 @@ def _assert_supports_trt_padding_strip(attention_mask: torch.Tensor) -> None:
     modeling sign-off, so we hard-fail here for now.
 
     Note on the build-time batch coupling: the ONNX export pipeline
-    (``scripts/deployment/export_onnx_n1d7.py``) bakes the batch dim as a
+    (``scripts/deployment/trt/export_onnx_n1d7.py``) bakes the batch dim as a
     static shape — only ``seq_len`` is registered in ``dynamic_axes`` —
     so a TRT engine built at ``--batch-size N`` only accepts B=N at
     runtime. Lifting heterogeneous B>1 inference therefore requires both
@@ -272,7 +958,13 @@ def _qwen3_vit_and_scatter(self, vl_input):
     grid_thw = vl_input["image_grid_thw"]
     input_ids = vl_input["input_ids"]
     attention_mask = vl_input["attention_mask"]
-    engine_dtype = torch.bfloat16
+    # Scatter into the dtype of the downstream LLM, not the ViT output.
+    llm_engine = getattr(self, "llm_engine", None)
+    engine_dtype = (
+        llm_engine.dtype_of("inputs_embeds")
+        if llm_engine is not None
+        else self._embedding_layer.weight.dtype
+    )
 
     # Look the layout up before any engine is enqueued: the key is a host read of GPU
     # data, which would otherwise wait for the ViT to finish.
@@ -298,7 +990,7 @@ def _qwen3_vit_and_scatter(self, vl_input):
     # Unpack deepstack: [num_layers, N, D] → list of [N, D]
     deepstack_list = []
     if deepstack_features is not None and deepstack_features.numel() > 1:
-        deepstack_list = list(deepstack_features.unbind(0))
+        deepstack_list = list(deepstack_features.to(engine_dtype).unbind(0))
 
     # --- PyTorch: embed_tokens + scatter ---
     inputs_embeds = self._embedding_layer(input_ids)
@@ -471,8 +1163,11 @@ def qwen3_backbone_llm_trt_forward(self, vl_input):
         "embeddings"
     ]
 
-    if backbone_features.dtype != torch.bfloat16:
-        backbone_features = backbone_features.to(torch.bfloat16)
+    # A retained PyTorch action head needs its parameter dtype at this boundary.
+    # Full TRT keeps the LLM engine output dtype for downstream engine adapters.
+    llm_out_dtype = getattr(self, "_trt_action_head_dtype", self.llm_engine.out_meta[0][2])
+    if backbone_features.dtype != llm_out_dtype:
+        backbone_features = backbone_features.to(llm_out_dtype)
 
     image_index, text_index = _token_subset_indices(image_mask_out, backbone_attention_mask)
     return BatchFeature(
@@ -544,9 +1239,11 @@ def qwen3_backbone_full_trt_forward(self, vl_input):
         "embeddings"
     ]
 
-    # Cast LLM output back to BF16 — downstream (vl_self_attention, DiT) expect BF16.
-    if backbone_features.dtype != torch.bfloat16:
-        backbone_features = backbone_features.to(torch.bfloat16)
+    # A retained PyTorch action head needs its parameter dtype at this boundary.
+    # Full TRT keeps the LLM engine output dtype for downstream engine adapters.
+    llm_out_dtype = getattr(self, "_trt_action_head_dtype", self.llm_engine.out_meta[0][2])
+    if backbone_features.dtype != llm_out_dtype:
+        backbone_features = backbone_features.to(llm_out_dtype)
 
     return BatchFeature(
         data={
@@ -581,18 +1278,28 @@ def _load_step_engines(action_head):
     """Load the per-component action-head engines (the path used without a fused engine)."""
     trt_engine_path, engine_kwargs = action_head._trt_engine_source
     print(f"Loading action head engines from: {trt_engine_path}")
-    vl_sa_engine_path = os.path.join(trt_engine_path, "vl_self_attention.engine")
-    action_head.vl_sa_engine = (
-        Engine(vl_sa_engine_path, **engine_kwargs) if os.path.exists(vl_sa_engine_path) else None
+    vl_sa_engine_path = vl_self_attention_engine_path(
+        action_head, trt_engine_path, _load_engine_metadata(trt_engine_path)
     )
+    action_head.vl_sa_engine = None
+    if vl_sa_engine_path is not None:
+        print(f"Loading VL Self-Attention engine: {vl_sa_engine_path}")
+        vl_sa_engine = Engine(vl_sa_engine_path, **engine_kwargs)
+        _validate_vl_attention_engine(vl_sa_engine, mask_vl_padding=action_head.mask_vl_padding)
+        action_head.vl_sa_engine = vl_sa_engine
     action_head.state_encoder_engine = Engine(
         os.path.join(trt_engine_path, "state_encoder.engine"), **engine_kwargs
     )
     action_head.action_encoder_engine = Engine(
         os.path.join(trt_engine_path, "action_encoder.engine"), **engine_kwargs
     )
-    action_head.dit_engine = Engine(
-        os.path.join(trt_engine_path, "dit_bf16.engine"), **engine_kwargs
+    dit_path = _engine_path(trt_engine_path, "dit")
+    print(f"Loading DiT engine: {dit_path}")
+    action_head.dit_engine = Engine(dit_path, **engine_kwargs)
+    assert_dit_engine_matches_action_padding(
+        action_head.config,
+        {item[0] for item in action_head.dit_engine.in_meta},
+        "TensorRT mode n17_full_pipeline",
     )
     action_head.action_decoder_engine = Engine(
         os.path.join(trt_engine_path, "action_decoder.engine"), **engine_kwargs
@@ -707,6 +1414,9 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
     When the engine directory holds a fused engine for the current number of denoising
     steps (``action_head_fused_<N>step.engine``), the whole head runs as that one engine.
     """
+    assert_plain_dit_sees_no_vl_padding(
+        self.config, backbone_output.get("backbone_attention_mask", None), "TensorRT action head"
+    )
     if "_trt_engine_source" in self.__dict__:
         fused_engine = _fused_engine_for(self, self.num_inference_timesteps)
         if fused_engine is not None:
@@ -715,29 +1425,24 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
             _load_step_engines(self)
 
     # --- VLLN (PyTorch) + vl_self_attention (TRT if available, else PyTorch) ---
-    backbone_features = backbone_output.backbone_features
-    backbone_features = self.vlln(backbone_features)
-    if hasattr(self, "vl_sa_engine") and self.vl_sa_engine is not None:
-        engine_dtype = torch.bfloat16
-        if backbone_features.dtype != engine_dtype:
-            backbone_features = backbone_features.to(engine_dtype)
-        self.vl_sa_engine.set_runtime_tensor_shape("hidden_states", backbone_features.shape)
-        backbone_features = self.vl_sa_engine(backbone_features)["output"]
-    else:
-        backbone_features = self.vl_self_attention(backbone_features)
+    backbone_features = _refine_vl_features(
+        self, backbone_output, getattr(self, "vl_sa_engine", None)
+    )
     vl_embs = backbone_features
 
     embodiment_id = action_input.embodiment_id
     batch_size = vl_embs.shape[0]
     device = vl_embs.device
 
-    engine_dtype = torch.bfloat16
+    # Derive expected dtypes from the loaded TRT engines
+    dit_dtype = self.dit_engine.in_meta[0][2]  # sa_embs dtype
+    aux_dtype = self.state_encoder_engine.in_meta[0][2]  # state dtype
 
     # Ensure consistent dtypes
-    if vl_embs.dtype != engine_dtype:
-        vl_embs = vl_embs.to(engine_dtype)
-    if action_input.state.dtype != engine_dtype:
-        action_input.state = action_input.state.to(engine_dtype)
+    if vl_embs.dtype != dit_dtype:
+        vl_embs = vl_embs.to(dit_dtype)
+    if action_input.state.dtype != aux_dtype:
+        action_input.state = action_input.state.to(aux_dtype)
     if embodiment_id.dtype != torch.int64:
         embodiment_id = embodiment_id.to(torch.int64)
 
@@ -750,13 +1455,16 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
     state_features = self.state_encoder_engine(state, embodiment_id)["output"]
 
     # --- Initialize actions as random noise ---
-    actions = _initial_actions(self, batch_size, device, engine_dtype)
+    actions = _initial_actions(self, batch_size, device, aux_dtype)
+    masks = strict_action_masks(self.config, action_input, actions, state_features.shape[1])
+    if masks is not None:
+        actions = actions * masks.action
 
     num_steps = self.num_inference_timesteps
     dt = 1.0 / num_steps
 
     # Timestep and position-embedding tensors are the same on every call; build them once.
-    loop_key = (num_steps, batch_size, str(device))
+    loop_key = (num_steps, batch_size, str(device), aux_dtype)
     loop_cache = self.__dict__.get("_trt_loop_cache")
     if loop_cache is None or loop_cache[0] != loop_key:
         timestep_tensors = [
@@ -771,7 +1479,7 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
         pos_embs = None
         if self.config.add_pos_embed:
             pos_ids = torch.arange(self.config.action_horizon, dtype=torch.long, device=device)
-            pos_embs = self.position_embedding(pos_ids).unsqueeze(0).to(engine_dtype)
+            pos_embs = self.position_embedding(pos_ids).unsqueeze(0).to(aux_dtype)
         loop_cache = (loop_key, timestep_tensors, pos_embs)
         self.__dict__["_trt_loop_cache"] = loop_cache
     _, timestep_tensors, pos_embs = loop_cache
@@ -783,15 +1491,17 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
         self.action_encoder_engine.set_runtime_tensor_shape("timesteps", timesteps_tensor.shape)
         self.action_encoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
         action_features = self.action_encoder_engine(
-            actions.to(engine_dtype), timesteps_tensor, embodiment_id
+            actions.to(aux_dtype), timesteps_tensor, embodiment_id
         )["output"]
 
         # Maybe add position embedding (stays in PyTorch)
         if pos_embs is not None:
             action_features = action_features + pos_embs
+        if masks is not None:
+            action_features = action_features * masks.tokens.to(action_features.dtype)
 
         # Concatenate state + action embeddings
-        sa_embs = torch.cat((state_features, action_features), dim=1).to(engine_dtype)
+        sa_embs = torch.cat((state_features, action_features), dim=1).to(dit_dtype)
 
         # DiT TRT
         self.dit_engine.set_runtime_tensor_shape("sa_embs", sa_embs.shape)
@@ -799,18 +1509,23 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
         self.dit_engine.set_runtime_tensor_shape("timestep", timesteps_tensor.shape)
 
         dit_kwargs = {}
-        if hasattr(backbone_output, "image_mask") and backbone_output.image_mask is not None:
+        # The plain DiT engine has no image or backbone mask inputs.
+        dit_inputs = {item[0] for item in self.dit_engine.in_meta}
+        if "image_mask" in dit_inputs and getattr(backbone_output, "image_mask", None) is not None:
             image_mask = backbone_output.image_mask
             self.dit_engine.set_runtime_tensor_shape("image_mask", image_mask.shape)
             dit_kwargs["image_mask"] = image_mask
 
         if (
-            hasattr(backbone_output, "backbone_attention_mask")
+            "backbone_attention_mask" in dit_inputs
             and backbone_output.backbone_attention_mask is not None
         ):
             bb_mask = backbone_output.backbone_attention_mask
             self.dit_engine.set_runtime_tensor_shape("backbone_attention_mask", bb_mask.shape)
             dit_kwargs["backbone_attention_mask"] = bb_mask
+        if masks is not None:
+            self.dit_engine.set_runtime_tensor_shape(HIDDEN_ATTENTION_MASK, masks.hidden.shape)
+            dit_kwargs[HIDDEN_ATTENTION_MASK] = masks.hidden
 
         model_output = self.dit_engine(sa_embs, vl_embs, timesteps_tensor, **dit_kwargs)["output"]
 
@@ -819,9 +1534,13 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
         self.action_decoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
         pred = self.action_decoder_engine(model_output, embodiment_id)["output"]
         pred_velocity = pred[:, -self.action_horizon :]
+        if masks is not None:
+            pred_velocity = pred_velocity * masks.action
 
         # Euler integration
         actions = actions + dt * pred_velocity
+        if masks is not None:
+            actions = actions * masks.action
 
     return BatchFeature(data={"action_pred": actions})
 
@@ -833,16 +1552,25 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
 
 # Engines each mode swaps in with no PyTorch fallback: their absence must fail
 # fast with a build hint rather than a bare FileNotFoundError from Engine.load.
-_ACTION_HEAD_ENGINES = (
+_ACTION_HEAD_STATIC_ENGINES = (
     "state_encoder.engine",
     "action_encoder.engine",
-    "dit_bf16.engine",
     "action_decoder.engine",
 )
-_MANDATORY_ENGINES = {
-    InferenceMode.n17_full_pipeline: _ACTION_HEAD_ENGINES,
-    InferenceMode.action_head: _ACTION_HEAD_ENGINES,
-}
+
+
+def _required_action_head_engines(engine_dir: str) -> tuple[str, ...]:
+    required = [
+        *_ACTION_HEAD_STATIC_ENGINES,
+        os.path.basename(_engine_path(engine_dir, "dit")),
+    ]
+    metadata = _load_engine_metadata(engine_dir)
+    artifacts = OptimizationArtifacts.from_metadata(engine_dir, metadata, artifact_kind="engine")
+    if artifacts is not None:
+        required.extend(
+            (os.path.basename(artifacts.cross_kv), os.path.basename(artifacts.constants))
+        )
+    return tuple(required)
 
 
 def setup_tensorrt_engines(
@@ -853,7 +1581,11 @@ def setup_tensorrt_engines(
     sync=False,
     cuda_graph=False,
 ):
-    """Load TRT engines, delete PyTorch modules, and monkey-patch forward methods.
+    """Load a validated TRT engine bundle and patch the selected inference path.
+
+    Per-component precision and optional optimized-action-head artifacts are
+    auto-detected from export_metadata.json. Legacy bundles without metadata
+    fall back to the historical BF16 engine names.
 
     Args:
         policy: Gr00tPolicy instance
@@ -862,8 +1594,6 @@ def setup_tensorrt_engines(
             value) selecting which engine subset to swap in. Invalid values raise.
         use_vit_engine: ``n17_full_pipeline`` only. False keeps the ViT in PyTorch
             even when a ViT engine is present (LLM + action head still run in TRT).
-            The ViT engine is FP32, which on Jetson Orin is slower than the BF16
-            PyTorch ViT with flash attention.
         sync: Block on the CUDA stream after every engine call. The default ``False``
             lets the engines queue back to back like ordinary PyTorch modules; results
             are identical, and reading the actions back still waits for them.
@@ -873,22 +1603,35 @@ def setup_tensorrt_engines(
     """
     mode = InferenceMode(mode)
     engine_kwargs = {"sync": sync, "cuda_graph": cuda_graph}
-    required = _MANDATORY_ENGINES.get(mode)
-    if required is not None:
+    metadata = _load_engine_metadata(trt_engine_path)
+    if metadata is not None:
+        logger.info(
+            "Auto-detected component precisions: vit=%s, llm=%s, dit=%s",
+            metadata.get("vit_precision"),
+            metadata.get("llm_precision"),
+            metadata.get("dit_precision"),
+        )
+    else:
+        logger.info(
+            "No export_metadata.json found in %s; using legacy BF16 engine names.",
+            trt_engine_path,
+        )
+    print(format_quantization_summary(metadata))
+
+    if mode in (InferenceMode.n17_full_pipeline, InferenceMode.action_head):
         assert_engine_bundle_present(
             trt_engine_path,
-            required,
+            _required_action_head_engines(trt_engine_path),
             mode=mode.value,
             source=f"setup_tensorrt_engines({mode})",
         )
-    _meta = assert_engine_matches_policy(
+
+    checked_metadata = assert_engine_matches_policy(
         policy, trt_engine_path, source=f"setup_tensorrt_engines({mode})"
     )
-
-    # Stash the ViT engine's baked grid_thw so the runtime ViT path can reject a
-    # mismatched image config. None for older bundles (no recorded grid).
-    policy.model.backbone._vit_baked_grid_thw = _meta.get("vit_grid_thw") if _meta else None
-
+    policy.model.backbone._vit_baked_grid_thw = (
+        checked_metadata.get("vit_grid_thw") if checked_metadata else None
+    )
     if mode == InferenceMode.n17_full_pipeline:
         _setup_n17_full_pipeline(
             policy, trt_engine_path, use_vit_engine=use_vit_engine, engine_kwargs=engine_kwargs
@@ -908,9 +1651,13 @@ def close_tensorrt_engines(policy):
     """
     # The sim wrapper exposes the inner Gr00tPolicy as ``.policy``; a remote
     # PolicyClient has no model and no engines to close.
-    model = getattr(getattr(policy, "policy", policy), "model", None)
+    inner_policy = getattr(policy, "policy", policy)
+    model = getattr(inner_policy, "model", None)
     if model is None:
         return
+    # Destroy the optimized runner's CUDA graph (and its engines) before the
+    # remaining TensorRT execution contexts.
+    close_optimized_action_head(inner_policy)
     closed = set()
     for module in model.modules():
         # Snapshot the attribute values: close() runs C++ destructors, so avoid
@@ -948,7 +1695,7 @@ def _setup_n17_full_pipeline(policy, trt_engine_path, use_vit_engine=True, engin
     with TRT engines. PyTorch ops kept: embed_tokens, masked_scatter,
     get_rope_index (lightweight, <1ms).
 
-    Falls back to PyTorch LLM if llm_bf16.engine is not found.
+    Falls back to PyTorch LLM if the LLM engine is not found.
     """
     backbone = policy.model.backbone
     qwen_model = backbone.model  # Qwen3VLForConditionalGeneration
@@ -960,7 +1707,7 @@ def _setup_n17_full_pipeline(policy, trt_engine_path, use_vit_engine=True, engin
     backbone._image_token_id = qwen_model.config.image_token_id
 
     # Load ViT TRT engine (optional — PyTorch ViT used as fallback for accuracy)
-    vit_engine_path = _resolve_vit_engine_path(trt_engine_path)
+    vit_engine_path = _engine_path(trt_engine_path, "vit")
     use_vit_trt = use_vit_engine and os.path.exists(vit_engine_path)
     if use_vit_trt:
         print(f"Loading ViT engine: {vit_engine_path}")
@@ -976,7 +1723,7 @@ def _setup_n17_full_pipeline(policy, trt_engine_path, use_vit_engine=True, engin
         print(f"  ViT engine not found at {vit_engine_path}, keeping PyTorch ViT")
 
     # Load LLM TRT engine (if available)
-    llm_engine_path = os.path.join(trt_engine_path, "llm_bf16.engine")
+    llm_engine_path = _engine_path(trt_engine_path, "llm")
     use_llm_trt = os.path.exists(llm_engine_path)
 
     if use_llm_trt:
@@ -1006,10 +1753,28 @@ def _setup_n17_full_pipeline(policy, trt_engine_path, use_vit_engine=True, engin
         print("  No backbone TRT engines loaded, backbone remains in PyTorch")
 
     # --- Action head setup ---
+    optimized_runner = OptimizedActionHeadRunner.maybe_create(
+        action_head,
+        trt_engine_path,
+        _load_engine_metadata(trt_engine_path),
+        dit_engine_path=_engine_path(trt_engine_path, "dit"),
+    )
+    if optimized_runner is not None:
+        release_replaced_action_modules(action_head, optimized_runner)
+        action_head._trt_optimization_runner = optimized_runner
+        action_head.get_action = optimized_runner
+        llm_status = "TRT" if use_llm_trt else "PyTorch"
+        vit_status = "TRT" if backbone.vit_engine else "PyTorch"
+        print("N1.7 optimized full-pipeline TRT engines loaded.")
+        print(f"  ViT: {vit_status} | LLM: {llm_status} | Action Head: TRT CUDA graph")
+        return
+    action_head._trt_optimization_runner = None
+
     # The PyTorch modules are replaced either by a fused engine (one per denoising-step
-    # count, optional) or by the per-component engines.
-    vl_sa_engine_path = os.path.join(trt_engine_path, "vl_self_attention.engine")
-    if os.path.exists(vl_sa_engine_path) and hasattr(action_head, "vl_self_attention"):
+    # count, optional) or by the per-component engines (loaded by _load_step_engines).
+    if vl_self_attention_engine_path(
+        action_head, trt_engine_path, _load_engine_metadata(trt_engine_path)
+    ) is not None and hasattr(action_head, "vl_self_attention"):
         del action_head.vl_self_attention
         print("  Deleted PyTorch vl_self_attention (replaced by TRT engine)")
     for module_name in ("model", "state_encoder", "action_encoder", "action_decoder"):
@@ -1054,6 +1819,8 @@ def _setup_vit_llm_only(policy, trt_engine_path, engine_kwargs=None):
     without any shape constraint.
     """
     backbone = policy.model.backbone
+    # This mode retains the PyTorch action head and must restore its dtype.
+    backbone._trt_action_head_dtype = next(policy.model.action_head.parameters()).dtype
     qwen_model = backbone.model  # Qwen3VLForConditionalGeneration
 
     # Save references needed by the TRT forward
@@ -1061,7 +1828,7 @@ def _setup_vit_llm_only(policy, trt_engine_path, engine_kwargs=None):
     backbone._image_token_id = qwen_model.config.image_token_id
 
     # Load ViT TRT engine
-    vit_engine_path = _resolve_vit_engine_path(trt_engine_path)
+    vit_engine_path = _engine_path(trt_engine_path, "vit")
     if not os.path.exists(vit_engine_path):
         raise FileNotFoundError(
             f"ViT TRT engine not found: {vit_engine_path}\n"
@@ -1074,7 +1841,7 @@ def _setup_vit_llm_only(policy, trt_engine_path, engine_kwargs=None):
     print("  Deleted PyTorch ViT (replaced by TRT engine)")
 
     # Load LLM TRT engine
-    llm_engine_path = os.path.join(trt_engine_path, "llm_bf16.engine")
+    llm_engine_path = _engine_path(trt_engine_path, "llm")
     if not os.path.exists(llm_engine_path):
         raise FileNotFoundError(
             f"LLM TRT engine not found: {llm_engine_path}\n"
@@ -1102,6 +1869,20 @@ def _setup_action_head(policy, trt_engine_path, engine_kwargs=None):
     TRT engines.
     """
     action_head = policy.model.action_head
+    optimized_runner = OptimizedActionHeadRunner.maybe_create(
+        action_head,
+        trt_engine_path,
+        _load_engine_metadata(trt_engine_path),
+        dit_engine_path=_engine_path(trt_engine_path, "dit"),
+    )
+    if optimized_runner is not None:
+        release_replaced_action_modules(action_head, optimized_runner)
+        action_head._trt_optimization_runner = optimized_runner
+        action_head.get_action = optimized_runner
+        print("Optimized action-head TRT engines loaded with CUDA graph replay.")
+        print("  Backbone remains in PyTorch (Qwen3-VL).")
+        return
+    action_head._trt_optimization_runner = None
 
     # Delete PyTorch modules that are replaced by TRT
     if hasattr(action_head, "model"):
@@ -1128,8 +1909,13 @@ def _setup_action_head(policy, trt_engine_path, engine_kwargs=None):
     action_head.action_encoder_engine = Engine(
         os.path.join(trt_engine_path, "action_encoder.engine"), **(engine_kwargs or {})
     )
-    action_head.dit_engine = Engine(
-        os.path.join(trt_engine_path, "dit_bf16.engine"), **(engine_kwargs or {})
+    dit_path = _engine_path(trt_engine_path, "dit")
+    print(f"Loading DiT engine: {dit_path}")
+    action_head.dit_engine = Engine(dit_path, **(engine_kwargs or {}))
+    assert_dit_engine_matches_action_padding(
+        action_head.config,
+        {item[0] for item in action_head.dit_engine.in_meta},
+        "TensorRT mode action_head",
     )
     action_head.action_decoder_engine = Engine(
         os.path.join(trt_engine_path, "action_decoder.engine"), **(engine_kwargs or {})
@@ -1156,16 +1942,23 @@ def _setup_dit_only(policy, trt_engine_path, engine_kwargs=None):
     torch.cuda.empty_cache()
 
     # Load DiT TRT engine
-    # Support both naming conventions
-    dit_path = os.path.join(trt_engine_path, "dit_bf16.engine")
+    # Support both naming conventions (legacy bundles predate metadata).
+    dit_path = (
+        trt_engine_path if os.path.isfile(trt_engine_path) else _engine_path(trt_engine_path, "dit")
+    )
     if not os.path.exists(dit_path):
-        dit_path = os.path.join(trt_engine_path, "dit_model_bf16.engine")
-    if not os.path.exists(dit_path):
-        # Try the old naming convention
-        dit_path = os.path.join(trt_engine_path, "dit_model_bf16.trt")
-
+        for legacy_name in ("dit_model_bf16.engine", "dit_model_bf16.trt"):
+            legacy_path = os.path.join(trt_engine_path, legacy_name)
+            if os.path.exists(legacy_path):
+                dit_path = legacy_path
+                break
     print(f"Loading DiT engine: {dit_path}")
     action_head.dit_engine = Engine(dit_path, **(engine_kwargs or {}))
+    assert_dit_engine_matches_action_padding(
+        action_head.config,
+        {item[0] for item in action_head.dit_engine.in_meta},
+        "TensorRT mode dit_only",
+    )
 
     # Monkey-patch only the get_action method
     # We need a simpler forward that only replaces the DiT call
@@ -1180,20 +1973,30 @@ def _setup_dit_only(policy, trt_engine_path, engine_kwargs=None):
     ):
         """get_action_with_features with DiT replaced by TRT.
 
-        ``action_input``/``options`` are accepted (and unused) so the patched
-        method matches the ``Gr00tN1d7.get_action_with_features`` contract that
-        ``get_action`` calls with these keywords; the DiT-only path needs neither.
+        ``options`` is accepted (and unused) so the patched method matches the
+        ``Gr00tN1d7.get_action_with_features`` contract that ``get_action`` calls
+        with these keywords. ``action_input`` carries the strict-mode action mask.
         """
+        assert_plain_dit_sees_no_vl_padding(
+            action_head.config,
+            backbone_output.get("backbone_attention_mask", None),
+            "TensorRT DiT-only mode",
+        )
         vl_embs = backbone_features
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
-        engine_dtype = torch.bfloat16
+        engine_dtype = action_head.dit_engine.in_meta[0][2]
 
         actions = torch.randn(
             size=(batch_size, action_head.config.action_horizon, action_head.action_dim),
             dtype=vl_embs.dtype,
             device=device,
         )
+        masks = strict_action_masks(
+            action_head.config, action_input or {}, actions, state_features.shape[1]
+        )
+        if masks is not None:
+            actions = actions * masks.action
 
         dt = 1.0 / action_head.num_inference_timesteps
 
@@ -1210,6 +2013,8 @@ def _setup_dit_only(policy, trt_engine_path, engine_kwargs=None):
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
                 pos_embs = action_head.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
+            if masks is not None:
+                action_features = action_features * masks.tokens.to(action_features.dtype)
 
             sa_embs = torch.cat((state_features, action_features), dim=1).to(engine_dtype)
 
@@ -1222,13 +2027,18 @@ def _setup_dit_only(policy, trt_engine_path, engine_kwargs=None):
             action_head.dit_engine.set_runtime_tensor_shape("timestep", timesteps_trt.shape)
 
             dit_kwargs = {}
-            if hasattr(backbone_output, "image_mask") and backbone_output.image_mask is not None:
+            # The plain DiT engine has no image or backbone mask inputs.
+            dit_inputs = {item[0] for item in action_head.dit_engine.in_meta}
+            if (
+                "image_mask" in dit_inputs
+                and getattr(backbone_output, "image_mask", None) is not None
+            ):
                 image_mask = backbone_output.image_mask
                 action_head.dit_engine.set_runtime_tensor_shape("image_mask", image_mask.shape)
                 dit_kwargs["image_mask"] = image_mask
 
             if (
-                hasattr(backbone_output, "backbone_attention_mask")
+                "backbone_attention_mask" in dit_inputs
                 and backbone_output.backbone_attention_mask is not None
             ):
                 bb_mask = backbone_output.backbone_attention_mask
@@ -1236,14 +2046,25 @@ def _setup_dit_only(policy, trt_engine_path, engine_kwargs=None):
                     "backbone_attention_mask", bb_mask.shape
                 )
                 dit_kwargs["backbone_attention_mask"] = bb_mask
+            if masks is not None:
+                action_head.dit_engine.set_runtime_tensor_shape(
+                    HIDDEN_ATTENTION_MASK, masks.hidden.shape
+                )
+                dit_kwargs[HIDDEN_ATTENTION_MASK] = masks.hidden
 
             model_output = action_head.dit_engine(
                 sa_embs, vl_embs_trt, timesteps_trt, **dit_kwargs
             )["output"]
 
-            pred = action_head.action_decoder(model_output, embodiment_id)
+            # Quantized DiT has FP16 I/O; the retained PyTorch decoder keeps
+            # the model dtype (normally BF16).
+            pred = action_head.action_decoder(model_output.to(action_features.dtype), embodiment_id)
             pred_velocity = pred[:, -action_head.action_horizon :]
+            if masks is not None:
+                pred_velocity = pred_velocity * masks.action
             actions = actions + dt * pred_velocity
+            if masks is not None:
+                actions = actions * masks.action
 
         return BatchFeature(
             data={

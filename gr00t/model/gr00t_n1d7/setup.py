@@ -44,6 +44,24 @@ def convert_tensors_to_lists(obj):
         return obj
 
 
+def require_strict_vl_padding_mask(requested, action_head):
+    """Refuse an explicitly requested strict_vl_padding_mask that vl_self_attention skips.
+
+    Loading such a checkpoint only warns, but a run that asks for the flag would otherwise
+    save ``strict_vl_padding_mask: true`` for a model whose actions depend on batch padding.
+    """
+    if (
+        requested
+        and not action_head.mask_vl_padding
+        and not isinstance(action_head.vl_self_attention, torch.nn.Identity)
+    ):
+        raise ValueError(
+            "strict_vl_padding_mask needs vl_self_attention_cfg positional_embeddings=None: "
+            "left padding shifts the absolute positions of the real VL tokens, so masking "
+            "the padding cannot make them padding-independent."
+        )
+
+
 class Gr00tN1d7Pipeline(ModelPipeline):
     model_class = Gr00tN1d7
     processor_class = Gr00tN1d7Processor
@@ -72,13 +90,25 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
     def setup(self):
         self.model = self._create_model()
+        require_strict_vl_padding_mask(
+            self.config.model.strict_vl_padding_mask, self.model.action_head
+        )
         self.train_dataset, self.eval_dataset = self._create_dataset(self.save_cfg_dir)
+        self.processor.validate_strict_action_padding_mask(self.model.config)
         self.data_collator = self._create_collator()
 
     def _create_model(self):
         """Setup model with proper vocabulary expansion."""
         skip_weight_loading = getattr(self.config.training, "skip_weight_loading", False)
         if self.config.training.start_from_checkpoint is not None and not skip_weight_loading:
+            strict_override = {
+                name: value
+                for name, value in (
+                    ("strict_vl_padding_mask", self.config.model.strict_vl_padding_mask),
+                    ("strict_action_padding_mask", self.config.model.strict_action_padding_mask),
+                )
+                if value is not None
+            }
             model, loading_info = AutoModel.from_pretrained(
                 self.config.training.start_from_checkpoint,
                 tune_llm=self.config.model.tune_llm,
@@ -87,6 +117,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 tune_diffusion_model=self.config.model.tune_diffusion_model,
                 tune_vlln=self.config.model.tune_vlln,
                 state_dropout_prob=self.config.model.state_dropout_prob,
+                **strict_override,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
@@ -168,6 +199,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 formalize_language=self.model_config.formalize_language,
                 apply_sincos_state_encoding=self.model_config.apply_sincos_state_encoding,
                 max_action_horizon=self.model_config.action_horizon,
+                strict_action_padding_mask=self.model_config.strict_action_padding_mask,
                 use_albumentations=self.model_config.use_albumentations_transforms,
                 extra_augmentation_config=self.model_config.extra_augmentation_config,
                 shortest_image_edge=self.model_config.shortest_image_edge,
@@ -199,6 +231,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 max_action_dim=self.model_config.max_action_dim,
                 apply_sincos_state_encoding=self.model_config.apply_sincos_state_encoding,
                 max_action_horizon=self.model_config.action_horizon,
+                strict_action_padding_mask=self.model_config.strict_action_padding_mask,
                 use_albumentations=self.model_config.use_albumentations_transforms,
                 extra_augmentation_config=self.model_config.extra_augmentation_config,
                 shortest_image_edge=self.model_config.shortest_image_edge,

@@ -85,7 +85,7 @@ def capture_calibration_data(
     mapping the
     ONNX input names of that graph to one CPU tensor per sample.
     """
-    from export_onnx_n1d7 import extract_step_data, parse_observation_gr00t
+    from .export_onnx_n1d7 import extract_step_data, parse_observation_gr00t
 
     model = policy.model
     action_head = model.action_head
@@ -227,7 +227,7 @@ def quantize_pipeline(
     engines have the memory. ``llm_keep_bf16`` is the LLM's own keep-BF16 pattern
     (``None`` quantizes every LLM linear). Returns the per-file quantization summaries.
     """
-    from quantize_onnx_int8 import quantize_file
+    from .quantize_onnx_int8 import quantize_file
 
     unknown = set(components) - set(INT8_COMPONENTS)
     if unknown:

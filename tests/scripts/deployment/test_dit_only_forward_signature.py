@@ -52,7 +52,7 @@ GET_ACTION_WITH_FEATURES_KWARGS = (
 @pytest.fixture(scope="module")
 def trt_model_forward():
     try:
-        import trt_model_forward as mod  # noqa: E402
+        import trt.trt_model_forward as mod  # noqa: E402
     except (ImportError, OSError) as e:  # torch/tensorrt or native CUDA libs absent on CPU CI
         pytest.skip(f"trt_model_forward not importable in this env: {e}")
     return mod
@@ -61,10 +61,14 @@ def trt_model_forward():
 def test_dit_only_patch_binds_get_action_caller_kwargs(trt_model_forward, monkeypatch):
     """``_setup_dit_only`` must install a forward that binds every keyword
     ``get_action`` passes — otherwise verify/inference crashes."""
-    monkeypatch.setattr(trt_model_forward, "Engine", lambda *a, **k: object())
+    monkeypatch.setattr(
+        trt_model_forward, "Engine", lambda *a, **k: types.SimpleNamespace(in_meta=[["sa_embs"]])
+    )
     monkeypatch.setattr(trt_model_forward.torch.cuda, "empty_cache", lambda: None)
 
-    action_head = types.SimpleNamespace(model=object())
+    action_head = types.SimpleNamespace(
+        model=object(), config=types.SimpleNamespace(strict_action_padding_mask=False)
+    )
     policy = types.SimpleNamespace(model=types.SimpleNamespace(action_head=action_head))
 
     trt_model_forward._setup_dit_only(policy, "/tmp/does-not-exist")
