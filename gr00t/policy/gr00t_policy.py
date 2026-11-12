@@ -476,10 +476,87 @@ class Gr00tPolicy(BasePolicy):
             self.check_observation(observation)
         return self._prepare_inputs(observation)
 
-    def run_model(self, collated_inputs: dict[str, Any]) -> Any:
-        """Run model inference on inputs from ``prepare_inputs`` (GPU side)."""
+    def run_model(
+        self,
+        collated_inputs: dict[str, Any],
+        rtc: tuple[torch.Tensor, dict[str, Any]] | None = None,
+    ) -> Any:
+        """Run model inference on inputs from ``prepare_inputs`` (GPU side).
+
+        ``rtc`` is ``(seed, options)`` from :meth:`rtc_seed` for real-time chunking.
+        """
         with torch.inference_mode():
-            return self.model.get_action(**collated_inputs)
+            if rtc is None:
+                return self.model.get_action(**collated_inputs)
+            # The seed goes in after prepare_input, which would cast it to the model dtype.
+            seed, options = rtc
+            raw = collated_inputs.get("inputs", collated_inputs)
+            backbone_inputs, action_inputs = self.model.prepare_input(raw)
+            action_inputs["action"] = seed
+            backbone_outputs = self.model.backbone(backbone_inputs)
+            return self.model.action_head.get_action(backbone_outputs, action_inputs, options)
+
+    def rtc_seed(
+        self,
+        prev_actions: dict[str, np.ndarray],
+        state: dict[str, np.ndarray],
+        frozen_steps: int,
+        overlap_steps: int | None = None,
+        ramp_rate: float | None = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Model-space seed and options for real-time chunking (RTC).
+
+        Args:
+            prev_actions: ``{action_key: (K, D)}`` physical-unit actions the robot has
+                already committed for the K control steps starting with the one in which
+                this observation was captured (new-chunk steps 0..K-1).
+            state: this observation's raw state ``{state_key: (T, D)}``: the reference for
+                relative action groups, as in training.
+            frozen_steps: how many of those steps the robot executes before the new chunk
+                arrives (inference latency in control steps); they are held exactly.
+            overlap_steps: cap on the seeded steps (default: all K, up to the horizon).
+            ramp_rate: exponential ramp from the frozen steps to the fresh prediction
+                (default: the model config's ``rtc_ramp_rate``).
+        """
+        tag = self.embodiment_tag.value
+        action_config = self.processor.modality_configs[tag]["action"]
+        horizon = len(action_config.delta_indices)
+        overlap = min(len(np.asarray(v)) for v in prev_actions.values())
+        if overlap_steps is not None and overlap_steps > 0:
+            overlap = min(overlap, int(overlap_steps))
+        overlap = int(min(overlap, horizon))
+        frozen = max(0, min(int(frozen_steps), overlap))
+        if ramp_rate is None:
+            ramp_rate = float(getattr(self.model.config, "rtc_ramp_rate", 6.0))
+
+        # Relative groups have per-step statistics, so the prefix is normalized as steps
+        # 0..overlap-1 of a full-horizon array (the filler rows are discarded); relative
+        # groups are converted against this observation's state, as in training.
+        full = {}
+        for key in action_config.modality_keys:
+            rows = np.asarray(prev_actions[key], dtype=np.float32)
+            rows = rows.reshape(len(rows), -1)[:overlap]
+            arr = np.repeat(rows[:1], horizon, axis=0)
+            arr[:overlap] = rows
+            full[key] = arr
+        normalized = self.processor.state_action_processor.apply_action(full, tag, state=state)
+        flat = np.concatenate(
+            [
+                np.asarray(normalized[key], dtype=np.float32).reshape(horizon, -1)[:overlap]
+                for key in action_config.modality_keys
+            ],
+            axis=-1,
+        )
+        # The head copies rows [H - overlap, H) of the seed into new-chunk steps 0..overlap-1.
+        seed = np.zeros((1, horizon, self.processor.max_action_dim), dtype=np.float32)
+        seed[0, horizon - overlap : horizon, : flat.shape[1]] = flat
+        options = {
+            "action_horizon": horizon,
+            "rtc_overlap_steps": overlap,
+            "rtc_frozen_steps": frozen,
+            "rtc_ramp_rate": float(ramp_rate),
+        }
+        return torch.from_numpy(seed).to(self.model.device), options
 
     def decode_model_output(
         self, model_pred: Any, states: list[dict[str, np.ndarray]]
@@ -516,7 +593,23 @@ class Gr00tPolicy(BasePolicy):
             Tuple of (actions_dict, info_dict)
         """
         collated_inputs, states = self._prepare_inputs(observation)
-        model_pred = self.run_model(collated_inputs)
+        rtc = None
+        prev = (options or {}).get("rtc_prev_actions")
+        if prev is not None:
+            if len(states) != 1:
+                raise ValueError("Real-time chunking supports batch size 1")
+            prev = {
+                key: np.asarray(value)[0] if np.ndim(value) == 3 else value
+                for key, value in prev.items()
+            }
+            rtc = self.rtc_seed(
+                prev,
+                states[0],
+                frozen_steps=int(options.get("rtc_frozen_steps", 0)),
+                overlap_steps=options.get("rtc_overlap_steps"),
+                ramp_rate=options.get("rtc_ramp_rate"),
+            )
+        model_pred = self.run_model(collated_inputs, rtc=rtc)
         casted_action = self._decode_model_output(model_pred, states)
         return casted_action, {}
 

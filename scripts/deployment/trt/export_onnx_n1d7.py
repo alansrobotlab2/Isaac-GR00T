@@ -2133,7 +2133,9 @@ def _bake_embodiment_weights(action_head, embodiment_id: int):
             del module._baked_bias
 
 
-def _sample_actions_reference(head, backbone_features, state, embodiment_id, init_actions, masks):
+def _sample_actions_reference(
+    head, backbone_features, state, embodiment_id, init_actions, masks, vel_strength=None
+):
     """``Gr00tN1d7ActionHead.get_action`` with given noise, through the unmodified modules.
 
     Used to check :class:`_FusedActionHead` before export. ``masks`` is a dict with
@@ -2162,7 +2164,10 @@ def _sample_actions_reference(head, backbone_features, state, embodiment_id, ini
             hidden_states=sa_embs, encoder_hidden_states=vl_embs, timestep=timesteps, **masks
         )
         pred = head.action_decoder(model_output, embodiment_id)
-        actions = actions + dt * pred[:, -head.action_horizon :].float()
+        velocity = pred[:, -head.action_horizon :].float()
+        if vel_strength is not None:
+            velocity = velocity * vel_strength
+        actions = actions + dt * velocity
     return actions
 
 
@@ -2279,7 +2284,15 @@ class _FusedActionHead(nn.Module):
             block.forward = types.MethodType(block_forward, block)
         return [dit, *dit.transformer_blocks]
 
-    def forward(self, backbone_features, state, init_actions, image_index=None, text_index=None):
+    def forward(
+        self,
+        backbone_features,
+        state,
+        init_actions,
+        vel_strength,
+        image_index=None,
+        text_index=None,
+    ):
         head = self.head
         for processor in self.shared_kv:
             processor.cache = None
@@ -2315,7 +2328,9 @@ class _FusedActionHead(nn.Module):
             sa_embs = torch.cat((state_features, action_features), dim=1)
             model_output = head.model(sa_embs, vl_embs, vl_image, vl_text, step)
             pred = head.action_decoder(model_output, embodiment_id)
-            actions = actions + dt * pred[:, -head.action_horizon :].float()
+            # vel_strength scales each update per element: ones normally; real-time
+            # chunking freezes (0) and ramps the rows seeded from the previous chunk.
+            actions = actions + dt * pred[:, -head.action_horizon :].float() * vel_strength
         return actions
 
 
@@ -2339,7 +2354,10 @@ def export_fused_action_head_to_onnx(
 
     Inputs:  backbone_features [B, vl_seq_len, backbone_embedding_dim] (pre-VLLN),
              state [B, 1, max_state_dim * state_history_length],
-             init_actions [B, action_horizon, max_action_dim] (sampled noise),
+             init_actions [B, action_horizon, max_action_dim] (FP32; sampled noise, its
+             leading rows seeded from the previous chunk under real-time chunking),
+             vel_strength [B, action_horizon, max_action_dim] (FP32; per-element scale of
+             every Euler update: ones, or the RTC freeze/ramp),
              image_index [num_image_tokens], text_index [num_text_tokens]: positions in
              the vision-language sequence of the image tokens and of the other attended
              tokens (only for the alternate-VL DiT; the layout is shared by the batch)
@@ -2372,14 +2390,18 @@ def export_fused_action_head_to_onnx(
         device="cuda",
     )
     init_actions = torch.randn(
-        batch_size, config.action_horizon, config.max_action_dim, dtype=dtype, device="cuda"
+        batch_size, config.action_horizon, config.max_action_dim, dtype=torch.float32, device="cuda"
     )
+    # A non-trivial scale (an RTC-like freeze and ramp) so the pre-export check covers it.
+    vel_strength = torch.ones_like(init_actions)
+    vel_strength[:, :2] = 0.0
+    vel_strength[:, 2:4] = 0.5
     # Where the tokens sit does not matter for tracing, only the two counts.
     image_index = torch.arange(num_image_tokens, dtype=torch.int64, device="cuda")
     text_index = torch.arange(num_image_tokens, vl_seq_len, dtype=torch.int64, device="cuda")
 
-    export_inputs = [backbone_features, state, init_actions]
-    input_names = ["backbone_features", "state", "init_actions"]
+    export_inputs = [backbone_features, state, init_actions, vel_strength]
+    input_names = ["backbone_features", "state", "init_actions", "vel_strength"]
     dynamic_axes = {"backbone_features": {1: "vl_seq_len"}}
     token_subsets = bool(config.use_alternate_vl_dit)
     if token_subsets:
@@ -2411,7 +2433,7 @@ def export_fused_action_head_to_onnx(
     action_head.num_inference_timesteps = num_steps
     with torch.inference_mode():
         reference = _sample_actions_reference(
-            action_head, backbone_features, state, embodiment_ids, init_actions, masks
+            action_head, backbone_features, state, embodiment_ids, init_actions, masks, vel_strength
         )
     action_head.num_inference_timesteps = saved_steps
 

@@ -145,6 +145,8 @@ def capture_calibration_data(
         add("action_head_fused", "state", state.to(torch.bfloat16))
         add("action_head_fused", "embodiment_id", action_input.embodiment_id.to(torch.int64))
         add("action_head_fused", "init_actions", noise.to(torch.bfloat16))
+        # Full-strength Euler updates (no real-time chunking) for graphs that take it.
+        add("action_head_fused", "vel_strength", torch.ones_like(noise))
         image_mask = backbone_output.image_mask.to(torch.bool)
         attended = backbone_output.backbone_attention_mask.to(torch.bool)
         add("action_head_fused", "image_mask", image_mask)

@@ -68,6 +68,7 @@ from gr00t.deployment.action_padding import (
 )
 from gr00t.deployment.modes import InferenceMode
 from gr00t.deployment.vl_padding import assert_plain_dit_sees_no_vl_padding
+from gr00t.model.gr00t_n1d7.gr00t_n1d7 import apply_rtc_prefix
 import torch
 from transformers.feature_extraction_utils import BatchFeature
 
@@ -1336,8 +1337,18 @@ def _flatten_state_history(state):
     return state
 
 
-def _fused_action_head_forward(self, engine, backbone_output, action_input):
-    """Run the whole action head (VLLN through the last Euler step) as one engine."""
+def _fused_supports_rtc(engine) -> bool:
+    """Whether a fused engine takes the per-element Euler scale that RTC needs."""
+    return "vel_strength" in {meta[0] for meta in engine.in_meta}
+
+
+def _fused_action_head_forward(self, engine, backbone_output, action_input, options=None):
+    """Run the whole action head (VLLN through the last Euler step) as one engine.
+
+    With ``action_input["action"]`` (real-time chunking) the noise is seeded from the
+    previous chunk and the engine's ``vel_strength`` input freezes and ramps the overlap,
+    exactly as :func:`apply_rtc_prefix` does for the PyTorch head.
+    """
     engine_dtype = torch.bfloat16
     backbone_features = backbone_output.backbone_features
     if backbone_features.dtype != engine_dtype:
@@ -1349,9 +1360,30 @@ def _fused_action_head_forward(self, engine, backbone_output, action_input):
     embodiment_id = action_input.embodiment_id
     if embodiment_id.dtype != torch.int64:
         embodiment_id = embodiment_id.to(torch.int64)
+    engine_dtypes = {meta[0]: meta[2] for meta in engine.in_meta}
+    engine_inputs = set(engine_dtypes)
+    # BF16 in graphs exported before real-time chunking support, FP32 since.
+    init_dtype = engine_dtypes.get("init_actions", engine_dtype)
     init_actions = _initial_actions(
-        self, backbone_features.shape[0], backbone_features.device, engine_dtype
+        self, backbone_features.shape[0], backbone_features.device, init_dtype
     )
+    vel_strength = None
+    if "vel_strength" in engine_inputs:
+        if getattr(action_input, "action", None) is not None or (
+            isinstance(action_input, dict) and action_input.get("action") is not None
+        ):
+            init_actions = init_actions.float().clone()
+            vel_strength = torch.ones_like(init_actions)
+            apply_rtc_prefix(init_actions, vel_strength, action_input["action"], options)
+            init_actions = init_actions.to(init_dtype)
+        else:
+            # Without RTC every update has full strength; the ones tensor is reused.
+            key = (tuple(init_actions.shape), str(init_actions.device))
+            cached = self.__dict__.get("_trt_unit_vel_strength")
+            if cached is None or cached[0] != key:
+                cached = (key, torch.ones(init_actions.shape, device=init_actions.device))
+                self.__dict__["_trt_unit_vel_strength"] = cached
+            vel_strength = cached[1]
     image_mask = backbone_output.image_mask
     backbone_attention_mask = backbone_output.backbone_attention_mask
 
@@ -1374,8 +1406,9 @@ def _fused_action_head_forward(self, engine, backbone_output, action_input):
         "embodiment_id": embodiment_id,
         "init_actions": init_actions,
     }
+    if vel_strength is not None:
+        inputs["vel_strength"] = vel_strength
     engine.set_runtime_tensor_shape("backbone_features", backbone_features.shape)
-    engine_inputs = {meta[0] for meta in engine.in_meta}
     if "image_index" in engine_inputs:
         # Current graphs take the token layout as index tensors (unmasked cross-attention
         # over the image and text subsets). The backbone forwards cache them per layout;
@@ -1417,10 +1450,25 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
     assert_plain_dit_sees_no_vl_padding(
         self.config, backbone_output.get("backbone_attention_mask", None), "TensorRT action head"
     )
+    # A previous chunk in the input requests real-time chunking.
+    rtc = getattr(action_input, "action", None) is not None or (
+        isinstance(action_input, dict) and action_input.get("action") is not None
+    )
     if "_trt_engine_source" in self.__dict__:
         fused_engine = _fused_engine_for(self, self.num_inference_timesteps)
+        if fused_engine is not None and rtc and not _fused_supports_rtc(fused_engine):
+            if not self.__dict__.get("_trt_rtc_fallback_warned", False):
+                logger.warning(
+                    "This fused action-head engine predates real-time chunking (no "
+                    "vel_strength input); RTC requests run on the per-step engines. "
+                    "Re-export the engines to use RTC with the fused engine."
+                )
+                self._trt_rtc_fallback_warned = True
+            fused_engine = None
         if fused_engine is not None:
-            return _fused_action_head_forward(self, fused_engine, backbone_output, action_input)
+            return _fused_action_head_forward(
+                self, fused_engine, backbone_output, action_input, options
+            )
         if not self.__dict__.get("_trt_step_engines_loaded", False):
             _load_step_engines(self)
 
@@ -1459,6 +1507,12 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
     masks = strict_action_masks(self.config, action_input, actions, state_features.shape[1])
     if masks is not None:
         actions = actions * masks.action
+    vel_strength = None
+    if rtc:
+        # Same seeding as the PyTorch head; the trajectory is integrated in FP32 here.
+        actions = actions.float().clone()
+        vel_strength = torch.ones_like(actions)
+        apply_rtc_prefix(actions, vel_strength, action_input["action"], options)
 
     num_steps = self.num_inference_timesteps
     dt = 1.0 / num_steps
@@ -1538,6 +1592,8 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
             pred_velocity = pred_velocity * masks.action
 
         # Euler integration
+        if vel_strength is not None:
+            pred_velocity = pred_velocity.float() * vel_strength
         actions = actions + dt * pred_velocity
         if masks is not None:
             actions = actions * masks.action

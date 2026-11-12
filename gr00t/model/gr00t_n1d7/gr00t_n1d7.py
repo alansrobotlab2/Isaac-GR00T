@@ -35,6 +35,56 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
 logger = logging.getLogger(__name__)
 
 
+def apply_rtc_prefix(
+    actions: torch.Tensor,
+    vel_strength: torch.Tensor,
+    prev_action: torch.Tensor,
+    options: dict[str, Any] | None,
+) -> None:
+    """Seed a new action chunk from the previous one (real-time chunking), in place.
+
+    ``actions`` [B, H_pad, D] is the initial noise and ``vel_strength`` [B, H_pad, D] the
+    per-element scale of every Euler update (ones without RTC). The first
+    ``rtc_overlap_steps`` rows of ``actions`` become rows
+    ``[action_horizon - overlap, action_horizon)`` of ``prev_action`` (normalized model
+    space). Their velocity is zero for the first ``rtc_frozen_steps`` rows (held exactly:
+    the robot executes them before the new chunk arrives) and ramps exponentially from 0
+    to 1 over the rest of the overlap (``rtc_ramp_rate``).
+
+    Options:
+        action_horizon: the embodiment's horizon before padding to the model's.
+        rtc_overlap_steps, rtc_frozen_steps, rtc_ramp_rate: as above.
+
+    Shared by the PyTorch action head and the TensorRT runtime so both seed identically.
+    """
+    if options is None:
+        raise ValueError("RTC needs options (action_horizon and rtc_* settings)")
+    for key in ("action_horizon", "rtc_overlap_steps", "rtc_frozen_steps", "rtc_ramp_rate"):
+        if key not in options:
+            raise ValueError(f"RTC option {key!r} is missing")
+    horizon = int(options["action_horizon"])
+    overlap = int(options["rtc_overlap_steps"])
+    frozen = int(options["rtc_frozen_steps"])
+    if not 0 <= frozen <= overlap <= horizon:
+        raise ValueError(
+            f"RTC needs 0 <= rtc_frozen_steps ({frozen}) <= rtc_overlap_steps ({overlap}) "
+            f"<= action_horizon ({horizon})"
+        )
+    device = actions.device
+
+    # Use the previous chunk instead of pure noise for the overlap (inpainting).
+    actions[:, :overlap, :] = prev_action[:, horizon - overlap : horizon, :].to(actions.dtype)
+    vel_strength[:, :frozen, :] = 0.0
+    # Exponential ramp from 0 to 1 over the unfrozen part of the overlap; only its interior
+    # points are used (0.0 and 1.0 are dropped).
+    intermediate_steps = overlap - frozen
+    t = torch.linspace(0.0, 1.0, intermediate_steps + 2, device=device)
+    ramp = 1 - torch.exp(-options["rtc_ramp_rate"] * t)
+    ramp = ramp / ramp[-1].clamp_min(1e-8)
+    ramp = ramp[1:-1]
+    vel_strength[:, frozen:overlap, :] = ramp[None, :, None].to(vel_strength.dtype)
+
+
 def _expand_action_mask(
     action_mask: torch.Tensor | None, actions: torch.Tensor
 ) -> torch.Tensor | None:
@@ -446,42 +496,8 @@ class Gr00tN1d7ActionHead(nn.Module):
             )
 
         if "action" in action_input:
-            # If action in input when doing get action, it means we want to use RTC.
-            # action_horizon is the action horizon of the input action.
-            # rtc_overlap_steps is the number of steps to overlap with the previous action chunks.
-            # rtc_frozen_steps is the number of steps to freeze the action, which is the latency of the policy inference.
-            # rtc_ramp_rate is the rate of the ramp of denoising the actions.
-            assert options is not None, "options is not None"
-            assert "action_horizon" in options, "action_horizon is not in options"
-            assert "rtc_overlap_steps" in options, "rtc_overlap_steps is not in options"
-            assert "rtc_frozen_steps" in options, "rtc_frozen_steps is not in options"
-            assert "rtc_ramp_rate" in options, "rtc_ramp_rate is not in options"
-
-            action_horizon_before_padding = options["action_horizon"]
-
-            # Use previous action instead of pure noise to do inpainting
-            actions[:, : options["rtc_overlap_steps"], :] = action_input["action"][
-                :,
-                action_horizon_before_padding
-                - options["rtc_overlap_steps"] : action_horizon_before_padding,
-                :,
-            ]
-            vel_strength[:, : options["rtc_frozen_steps"], :] = 0.0
-            # NOTE: use an exponential ramp strength to set the remaining unfrozen rtc_steps
-            intermediate_steps = options["rtc_overlap_steps"] - options["rtc_frozen_steps"]
-            # Create exponential ramp from 0 to 1 over intermediate steps
-            t = torch.linspace(0.0, 1.0, intermediate_steps + 2, device=device)
-            ramp = 1 - torch.exp(-options["rtc_ramp_rate"] * t)
-            ramp = ramp / ramp[-1].clamp_min(1e-8)  # normalize to [0,1]
-            ramp = ramp[
-                1:-1
-            ]  # we will only take the middle part of the ramp, ignore the 0.0 and 1.0
-            # Apply ramp to the intermediate steps [batch, intermediate_steps, action_dim]
-            vel_strength[
-                :,
-                options["rtc_frozen_steps"] : options["rtc_overlap_steps"],
-                :,
-            ] = ramp[None, :, None].to(device)
+            # Real-time chunking: inpaint the start of the new chunk from the previous one.
+            apply_rtc_prefix(actions, vel_strength, action_input["action"], options)
 
         # Timestep tensors are static across denoising steps; build them up front.
         timestep_tensors = []
