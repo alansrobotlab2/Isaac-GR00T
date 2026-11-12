@@ -281,7 +281,7 @@ def load_tensorrt_engines(
     unchanged. Graphs are captured during the first inference, which is therefore slower.
     """
     deploy_dir = Path(__file__).resolve().parents[2] / "scripts" / "deployment"
-    if not (deploy_dir / "trt_model_forward.py").is_file():
+    if not (deploy_dir / "trt" / "trt_model_forward.py").is_file():
         raise FileNotFoundError(
             f"TensorRT runtime glue not found at {deploy_dir}; loading TRT engines "
             "requires running from a source checkout of this repository."

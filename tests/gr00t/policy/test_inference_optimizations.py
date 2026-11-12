@@ -5,6 +5,7 @@ opt-in optimization switches. CPU-only; models and policies are lightweight fake
 
 from concurrent.futures import Future
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 from gr00t.policy import inference_optimizations as opt
@@ -198,3 +199,19 @@ def test_compile_dit_skipped_when_dit_deleted(fake_compile):
     del policy.model.action_head.model
     apply_inference_optimizations(policy, compile_dit=True)
     assert fake_compile == []
+
+
+def test_load_tensorrt_engines_finds_the_runtime_glue(monkeypatch, tmp_path):
+    """The TRT glue lives in scripts/deployment/trt/; the loader must find and call it."""
+    pytest.importorskip("tensorrt")
+    deploy_dir = str(Path(opt.__file__).resolve().parents[2] / "scripts" / "deployment")
+    monkeypatch.syspath_prepend(deploy_dir)
+    from trt import _trt_contract, trt_model_forward
+
+    calls = {}
+    monkeypatch.setattr(_trt_contract, "resolve_batch_size", lambda *a, **k: 1)
+    monkeypatch.setattr(
+        trt_model_forward, "setup_tensorrt_engines", lambda policy, d, **kw: calls.update(kw)
+    )
+    opt.load_tensorrt_engines(object(), str(tmp_path))
+    assert calls["cuda_graph"] is True and calls["sync"] is False
