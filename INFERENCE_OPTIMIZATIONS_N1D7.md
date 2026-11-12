@@ -632,6 +632,50 @@ All three episodes were in the training set, so the open-loop numbers show the e
 reproduce the model, not how well it generalizes; 2-step vs 4-step still has to be judged
 on the robot.
 
+## Real-time chunking through the engines (2026-11-12)
+
+The N1.7 action head can inpaint a new chunk from the previous one (real-time chunking,
+RTC): given the actions the robot has already committed for the first steps of the new
+chunk, it starts from them instead of noise, holds the first `rtc_frozen_steps` exactly
+(the robot executes them while inference runs) and ramps the rest of the overlap toward
+the fresh prediction. The TensorRT runtime replaced the head's `get_action` and dropped
+the previous chunk, so RTC silently turned off whenever engines were loaded. Now:
+
+- `apply_rtc_prefix` (`gr00t_n1d7.py`) is the head's seeding as one function; the
+  per-step TRT loop uses it and scales its Euler update the same way.
+- The fused action head takes `vel_strength` (per-element scale of every Euler update,
+  ones without RTC) and FP32 `init_actions`. Engines exported before this run RTC
+  requests on the per-step engines instead of ignoring them; re-export to use the fused
+  engine. The extra input costs 0.5 ms per step.
+- `Gr00tPolicy.get_action(obs, options)` takes `rtc_prev_actions` (physical units, from
+  the observation's control step on), `rtc_frozen_steps`, `rtc_overlap_steps` and
+  `rtc_ramp_rate`; the prefix is normalized at its step positions (relative groups have
+  per-step statistics) and re-based on the current state for relative groups.
+
+Alfie checkpoint, INT8 engines: RTC through the engines vs through PyTorch with the same
+noise, 1.2% / 1.4% mean action difference at 4 / 2 steps (the engines' usual INT8
+difference); the frozen rows come back equal to the committed actions (1e-7).
+
+Smoothness with the robot client's execution (`scripts/deployment/rtc_smoothness_eval.py`):
+16-step chunks at 15 fps, a new observation every 4 steps, the chunk takes over 2 steps
+later and runs `[2:6]`; RTC overlap 6, frozen 2, ramp rate 3.0; 3 CleanTheRoom episodes,
+open loop, raw policy output (before the client's filtering). Seam jump is the mean
+absolute action change where a new chunk takes over; jerk the RMS second difference.
+
+| | Seam jump | Seam / ordinary step | Jerk RMS | MAE vs ground truth |
+|---|---|---|---|---|
+| PyTorch 4-step, RTC off | 0.0149 | 3.02 | 0.0397 | 0.0136 |
+| PyTorch 4-step, RTC on | 0.0078 | 2.18 | 0.0163 | 0.0132 |
+| INT8 engines 4-step, RTC off | 0.0148 | 2.98 | 0.0391 | 0.0137 |
+| INT8 engines 4-step, RTC on | **0.0074** | 2.11 | **0.0154** | **0.0127** |
+| INT8 engines 2-step, RTC off | 0.0138 | 2.11 | 0.0366 | 0.0135 |
+| INT8 engines 2-step, RTC on | **0.0070** | 1.82 | **0.0141** | **0.0126** |
+
+RTC halves the seam jumps, cuts jerk by about 60% and lowers the error a little, at either
+step count. Unlike an earlier N1.6 study with a hand-patched sampler, two denoising steps
+work with RTC here (77 ms vs 92 ms per request through the server); the robot has to
+confirm both.
+
 ## Recommended configuration
 
 ```bash
