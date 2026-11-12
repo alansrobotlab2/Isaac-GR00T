@@ -593,6 +593,8 @@ def build_full_pipeline(
                         f"Fused Action Head ({match.group(1)} steps)",
                         onnx_file,
                         os.path.splitext(onnx_file)[0] + ".engine",
+                        # Exported in BF16 (INT8 arrives as Q/DQ nodes from the quantize step).
+                        precision,
                     )
                 )
 

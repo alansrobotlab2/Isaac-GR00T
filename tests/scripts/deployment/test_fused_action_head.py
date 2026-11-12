@@ -205,3 +205,33 @@ def test_fused_onnx_and_engine_names_agree(monkeypatch, trt_model_forward):
     assert match and match.group(1) == "2"
     engine_name = onnx_name.replace(".onnx", ".engine")
     assert trt_model_forward._FUSED_ENGINE_RE.fullmatch(engine_name).group(1) == "2"
+
+
+def test_builder_builds_fused_engine_with_a_precision(monkeypatch, tmp_path):
+    """build_full_pipeline must accept a fused-head ONNX next to the per-component table.
+
+    Regression: after the upstream merge the component list became 4-tuples with a
+    precision, and the fused entries were still 3-tuples (ValueError at build time).
+    """
+    monkeypatch.syspath_prepend(DEPLOY_DIR)
+    pytest.importorskip("tensorrt")
+    from trt import build_tensorrt_engine as builder
+    from trt.export_onnx_n1d7 import FUSED_ACTION_HEAD_ONNX
+
+    onnx_dir, engine_dir = tmp_path / "onnx", tmp_path / "engines"
+    onnx_dir.mkdir()
+    engine_dir.mkdir()
+    fused = FUSED_ACTION_HEAD_ONNX.format(steps=2)
+    (onnx_dir / fused).write_bytes(b"")
+
+    built = []
+    monkeypatch.setattr(builder, "FULL_PIPELINE_COMPONENTS", ())
+    monkeypatch.setattr(builder, "components_to_build", lambda only, metadata: None)
+    monkeypatch.setattr(builder, "derive_shapes_with_hint", lambda *a, **k: ({}, {}, {}))
+    monkeypatch.setattr(builder, "build_engine", lambda **kw: built.append(kw))
+
+    builder.build_full_pipeline(str(onnx_dir), str(engine_dir), allow_default_hints=True)
+
+    assert len(built) == 1
+    assert built[0]["engine_path"].endswith(fused.replace(".onnx", ".engine"))
+    assert built[0]["precision"] == "bf16"
