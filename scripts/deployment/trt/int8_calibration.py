@@ -55,6 +55,12 @@ VIT_KEEP_BF16: str | None = r"patch_embed"
 # The DiT inside a fused action head graph; the other parts of the head stay BF16 unless
 # ``quantize_action_head_all`` is set.
 _FUSED_DIT_FILTER = "/model/"
+# Denoising-step counts the per-step DiT is calibrated across (frames cycle through them).
+# Its inputs depend on the timestep, so scales taken at one step count clip at others: an
+# engine calibrated only at 4 steps was several times rougher at 8 and 16 steps (head-yaw
+# reversals 19 and 30 per 100 steps vs 4 for PyTorch or the fused engines). Fused graphs
+# run their own baked step count and are unaffected.
+DIT_CALIBRATION_STEPS: tuple[int, ...] = (4, 8, 16)
 
 
 def _calibration_steps(dataset, modality_configs, num_frames: int) -> list[tuple[int, int]]:
@@ -166,9 +172,13 @@ def capture_calibration_data(
         action_head.model.register_forward_pre_hook(dit_hook, with_kwargs=True),
     ]
     action_head.get_action = recording_get_action
+    saved_steps = action_head.num_inference_timesteps
     try:
         cached_traj, cached = None, None
-        for traj_idx, step in steps:
+        for index, (traj_idx, step) in enumerate(steps):
+            action_head.num_inference_timesteps = DIT_CALIBRATION_STEPS[
+                index % len(DIT_CALIBRATION_STEPS)
+            ]
             if traj_idx != cached_traj:
                 cached_traj, cached = traj_idx, dataset[traj_idx]
             data = extract_step_data(
@@ -187,6 +197,7 @@ def capture_calibration_data(
         for hook in hooks:
             hook.remove()
         del action_head.get_action  # restore the class method
+        action_head.num_inference_timesteps = saved_steps
     return records
 
 

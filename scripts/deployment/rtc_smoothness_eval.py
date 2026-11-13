@@ -69,6 +69,23 @@ class Config:
     """'off' and/or 'rtc'."""
     seed: int = 0
     output_json: str | None = None
+    force_step_engines: bool = False
+    """With engines: ignore fused action-head engines and run the per-component ones."""
+    band_key: str | None = "base"
+    """Action group for the band statistic (None turns it off)."""
+    band_dim: int = 5
+    """Dimension within ``band_key`` (alfie: 5 = base turn rate cmd_rot_z)."""
+    reversal_key: str | None = "head"
+    reversal_dim: int = 0
+    """Dimension for the reversal count (alfie: head 0 = head yaw)."""
+    reversal_threshold: float = 0.05
+    """A reversal is a direction change after a move larger than this (hysteresis)."""
+    flip_threshold: float = 0.01
+    """Sign flips of the band dimension, counted among |value| > this."""
+    band_lo: float = 0.005
+    band_hi: float = 0.2
+    """Band share: of the executed |value| >= band_lo, the fraction below band_hi. High
+    means weak, hedged commands for an action that the demonstrations issue at full rate."""
 
 
 def _observation(policy, traj, step):
@@ -129,7 +146,7 @@ def run_episode(policy, traj, cfg, rtc: bool):
     return executed, gt, seams, latencies[1:]
 
 
-def metrics(executed, gt, seams):
+def _smoothness(executed, gt, seams):
     deltas = np.abs(np.diff(executed, axis=0)).mean(axis=1)  # per transition t-1 -> t
     seam_idx = np.array([s - 1 for s in seams if s > 0])
     mask = np.ones(len(deltas), dtype=bool)
@@ -144,6 +161,46 @@ def metrics(executed, gt, seams):
     }
 
 
+def _reversals(x, threshold):
+    """Direction reversals of ``x`` after moves larger than ``threshold`` (zig-zag count)."""
+    count, direction, anchor = 0, 0, x[0]
+    for value in x[1:]:
+        move = value - anchor
+        if direction >= 0 and move < -threshold:
+            count += direction > 0
+            direction, anchor = -1, value
+        elif direction <= 0 and move > threshold:
+            count += direction < 0
+            direction, anchor = 1, value
+        elif (direction > 0 and value > anchor) or (direction < 0 and value < anchor):
+            anchor = value
+    return count
+
+
+def metrics(executed, gt, seams, groups=None, band=None, reversal=None, flip_threshold=0.01):
+    """Smoothness over all dimensions, per action group (``groups``: key -> column slice),
+    and the band share (``band``: (column, lo, hi))."""
+    result = _smoothness(executed, gt, seams)
+    for key, cols in (groups or {}).items():
+        for name, value in _smoothness(executed[:, cols], gt[:, cols], seams).items():
+            result[f"{key}/{name}"] = value
+    if band is not None:
+        column, lo, hi = band
+        values = np.abs(executed[:, column])
+        active = values >= lo
+        result["band_share"] = float((values[active] < hi).mean()) if active.any() else float("nan")
+        result["band_active_steps"] = int(active.sum())
+        strong = executed[:, column][np.abs(executed[:, column]) > flip_threshold]
+        flips = int((np.sign(strong[1:]) != np.sign(strong[:-1])).sum()) if len(strong) > 1 else 0
+        result["sign_flips_per_100"] = 100.0 * flips / len(executed)
+    if reversal is not None:
+        column, threshold = reversal
+        result["reversals_per_100"] = (
+            100.0 * _reversals(executed[:, column], threshold) / len(executed)
+        )
+    return result
+
+
 def main(cfg: Config):
     logging.basicConfig(level=logging.INFO)
     tag = EmbodimentTag.resolve(cfg.embodiment_tag)
@@ -152,23 +209,54 @@ def main(cfg: Config):
         from gr00t.policy.inference_optimizations import load_tensorrt_engines
 
         load_tensorrt_engines(policy, cfg.trt_engine_path)
+        if cfg.force_step_engines:
+            head = policy.model.action_head
+            head._trt_fused_engine_paths = {}
+            head._trt_fused_engines = {}
     policy.model.action_head.num_inference_timesteps = cfg.denoising_steps
     dataset = LeRobotEpisodeLoader(cfg.dataset_path, modality_configs=policy.get_modality_config())
+
+    keys = policy.get_modality_config()["action"].modality_keys
+    groups, start = {}, 0
+    norm = policy.processor.state_action_processor.norm_params[tag.value]["action"]
+    for key in keys:
+        dim = int(norm[key]["dim"].item())
+        groups[key] = slice(start, start + dim)
+        start += dim
+    band = None
+    if cfg.band_key is not None:
+        band = (groups[cfg.band_key].start + cfg.band_dim, cfg.band_lo, cfg.band_hi)
+    reversal = None
+    if cfg.reversal_key is not None:
+        reversal = (groups[cfg.reversal_key].start + cfg.reversal_dim, cfg.reversal_threshold)
 
     results = {}
     for mode in cfg.modes:
         per_episode, all_lat = [], []
         for traj_id in cfg.traj_ids:
             executed, gt, seams, lat = run_episode(policy, dataset[traj_id], cfg, mode == "rtc")
-            per_episode.append(metrics(executed, gt, seams))
+            per_episode.append(
+                metrics(executed, gt, seams, groups, band, reversal, cfg.flip_threshold)
+            )
             all_lat += lat
-        summary = {k: float(np.mean([m[k] for m in per_episode])) for k in per_episode[0]}
+        summary = {k: float(np.nanmean([m[k] for m in per_episode])) for k in per_episode[0]}
         summary["latency_ms"] = 1000 * float(np.mean(all_lat))
         results[mode] = summary
         print(
             f"[{mode:3s}] seam jump {summary['seam_jump']:.5f}  step {summary['step_size']:.5f}  "
             f"ratio {summary['seam_ratio']:.2f}  jerk {summary['jerk_rms']:.5f}  "
             f"MAE {summary['mae']:.5f}  ({summary['latency_ms']:.0f} ms/request)"
+            + (f"  band {summary['band_share']:.2f}" if "band_share" in summary else "")
+            + (
+                f"  flips/100 {summary['sign_flips_per_100']:.1f}"
+                if "band_share" in summary
+                else ""
+            )
+            + (
+                f"  rev/100 {summary['reversals_per_100']:.1f}"
+                if "reversals_per_100" in summary
+                else ""
+            )
         )
     if cfg.output_json:
         with open(cfg.output_json, "w") as f:
