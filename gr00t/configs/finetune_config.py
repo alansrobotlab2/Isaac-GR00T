@@ -49,6 +49,12 @@ class FinetuneConfig:
     tune_llm: bool = False
     """If True, fine-tune the language model (LLM) backbone during training."""
 
+    tune_top_llm_layers: int = 0
+    """
+    Number of top language model (LLM) layers to fine-tune while the rest of the LLM stays
+    frozen. 0 keeps the LLM frozen (unless tune_llm is set). The N1.6 fine-tuning default was 4.
+    """
+
     tune_visual: bool = False
     """If True, fine-tune the visual encoder (e.g., ViT or CNN backbone)."""
 
